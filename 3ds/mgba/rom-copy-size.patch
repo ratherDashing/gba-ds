@@ -1,0 +1,59 @@
+diff --git a/src/gba/memory.c b/src/gba/memory.c
+index aa01fdcc7..45992061b 100644
+--- a/src/gba/memory.c
++++ b/src/gba/memory.c
+@@ -1266,6 +1266,11 @@ void GBAPatch32(struct ARMCore* cpu, uint32_t address, int32_t value, int32_t* o
+ 	case GBA_REGION_ROM2:
+ 	case GBA_REGION_ROM2_EX:
+ 		_pristineCow(gba);
++#ifdef __3DS__
++		if ((address & (GBA_SIZE_ROM0 - 4)) > gba->memory.romMask) {
++			break; /* (the copy ends at the ROM's power of two) */
++		}
++#endif
+ 		if ((address & (GBA_SIZE_ROM0 - 4)) >= gba->memory.romSize) {
+ 			gba->memory.romSize = (address & (GBA_SIZE_ROM0 - 4)) + 4;
+ 			gba->memory.romMask = toPow2(gba->memory.romSize) - 1;
+@@ -1336,6 +1341,11 @@ void GBAPatch16(struct ARMCore* cpu, uint32_t address, int16_t value, int16_t* o
+ 	case GBA_REGION_ROM2:
+ 	case GBA_REGION_ROM2_EX:
+ 		_pristineCow(gba);
++#ifdef __3DS__
++		if ((address & (GBA_SIZE_ROM0 - 2)) > gba->memory.romMask) {
++			break; /* (the copy ends at the ROM's power of two) */
++		}
++#endif
+ 		if ((address & (GBA_SIZE_ROM0 - 2)) >= gba->memory.romSize) {
+ 			gba->memory.romSize = (address & (GBA_SIZE_ROM0 - 2)) + 2;
+ 			gba->memory.romMask = toPow2(gba->memory.romSize) - 1;
+@@ -1422,6 +1432,11 @@ void GBAPatch8(struct ARMCore* cpu, uint32_t address, int8_t value, int8_t* old)
+ 	case GBA_REGION_ROM2:
+ 	case GBA_REGION_ROM2_EX:
+ 		_pristineCow(gba);
++#ifdef __3DS__
++		if ((address & (GBA_SIZE_ROM0 - 1)) > gba->memory.romMask) {
++			break; /* (the copy ends at the ROM's power of two) */
++		}
++#endif
+ 		if ((address & (GBA_SIZE_ROM0 - 1)) >= gba->memory.romSize) {
+ 			gba->memory.romSize = (address & (GBA_SIZE_ROM0 - 2)) + 2;
+ 			gba->memory.romMask = toPow2(gba->memory.romSize) - 1;
+@@ -1902,9 +1917,16 @@ void _pristineCow(struct GBA* gba) {
+ 		return;
+ 	}
+ #if !defined(FIXED_ROM_BUFFER) && !defined(__wii__)
+-	void* newRom = anonymousMemoryMap(GBA_SIZE_ROM0);
++#ifdef __3DS__
++	/* A copy the ROM's size (to its power of two), not 32 MiB: the 3DS runs several copies of a game in
++	 * little memory, and every read past the ROM's end is checked against romSize. */
++	size_t copySize = toPow2(gba->memory.romSize);
++#else
++	size_t copySize = GBA_SIZE_ROM0;
++#endif
++	void* newRom = anonymousMemoryMap(copySize);
+ 	memcpy(newRom, gba->memory.rom, gba->memory.romSize);
+-	memset(((uint8_t*) newRom) + gba->memory.romSize, 0xFF, GBA_SIZE_ROM0 - gba->memory.romSize);
++	memset(((uint8_t*) newRom) + gba->memory.romSize, 0xFF, copySize - gba->memory.romSize);
+ 	if (gba->cpu->memory.activeRegion == gba->memory.rom) {
+ 		gba->cpu->memory.activeRegion = newRom;
+ 	}

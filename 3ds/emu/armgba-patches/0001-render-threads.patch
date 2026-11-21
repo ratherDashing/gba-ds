@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Tue, 17 Nov 2026 09:43:42 -0500
+Subject: armGBA: render threads hand frames over widened for the frontend, and
+ find a line's changed video pages eight flags at a time
+
+
+diff --git a/src/video/render-thread.c b/src/video/render-thread.c
+index 1f3fdd1..8951a66 100644
+--- a/src/video/render-thread.c
++++ b/src/video/render-thread.c
+@@ -71,6 +71,8 @@ struct Worker {
+ 	struct GBA* copy;
+ 	// How much of the log this worker has done.
+ 	atomic_ullong done;
++	// The frames this worker has handed over widened (counted after its rows are in).
++	atomic_uint widened;
+ 	int index;
+ 	// Signalled when there is something logged. Each worker has its own: libctru's condition
+ 	// variable keeps one "signalled" mark, which a second thread starting to wait resets, so with
+@@ -100,7 +102,14 @@ struct RenderThread {
+ 	// ends.
+ 	bool late;
+ 	uint64_t finishLogged;
+-	uint16_t finished[SCREEN_HEIGHT][SCREEN_WIDTH];
++	_Alignas(4) uint16_t finished[SCREEN_HEIGHT][SCREEN_WIDTH];
++	// A frontend's widener (renderThreadSetWiden): the workers turn the rows they hand over into its
++	// pixels too, in wide[frames finished & 1]. The emulation thread's: which one holds the frame it took.
++	void (*widen)(uint32_t* dst, const uint16_t* src);
++	uint32_t* wide[2];
++	int wideIndex;
++	bool wideReady;
++	bool cloneFrame;
+ 	// Sharing a frame's lines three ways (see "Shared lines" below). Each line's word says who has
+ 	// it in which frame; lastOwner is the copy whose frame holds the line as last drawn.
+ 	bool share;
+@@ -360,7 +369,7 @@ static uint32_t play(struct GBA* copy, const uint8_t* entry, uint32_t* size) {
+ }
+ 
+ // The frame's lines a worker draws, from its copy to where the frame is taken from.
+-static void takeLines(const struct Worker* w, uint16_t (*out)[SCREEN_WIDTH]) {
++static void takeLines(const struct Worker* w, uint16_t (*out)[SCREEN_WIDTH], uint32_t* wide) {
+ 	const struct Renderer* renderer = &w->copy->renderer;
+ 	struct RenderThread* t = w->owner;
+ 	if (t->share) {
+@@ -370,16 +379,25 @@ static void takeLines(const struct Worker* w, uint16_t (*out)[SCREEN_WIDTH]) {
+ 			if (owner == HELPER ? w->index == 0 : owner - 1 == w->index) {
+ 				const struct GBA* from = owner == HELPER ? t->helper : w->copy;
+ 				memcpy(out[y], from->renderer.frame[y], sizeof(renderer->frame[y]));
++				if (wide) {
++					t->widen(wide + y * SCREEN_WIDTH, out[y]);
++				}
+ 			}
+ 		}
+ 		return;
+ 	}
+ 	if (renderer->copy <= 1) {
+ 		memcpy(out, renderer->frame, sizeof(renderer->frame));
++		for (int y = 0; wide && y < SCREEN_HEIGHT; ++y) {
++			t->widen(wide + y * SCREEN_WIDTH, out[y]);
++		}
+ 		return;
+ 	}
+ 	for (int y = renderer->copy & 1; y < SCREEN_HEIGHT; y += 2) {
+ 		memcpy(out[y], renderer->frame[y], sizeof(renderer->frame[y]));
++		if (wide) {
++			t->widen(wide + y * SCREEN_WIDTH, out[y]);
++		}
+ 	}
+ }
+ 
+@@ -423,7 +441,11 @@ static void* work(void* context) {
+ 		}
+ #endif
+ 		if (finish && t->late) {
+-			takeLines(w, t->finished);
++			bool const wide = t->widen != NULL;
++			takeLines(w, t->finished, wide ? t->wide[atomic_load(&w->widened) & 1] : NULL);
++			if (wide) {
++				atomic_fetch_add(&w->widened, 1);
++			}
+ 		}
+ 		atomic_store(&w->done, done + size);
+ 		if (finish && atomic_load(&t->awaited)) {
+@@ -542,12 +564,17 @@ static void logLine(struct GBA* gba, uint32_t kind, int y) {
+ 		data += SIZE_PALETTE;
+ 	}
+ 	uint64_t pages = 0;
+-	for (int page = 0; page < VRAM_PAGES; ++page) {
+-		if (renderer->vramChanged[page]) {
+-			renderer->vramChanged[page] = 0;
+-			pages |= 1ull << page;
+-			memcpy(data, &gba->vram[page * VRAM_PAGE], VRAM_PAGE);
+-			data += VRAM_PAGE;
++	for (int first = 0; first < VRAM_PAGES; first += 8) {
++		// Eight flags at a time: most lines change none.
++		uint64_t any;
++		memcpy(&any, &renderer->vramChanged[first], sizeof(any));
++		for (int page = first; any && page < first + 8; ++page) {
++			if (renderer->vramChanged[page]) {
++				renderer->vramChanged[page] = 0;
++				pages |= 1ull << page;
++				memcpy(data, &gba->vram[page * VRAM_PAGE], VRAM_PAGE);
++				data += VRAM_PAGE;
++			}
+ 		}
+ 	}
+ 	uint32_t head[4] = { kind, y | changed << 8, (uint32_t) pages, (uint32_t) (pages >> 32) };
+@@ -712,7 +739,7 @@ static void finishShared(struct GBA* gba) {
+ #endif
+ 	settleOwners(t);
+ 	for (int i = 0; i < t->count; ++i) {
+-		takeLines(&t->workers[i], gba->renderer.frame);
++		takeLines(&t->workers[i], gba->renderer.frame, NULL);
+ 	}
+ 	memset(t->logged, 0, sizeof(t->logged));
+ 	++t->frameSeq;
+@@ -734,7 +761,7 @@ void renderThreadFinishFrame(struct GBA* gba) {
+ 		entry(gba, LOG_FINISH, 0, 0, 0);
+ 		drain(t);
+ 		for (int i = 0; i < t->count; ++i) {
+-			takeLines(&t->workers[i], gba->renderer.frame);
++			takeLines(&t->workers[i], gba->renderer.frame, NULL);
+ 		}
+ 		renderHooksPublish(gba);
+ 		shareBegin(gba);
+@@ -743,13 +770,34 @@ void renderThreadFinishFrame(struct GBA* gba) {
+ 	// Takes the frame before this one, before the worker can finish another over it.
+ 	if (t->finishLogged) {
+ 		await(t, t->finishLogged);
+-		memcpy(gba->renderer.frame, t->finished, sizeof(gba->renderer.frame));
++		// The newest frame the workers finished is the one taken: the next is logged below. The
++		// frontend takes a widened one from wide[], so the renderer's own isn't brought up to date.
++		t->wideReady = t->widen && !t->cloneFrame;
++		t->wideIndex = (int) ((atomic_load(&t->workers[0].widened) - 1) & 1);
++		t->cloneFrame = false;
++		if (!t->wideReady) {
++			memcpy(gba->renderer.frame, t->finished, sizeof(gba->renderer.frame));
++		}
+ 		renderHooksPublish(gba);
+ 	}
+ 	entry(gba, LOG_FINISH, 0, 0, 0);
+ 	t->finishLogged = atomic_load(&t->written);
+ }
+ 
++void renderThreadSetWiden(struct GBA* gba, void (*widen)(uint32_t* dst, const uint16_t* src), uint32_t* first, uint32_t* second) {
++	struct RenderThread* t = gba->renderThread;
++	if (t && t->late) {
++		t->wide[0] = first;
++		t->wide[1] = second;
++		t->widen = widen;
++	}
++}
++
++const uint32_t* renderThreadWide(struct GBA* gba) {
++	struct RenderThread* t = gba->renderThread;
++	return t && t->wideReady ? t->wide[t->wideIndex] : NULL;
++}
++
+ int renderThreadCopies(struct GBA* gba, struct GBA* copies[2]) {
+ 	struct RenderThread* t = gba->renderThread;
+ 	if (!t) {
+@@ -782,6 +830,7 @@ void renderThreadClone(struct GBA* gba) {
+ 	}
+ 	// When late, the frame handed over next is the one this renderer last finished.
+ 	memcpy(t->finished, gba->renderer.frame, sizeof(t->finished));
++	t->cloneFrame = true;
+ 	shareBegin(gba);
+ }
+ 
+@@ -797,9 +846,9 @@ const struct Renderer* renderThreadRenderer(struct GBA* gba) {
+ 	memcpy(t->merged, &t->workers[0].copy->renderer, sizeof(*t->merged));
+ 	if (t->share) {
+ 		settleOwners(t);
+-		takeLines(&t->workers[0], t->merged->frame);
++		takeLines(&t->workers[0], t->merged->frame, NULL);
+ 	}
+-	takeLines(&t->workers[1], t->merged->frame);
++	takeLines(&t->workers[1], t->merged->frame, NULL);
+ 	// What a copy keeps from the lines it drew depends on which lines it happened to draw.
+ 	renderForget(t->merged);
+ 	return t->merged;
+diff --git a/src/video/render.h b/src/video/render.h
+index e04e7e1..5112fc2 100644
+--- a/src/video/render.h
++++ b/src/video/render.h
+@@ -292,6 +292,12 @@ void renderFinishFrame(struct GBA*);
+ // drawing overlaps emulation. With second, two threads draw, each every other line.
+ bool renderThreadStart(struct GBA*, bool late, bool second);
+ void renderThreadStop(struct GBA*);
++// With late: the workers also turn each row they hand over into the frontend's pixels (widen: one
++// row, whole words), into first and second in turn; set before the first frame. After a frame is
++// handed over, renderThreadWide has the buffer holding it (NULL after a state load); it is written
++// again once the next frame has ended.
++void renderThreadSetWiden(struct GBA*, void (*widen)(uint32_t* dst, const uint16_t* src), uint32_t* first, uint32_t* second);
++const uint32_t* renderThreadWide(struct GBA*);
+ void renderThreadClone(struct GBA*);
+ // Returns the copy's renderer, with everything logged so far drawn.
+ const struct Renderer* renderThreadRenderer(struct GBA*);

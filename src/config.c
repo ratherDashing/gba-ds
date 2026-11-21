@@ -32,6 +32,7 @@ void config_defaults(Config* c) {
 	strcpy(c->screenMatch, "keep");
 	strcpy(c->screenPlace, "center");
 	strcpy(c->touchMap, "window");
+	strcpy(c->idleLoops, "remove");
 	c->touchRotate = -1;
 	c->map = true;
 	c->mapCrop = true;
@@ -54,15 +55,31 @@ void config_defaults(Config* c) {
 #else
 	c->mapInterval = 60;
 #endif
+	c->captureCore = c->aheadCore = c->sideCore = c->videoCore = -1;
+	c->core1Limit = 50;
+	c->videoWake = 15;
 	c->sway = true;
 	c->audioLatency = 64;
 	c->keepSound = true;
 	c->ffSpeed = 3;
-	#ifdef __3DS__
-	c->ffMute = 1;
-#endif
 #ifdef __3DS__
-	c->renderWorkers = 2; /* (timed on a New 3DS: Mario Kart's races faster on two) */
+	strcpy(c->idleLoops, "known"); /* (skips the known waiting loops; "remove" is the cycle-exact setting) */
+	strcpy(c->armgba[6], "8"); /* (armgba_copy_code_mib: at 4 MiB the hidden copy keeps filling its code memory and starting over) */
+	c->overlayMode = OVM_OFF; /* (black beside the picture, as most emulators show it) */
+	c->ffMute = 1;
+	c->tallLive = false; /* (Pinball's live view runs two more copies of the game, two frames each, every frame) */
+	c->threadedVideo = true;
+	c->asyncUpload = true;
+	c->rawPicture = 1; /* (on: 0.5 to 0.8 ms a frame off Crash, GT3 and Tactics Ogre on a New 2DS XL, 2026-11-20) */
+	c->gpuTwin = false; /* (off: on the console its extra pass on the render worker slowed the game thread more than it saved, 2026-11-19) */
+	c->hudLayers = true;
+	/* (one worker that also widens the picture beat two without it in 46 of 53 games' slowest stretches on a New 2DS XL) */
+	c->renderWorkers = 1;
+	strcpy(c->armgba[9], "1"); /* armgba_picture_thread */
+	/* (the racers' emulating knobs: timed on a New 2DS XL and exact in the sim and Azahar, 2026-11-20) */
+	strcpy(c->armgba[13], "1"); /* armgba_lazy_carry */
+	strcpy(c->armgba[14], "3"); /* armgba_mid_careful */
+	strcpy(c->armgba[15], "31"); /* armgba_cside */
 #else
 	c->renderWorkers = 1;
 #endif
@@ -84,6 +101,28 @@ void config_defaults(Config* c) {
 	strcpy(c->borderColor, "000000");
 }
 
+/* The armGBA core's switches (3ds/emu/emu_armgba.c, 3ds/ctr/jitmem.c), in Config.armgba in this order; the core reads them
+ * from the environment (GBADS_ARMGBA_SAVE...). */
+enum { ARMGBA_KEYS = sizeof(((Config*) 0)->armgba) / sizeof(((Config*) 0)->armgba[0]) };
+static const char* const armgbaKeys[ARMGBA_KEYS] = { "save", "stats", "code_mib", "render_workers", "later_mib", "icache", "copy_code_mib", "mid_after", "lean_logs", "picture_thread", "compile_after", "defer", "compile_budget", "lazy_carry", "mid_careful", "cside" };
+
+void config_apply_core_env(const Config* c) {
+	static bool set[ARMGBA_KEYS]; /* (only what this put there is taken back: the environment may have its own) */
+	for (int i = 0; i < ARMGBA_KEYS; ++i) {
+		char name[32] = "GBADS_ARMGBA_";
+		size_t n = strlen(name);
+		for (const char* k = armgbaKeys[i]; *k && n < sizeof(name) - 1; ++k) name[n++] = (char) toupper((unsigned char) *k);
+		name[n] = 0;
+		if (c->armgba[i][0]) {
+			setenv(name, c->armgba[i], 1);
+			set[i] = true;
+		} else if (set[i]) {
+			unsetenv(name);
+			set[i] = false;
+		}
+	}
+}
+
 static bool parse_bool(const char* v) {
 	return !strcmp(v, "1") || !strcasecmp(v, "true") || !strcasecmp(v, "yes") || !strcasecmp(v, "on");
 }
@@ -97,6 +136,11 @@ static bool set_option(Config* c, const char* key, const char* val) {
 #define BOOL(name, field) \
 	if (!strcmp(key, name)) { \
 		c->field = parse_bool(val); \
+		return true; \
+	}
+#define CORE(name, field) /* auto, or the core's number */ \
+	if (!strcmp(key, name)) { \
+		c->field = val[0] >= '0' && val[0] <= '3' ? val[0] - '0' : -1; \
 		return true; \
 	}
 #define INT(name, field) \
@@ -159,6 +203,15 @@ static bool set_option(Config* c, const char* key, const char* val) {
 	BOOL("vsync", vsync)
 	BOOL("pin_cores", pinCores)
 	BOOL("frame_buffer", frameBuffer)
+	if (!strncmp(key, "armgba_", 7)) {
+		for (int i = 0; i < ARMGBA_KEYS; ++i) {
+			if (!strcmp(key + 7, armgbaKeys[i])) {
+				snprintf(c->armgba[i], sizeof(c->armgba[i]), "%s", val);
+				return true;
+			}
+		}
+		return false;
+	}
 	BOOL("map", map)
 	BOOL("map_crop", mapCrop)
 	BOOL("map_animations", mapAnim)
@@ -174,10 +227,35 @@ static bool set_option(Config* c, const char* key, const char* val) {
 		return true;
 	}
 	BOOL("match_display", matchDisplay)
+	BOOL("threaded_video", threadedVideo)
+	STR("idle_loops", idleLoops)
+	BOOL("hud_layers", hudLayers)
 	BOOL("rewind", rewind)
 	BOOL("keep_sound", keepSound)
 	INT("rewind_seconds", rewindSeconds)
 	INT("map_interval", mapInterval)
+	INT("capture_throttle", captureThrottle)
+	INT("capture_priority", capturePriority)
+	INT("capture_duty", captureDuty)
+	CORE("capture_core", captureCore)
+	CORE("ahead_core", aheadCore)
+	CORE("side_core", sideCore)
+	CORE("video_core", videoCore)
+	INT("core1_limit", core1Limit)
+	INT("video_wake", videoWake)
+	BOOL("async_upload", asyncUpload)
+	if (!strcmp(key, "raw_picture")) {
+		c->rawPicture = atoi(val) == 2 ? 2 : parse_bool(val);
+		return true;
+	}
+	BOOL("raw_check", rawCheck)
+	BOOL("gpu_twin", gpuTwin)
+	BOOL("twin_check", twinCheck)
+	BOOL("tex_check", texCheck)
+	BOOL("cpu_tile", cpuTile)
+	INT("bench_check", benchCheck)
+	BOOL("core_probe", coreProbe)
+	BOOL("lines_first", linesFirst)
 	BOOL("ab_swap", abSwap)
 	STR("hotkey", hotkey)
 	if (!strcmp(key, "hotkey_fps")) return true; /* (a test build's: the quick menu has the FPS counter) */
@@ -273,10 +351,12 @@ static bool set_option(Config* c, const char* key, const char* val) {
 	STR("es_config_dir", esConfigDir)
 	STR("library_view", libraryView)
 	STR("input_script", inputScript)
+	STR("bench", bench)
 	return false;
 #undef STR
 #undef BOOL
 #undef INT
+#undef CORE
 }
 
 /* the keys given on the command line: they win over a game's own file too */
@@ -384,6 +464,10 @@ bool config_parse_args(Config* c, int argc, char** argv) {
 		}
 	}
 	return true;
+}
+
+bool config_set(Config* c, const char* key, const char* val) {
+	return set_option(c, key, val);
 }
 
 void config_usage(const char* argv0) {

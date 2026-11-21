@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Tue, 17 Nov 2026 09:43:42 -0500
+Subject: armGBA: the render and sound logs are published at line and frame
+ ends, with the fewest barriers
+
+
+diff --git a/src/audio/audio-thread.c b/src/audio/audio-thread.c
+index 4377d03..e484a3f 100644
+--- a/src/audio/audio-thread.c
++++ b/src/audio/audio-thread.c
+@@ -62,6 +62,8 @@ struct AudioThread {
+ 	struct Entry log[LOG_ENTRIES];
+ 	atomic_uint written;
+ 	atomic_uint done;
++	// The emulation thread's: how far the worker had got when it last looked.
++	unsigned doneSeen;
+ 	atomic_bool asleep;
+ 	atomic_bool awaited;
+ 	// Who is making the logged calls on the copy: nobody (0), the worker (1), or the emulation
+@@ -192,7 +194,9 @@ static void* work(void* context) {
+ 
+ static void wake(struct AudioThread* t) {
+ 	t->sinceWake = 0;
+-	if (atomic_load(&t->asleep)) {
++	// The entry just written is seen by the worker, before this looks whether it sleeps.
++	atomic_thread_fence(memory_order_seq_cst);
++	if (atomic_load_explicit(&t->asleep, memory_order_relaxed)) {
+ 		pthread_mutex_lock(&t->mutex);
+ 		pthread_cond_signal(&t->wake);
+ 		pthread_mutex_unlock(&t->mutex);
+@@ -257,11 +261,19 @@ static void drain(struct AudioThread* t) {
+ void audioThreadWrite(uint32_t kind, uint32_t a, uint32_t b, uint32_t time, uint32_t value) {
+ 	struct AudioThread* t = thread;
+ 	unsigned const written = atomic_load_explicit(&t->written, memory_order_relaxed);
+-	if (written - atomic_load(&t->done) >= LOG_ENTRIES) {
+-		drain(t);
++	if (written - t->doneSeen >= LOG_ENTRIES || !threadLogsLean) {
++		t->doneSeen = atomic_load(&t->done);
++		if (written - t->doneSeen >= LOG_ENTRIES) {
++			drain(t);
++			t->doneSeen = atomic_load(&t->done);
++		}
+ 	}
+ 	t->log[written % LOG_ENTRIES] = (struct Entry) { kind, a, b, time, value };
+-	atomic_store(&t->written, written + 1);
++	if (threadLogsLean) {
++		atomic_store_explicit(&t->written, written + 1, memory_order_release);
++	} else {
++		atomic_store(&t->written, written + 1);
++	}
+ 	if (++t->sinceWake >= WAKE_AFTER) {
+ 		wake(t);
+ 	}
+diff --git a/src/gba.h b/src/gba.h
+index 2d9e9a8..348d551 100644
+--- a/src/gba.h
++++ b/src/gba.h
+@@ -1102,6 +1102,9 @@ enum {
+ 	AUDIO_LOG_WAVE_SHAPE,
+ 	AUDIO_LOG_WAVE_VOLUME,
+ };
++// Whether the render and sound logs are published and read with the fewest barriers (false: a barrier
++// at every entry, as they were).
++extern bool threadLogsLean;
+ // The console whose sound a thread makes, if any, and whether its calls are inside one already
+ // logged whole.
+ extern struct GBA* audioThreaded;
+diff --git a/src/video/render-thread.c b/src/video/render-thread.c
+index 8951a66..2b57d37 100644
+--- a/src/video/render-thread.c
++++ b/src/video/render-thread.c
+@@ -88,8 +88,10 @@ struct RenderThread {
+ 	int count;
+ 	// A ring: positions only grow, and an entry is at its position modulo LOG_SIZE.
+ 	uint8_t* log;
+-	// How much is logged.
++	// How much the workers can see of the log, and (the emulation thread's) how much is logged: the rest
++	// waits for the next line, since nothing draws before one.
+ 	atomic_ullong written;
++	uint64_t head, published;
+ 	// The emulation thread's: up to where the log is known to be clear of what the workers have yet
+ 	// to do.
+ 	uint64_t roomUntil;
+@@ -206,6 +208,7 @@ struct Sharer {
+ // For the frontend's log and for tests: lines the emulation thread's copy drew, lines it took over
+ // from a worker, lines taken as they were last frame, and times its copy was made anew.
+ unsigned long renderShareCounts[4];
++bool threadLogsLean = true;
+ #if !defined(__3DS__)
+ // ARMGBA_RENDER_STALL=n: a worker stops for 2 ms holding about one line in n, to test taking over.
+ static int stallEvery = -1;
+@@ -481,14 +484,21 @@ static void await(struct RenderThread* t, uint64_t target) {
+ #endif
+ }
+ 
++static void publish(struct RenderThread* t);
++
+ // Waits until the worker has done everything written so far.
+ static void drain(struct RenderThread* t) {
+-	await(t, atomic_load(&t->written));
++	publish(t);
++	await(t, t->head);
+ }
+ 
+-// Makes an entry of size bytes visible to the worker, and wakes it if it sleeps.
+-static void publish(struct RenderThread* t, uint32_t size) {
+-	atomic_store(&t->written, atomic_load(&t->written) + size);
++// Makes what is logged visible to the workers, and wakes one that sleeps.
++static void publish(struct RenderThread* t) {
++	if (t->published == t->head) {
++		return;
++	}
++	t->published = t->head;
++	atomic_store(&t->written, t->head);
+ 	if (atomic_load(&t->asleep)) {
+ 		pthread_mutex_lock(&t->mutex);
+ 		pthread_cond_signal(&t->workers[0].wake);
+@@ -502,13 +512,13 @@ static void shareBegin(struct GBA* gba);
+ 
+ // Finds room for the biggest entry, in one piece and clear of what the worker has yet to do.
+ static uint8_t* reserve(struct RenderThread* t) {
+-	uint64_t written = atomic_load(&t->written);
++	uint64_t written = t->head;
+ 	uint32_t at = written & (LOG_SIZE - 1);
+ 	if (at + LOG_MOST > LOG_SIZE) {
+ 		uint32_t head[4] = { LOG_SKIP, LOG_SIZE - at, 0, 0 };
+ 		memcpy(&t->log[at], head, sizeof(head));
+-		publish(t, LOG_SIZE - at);
+-		written += LOG_SIZE - at;
++		t->head += LOG_SIZE - at;
++		written = t->head;
+ 		at = 0;
+ 	}
+ 	// The workers only get further, so room found once is still there: they are asked how far they
+@@ -530,7 +540,10 @@ static void entry(struct GBA* gba, uint32_t kind, uint32_t a, uint32_t b, uint32
+ 	struct RenderThread* t = gba->renderThread;
+ 	uint32_t head[4] = { kind, a, b, c };
+ 	memcpy(reserve(t), head, sizeof(head));
+-	publish(t, sizeof(head));
++	t->head += sizeof(head);
++	if (kind == LOG_FINISH || !threadLogsLean) {
++		publish(t);
++	}
+ }
+ 
+ // The calls the emulation thread logs instead of making: a register write, a line start, a latch, a
+@@ -583,7 +596,8 @@ static void logLine(struct GBA* gba, uint32_t kind, int y) {
+ 	}
+ 	memcpy(start, head, sizeof(head));
+ 	// Entries start on word boundaries.
+-	publish(t, (data - start + 3) & ~3u);
++	t->head += (data - start + 3) & ~3u;
++	publish(t);
+ }
+ 
+ void renderThreadScanline(struct GBA* gba, int y) {
+@@ -622,7 +636,7 @@ static void helperClone(struct RenderThread* t) {
+ 		}
+ 	}
+ 	sharerSet(t->helper, t, HELPER, t->frameSeq);
+-	t->helperDone = atomic_load(&t->written);
++	t->helperDone = t->head;
+ 	t->helperActive = true;
+ 	++renderShareCounts[3];
+ 	t->idleFrames = 0;
+@@ -700,7 +714,7 @@ static void finishShared(struct GBA* gba) {
+ 		if (t->idleFrames > 30) {
+ 			t->helperActive = false;
+ 		} else {
+-			uint64_t const end = atomic_load(&t->written);
++			uint64_t const end = t->head;
+ 			while (t->helperDone < end) {
+ 				uint32_t size;
+ 				play(t->helper, &t->log[t->helperDone & (LOG_SIZE - 1)], &size);
+@@ -781,7 +795,7 @@ void renderThreadFinishFrame(struct GBA* gba) {
+ 		renderHooksPublish(gba);
+ 	}
+ 	entry(gba, LOG_FINISH, 0, 0, 0);
+-	t->finishLogged = atomic_load(&t->written);
++	t->finishLogged = t->head;
+ }
+ 
+ void renderThreadSetWiden(struct GBA* gba, void (*widen)(uint32_t* dst, const uint16_t* src), uint32_t* first, uint32_t* second) {

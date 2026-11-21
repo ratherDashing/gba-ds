@@ -1,0 +1,477 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Thu, 19 Nov 2026 10:00:00 -0500
+Subject: armGBA: a flush gives back every block's records at once (an arena), the game and the hidden copy each count their own compiling, and the stats count flushes by cause
+
+
+diff --git a/src/cpu/a32/backend.c b/src/cpu/a32/backend.c
+index 1b6558a..92a4960 100644
+--- a/src/cpu/a32/backend.c
++++ b/src/cpu/a32/backend.c
+@@ -3078,7 +3078,7 @@ static bool compileInStretch(struct Jit* jit, struct Block* block, struct Inst*
+ 		aB(e, C_AL, jit->exitRoutine);
+ 	}
+ 	block->outCount = c.linkCount;
+-	block->out = malloc(c.linkCount * sizeof(*block->out));
++	block->out = jitAlloc(c.jit, c.linkCount * sizeof(*block->out));
+ 	memcpy(block->out, c.links, c.linkCount * sizeof(*block->out));
+ 	for (int i = 0; i < block->outCount; ++i) {
+ 		struct Link* link = &block->out[i];
+diff --git a/src/cpu/a64/backend.c b/src/cpu/a64/backend.c
+index 481d0b4..14a49eb 100644
+--- a/src/cpu/a64/backend.c
++++ b/src/cpu/a64/backend.c
+@@ -2940,7 +2940,7 @@ static bool compileInStretch(struct Jit* jit, struct Block* block, struct Inst*
+ 		aB(e, jit->exitRoutine);
+ 	}
+ 	block->outCount = c.linkCount;
+-	block->out = malloc(c.linkCount * sizeof(*block->out));
++	block->out = jitAlloc(c.jit, c.linkCount * sizeof(*block->out));
+ 	memcpy(block->out, c.links, c.linkCount * sizeof(*block->out));
+ 	for (int i = 0; i < block->outCount; ++i) {
+ 		struct Link* link = &block->out[i];
+diff --git a/src/cpu/jit-internal.h b/src/cpu/jit-internal.h
+index 679bd4b..8300077 100644
+--- a/src/cpu/jit-internal.h
++++ b/src/cpu/jit-internal.h
+@@ -96,6 +96,12 @@ struct LookupEntry {
+ 
+ struct Block;
+ 
++// Memory for what blocks keep (their records, sites, links, saved code, page lists), taken in chunks and all given back
++// by a flush: freeing a block's pieces one by one cost 28 ms for 8,800 blocks in Azahar, in one frame.
++struct ArenaChunk {
++	struct ArenaChunk* next;
++};
++
+ struct Link {
+ 	uint8_t* site;
+ 	uint8_t* stub;
+@@ -168,6 +174,8 @@ struct Block {
+ 	struct Site* sites;
+ 	int siteCount;
+ 	int siteCap;
++	// Where its records are kept (jitRecordSite grows them)
++	struct Jit* jit;
+ 	// The hash chain, and the list of every block
+ 	struct Block* hashNext;
+ 	struct Block* allNext;
+@@ -361,6 +369,11 @@ struct Jit {
+ 	struct Block* hash[BLOCK_HASH_SIZE];
+ 	struct Block* dormant[BLOCK_HASH_SIZE];
+ 	struct Block* allBlocks;
++	// What blocks keep, until the next flush: the chunks taken, the room left in the last, and the page list nodes to use again
++	struct ArenaChunk* arena;
++	uint8_t* arenaNext;
++	uint8_t* arenaEnd;
++	struct PageNode* freeNodes;
+ 	struct PageNode** pages[CODE_KINDS];
+ 	uint32_t pageCount[CODE_KINDS];
+ 
+@@ -481,6 +494,14 @@ struct Jit {
+ 	uint64_t formMisses;
+ 	uint64_t writeReasons[4];
+ 	uint64_t flushReasons[2];
++	// For the stats: flushes for want of heap, blocks flushes freed (compiled since the last), the ticks they took, and whether
++	// the last compile was refused for heap
++	uint64_t heapLowFlushes, flushedBlocks, compiledAtFlush, flushWorkTicks;
++	// Ticks this machine has spent compiling, when its frame began, and how many of them a frame may take (the 3DS)
++	uint64_t compileTicks, compileFrameStart, compileBudget;
++	// Compiles refused (the stats): for want of heap, for want of an allocation, for want of code memory
++	uint64_t refused[3];
++	bool heapLow;
+ 	uint64_t exits[5];
+ 	uint64_t carefulSteps;
+ 	uint64_t midSteps;
+@@ -515,6 +536,8 @@ static inline int accessSize(int kind) {
+ int codeKindOf(struct GBA*, uint32_t address);
+ 
+ void jitRecordSite(struct Block*, uint32_t offset, uint32_t pc, uint32_t op0, uint32_t op1);
++// Memory that lives until the next flush (not freed one by one); NULL if the heap has none.
++void* jitAlloc(struct Jit*, size_t size);
+ // With ARMGBA_PERFMAP set, names generated code for perf in /tmp/perf-<pid>.map.
+ void jitNameCode(const void* start, const void* end, const char* name);
+ void jitNameBlock(const struct Block*, const void* bodyEnd, const void* cold, const void* end);
+diff --git a/src/cpu/jit-layout.h b/src/cpu/jit-layout.h
+index 936946d..cbd7f76 100644
+--- a/src/cpu/jit-layout.h
++++ b/src/cpu/jit-layout.h
+@@ -146,7 +146,6 @@ bool backendColdSide(const struct Jit* jit, const uint8_t* p) {
+ // Forgets what a compile whose code didn't fit left behind.
+ static void abandon(struct Compiler* c) {
+ 	c->block->siteCount = 0;
+-	free(c->block->out);
+ 	c->block->out = NULL;
+ 	c->block->outCount = 0;
+ }
+diff --git a/src/cpu/jit.c b/src/cpu/jit.c
+index a665665..2d8bfd6 100644
+--- a/src/cpu/jit.c
++++ b/src/cpu/jit.c
+@@ -236,7 +236,12 @@ static void addPages(struct Jit* jit, struct Block* block) {
+ 		return;
+ 	}
+ 	for (uint32_t page = block->start >> PAGE_SHIFT; page <= (block->stop - 1) >> PAGE_SHIFT; ++page) {
+-		struct PageNode* node = malloc(sizeof(*node));
++		struct PageNode* node = jit->freeNodes;
++		if (node) {
++			jit->freeNodes = node->next;
++		} else {
++			node = jitAlloc(jit, sizeof(*node));
++		}
+ 		node->block = block;
+ 		node->next = jit->pages[kind][page];
+ 		jit->pages[kind][page] = node;
+@@ -318,32 +323,68 @@ static void removeBlock(struct Jit* jit, struct Block* block) {
+ 	// removed.
+ }
+ 
+-// Frees every block and list, for a flush or at shutdown.
++// Memory that lives until the next flush, from chunks that go back together. A heap too full or too
++// cut up for a chunk gives what is asked for piece by piece, as malloc did before the chunks.
++void* jitAlloc(struct Jit* jit, size_t size) {
++	enum { CHUNK = 64 << 10, ALIGN = 8 };
++	size = (size + ALIGN - 1) & ~(size_t) (ALIGN - 1);
++	if (size > (size_t) (jit->arenaEnd - jit->arenaNext)) {
++		// A request that would waste much of a chunk has one to itself, behind the one being filled.
++		size_t take = size > CHUNK / 4 ? size : CHUNK;
++		struct ArenaChunk* chunk = malloc(sizeof(*chunk) + take + ALIGN);
++		if (!chunk && take > size) {
++			take = size;
++			chunk = malloc(sizeof(*chunk) + take + ALIGN);
++		}
++		if (!chunk) {
++			return NULL;
++		}
++		uint8_t* const start = (uint8_t*) (((uintptr_t) (chunk + 1) + ALIGN - 1) & ~(uintptr_t) (ALIGN - 1));
++		if (take == size && (size > CHUNK / 4 || jit->arena)) {
++			chunk->next = jit->arena ? jit->arena->next : NULL;
++			if (jit->arena) {
++				jit->arena->next = chunk;
++			} else {
++				jit->arena = chunk;
++				jit->arenaNext = jit->arenaEnd = start + size;
++			}
++			return start;
++		}
++		chunk->next = jit->arena;
++		jit->arena = chunk;
++		jit->arenaNext = start;
++		jit->arenaEnd = start + take;
++	}
++	void* const at = jit->arenaNext;
++	jit->arenaNext += size;
++	return at;
++}
++
++static void* jitAllocZero(struct Jit* jit, size_t size) {
++	void* const at = jitAlloc(jit, size);
++	if (at) {
++		memset(at, 0, size);
++	}
++	return at;
++}
++
++// Gives back every block and list, for a flush or at shutdown.
+ static void freeAll(struct Jit* jit) {
+ 	for (int kind = 0; kind < CODE_KINDS; ++kind) {
+-		if (!jit->pages[kind]) {
+-			continue;
+-		}
+-		for (uint32_t page = 0; page < jit->pageCount[kind]; ++page) {
+-			struct PageNode* node = jit->pages[kind][page];
+-			while (node) {
+-				struct PageNode* next = node->next;
+-				free(node);
+-				node = next;
+-			}
+-			jit->pages[kind][page] = NULL;
++		if (jit->pages[kind]) {
++			memset(jit->pages[kind], 0, jit->pageCount[kind] * sizeof(*jit->pages[kind]));
+ 		}
+ 	}
+-	struct Block* block = jit->allBlocks;
+-	while (block) {
+-		struct Block* next = block->allNext;
+-		free(block->sites);
+-		free(block->bytes);
+-		free(block->out);
+-		free(block->entries);
+-		free(block);
+-		block = next;
++	jit->flushedBlocks += jit->compiled - jit->compiledAtFlush;
++	jit->compiledAtFlush = jit->compiled;
++	for (struct ArenaChunk* chunk = jit->arena; chunk;) {
++		struct ArenaChunk* const next = chunk->next;
++		free(chunk);
++		chunk = next;
+ 	}
++	jit->arena = NULL;
++	jit->arenaNext = jit->arenaEnd = NULL;
++	jit->freeNodes = NULL;
+ 	jit->allBlocks = NULL;
+ 	memset(jit->hash, 0, sizeof(jit->hash));
+ 	memset(jit->dormant, 0, sizeof(jit->dormant));
+@@ -354,8 +395,13 @@ static void freeAll(struct Jit* jit) {
+ // needs them finds its site by its return address.
+ void jitRecordSite(struct Block* block, uint32_t offset, uint32_t pc, uint32_t op0, uint32_t op1) {
+ 	if (block->siteCount == block->siteCap) {
+-		block->siteCap = block->siteCap ? block->siteCap * 2 : 8;
+-		block->sites = realloc(block->sites, block->siteCap * sizeof(*block->sites));
++		int const cap = block->siteCap ? block->siteCap * 2 : 8;
++		struct Site* const sites = jitAlloc(block->jit, cap * sizeof(*sites));
++		if (block->siteCount) {
++			memcpy(sites, block->sites, block->siteCount * sizeof(*sites));
++		}
++		block->sites = sites;
++		block->siteCap = cap;
+ 	}
+ 	block->sites[block->siteCount++] = (struct Site) { offset, pc, { op0, op1 } };
+ }
+@@ -560,9 +606,16 @@ uint32_t jitIoStore(struct GBA* gba, int kind, uint32_t address, uint32_t value)
+ 	return slowDone(gba, runs, 0);
+ }
+ 
++#if defined(__3DS__)
++uint64_t renderThreadHostTicks(void);
++#endif
++
+ // Throws all compiled code away and starts again from the bottom of the code memory.
+ void jitFlush(struct GBA* gba) {
+ 	struct Jit* jit = gba->jit;
++#if defined(__3DS__)
++	uint64_t const began = renderThreadHostTicks();
++#endif
+ 	freeAll(jit);
+ 	jit->midCompiled = 0;
+ 	jit->rangeCount = 0;
+@@ -591,6 +644,9 @@ void jitFlush(struct GBA* gba) {
+ 	jit->irqReturn = ~0u;
+ 	jit->carefulAtFlush = jit->carefulBytes;
+ 	++jit->flushes;
++#if defined(__3DS__)
++	jit->flushWorkTicks += renderThreadHostTicks() - began;
++#endif
+ }
+ 
+ void jitSetMidAfter(struct GBA* gba, int times) {
+@@ -680,7 +736,8 @@ static bool removeBlocks(struct GBA* gba, int kind, uint32_t start, uint32_t sto
+ 					dirtyTo = block->stop > top ? top : block->stop;
+ 				}
+ 				*prev = node->next;
+-				free(node);
++				node->next = jit->freeNodes;
++				jit->freeNodes = node;
+ 				continue;
+ 			}
+ 			prev = &node->next;
+@@ -1165,23 +1222,21 @@ enum {
+ 	WARM_MOST = 1 << 16,
+ };
+ 
+-#if defined(__3DS__)
+-// For the frontend's numbers: time spent compiling, in the host's ticks.
+-uint64_t renderThreadHostTicks(void);
+-uint64_t jitCompileTicks;
+-#endif
+ 
+ static struct Block* compileBlock(struct GBA* gba, uint32_t pc, bool thumb, const struct Block* parent) {
+ #if defined(__3DS__)
++	struct Jit* const jit = gba->jit;
+ 	// Blocks take heap as well as code memory (about as much again): when the heap runs low the
+ 	// caller flushes, as when the code memory is full. Mario Kart ran the heap out with room left
+ 	// for code, and crashed (2026-11-09).
+-	if (jitHostMemoryLow()) {
++	jit->heapLow = jitHostMemoryLow();
++	if (jit->heapLow) {
++		++jit->refused[0];
+ 		return NULL;
+ 	}
+ 	uint64_t const began = renderThreadHostTicks();
+ 	struct Block* block = compileBlockTimed(gba, pc, thumb, parent);
+-	jitCompileTicks += renderThreadHostTicks() - began;
++	jit->compileTicks += renderThreadHostTicks() - began;
+ 	return block;
+ #else
+ 	return compileBlockTimed(gba, pc, thumb, parent);
+@@ -1261,10 +1316,14 @@ static struct Block* compileBlockTimed(struct GBA* gba, uint32_t pc, bool thumb,
+ 		nextOps[i] = thumb ? codeFetch16(gba, at) : codeFetch32(gba, at);
+ 	}
+ 
+-	struct Block* block = calloc(1, sizeof(*block));
++	struct ArenaChunk* const arenaChunk = jit->arena;
++	uint8_t* const arenaAt = jit->arenaNext;
++	struct Block* block = jitAllocZero(jit, sizeof(*block));
+ 	if (!block) {
++		++jit->refused[1];
+ 		return NULL;
+ 	}
++	block->jit = jit;
+ 	block->pc = pc;
+ 	block->end = end;
+ 	block->thumb = thumb;
+@@ -1288,14 +1347,15 @@ static struct Block* compileBlockTimed(struct GBA* gba, uint32_t pc, bool thumb,
+ 	block->valid = true;
+ 	block->idleHead = jitIsIdleHead(jit, blockKey(pc, thumb));
+ 	if (careful) {
+-		block->entries = calloc(count, sizeof(*block->entries));
++		block->entries = jitAllocZero(jit, count * sizeof(*block->entries));
+ 	}
+ 
+ 	if (!backendCompile(jit, block, insts, count, nextOps)) {
+-		free(block->sites);
+-		free(block->out);
+-		free(block->entries);
+-		free(block);
++		// A careful copy that doesn't fit may be tried again and again before a flush: give back what it took.
++		if (jit->arena == arenaChunk) {
++			jit->arenaNext = arenaAt;
++		}
++		++jit->refused[2];
+ 		return NULL;
+ 	}
+ 	idleSpan(jit, block, &insts[count - 1]);
+@@ -1364,8 +1424,10 @@ static struct Block* compileBlockTimed(struct GBA* gba, uint32_t pc, bool thumb,
+ 		block->cached = true;
+ 		// Once copied back, rewritten words could hold forms the block wasn't compiled for.
+ 		if (kind != CODE_BIOS && kind != CODE_ROM && kind != CODE_NONE && !polymorphic) {
+-			block->bytes = malloc(block->bodyStop - block->start);
+-			memcpy(block->bytes, codePointer(gba, pc), block->bodyStop - block->start);
++			block->bytes = jitAlloc(jit, block->bodyStop - block->start);
++			if (block->bytes) {
++				memcpy(block->bytes, codePointer(gba, pc), block->bodyStop - block->start);
++			}
+ 		}
+ 		registerBlock(jit, block);
+ 	}
+@@ -1416,19 +1478,33 @@ enum {
+ };
+ 
+ #if defined(__3DS__)
+-// From the frontend, each frame: how long compiling may take in it before blocks are put off to a
+-// later frame (the frame's time left over after emulation, in the host's ticks), and what
+-// jitCompileTicks was when the frame began. A race starting compiled hundreds of blocks in a
+-// frame or two, each frame then late (2026-11-09).
+-uint64_t jitCompileBudget = ~0ull, jitCompileFrameStart;
+ uint64_t jitBudgetPutOff;
++
++// From the frontend, at the start of each frame: how long this machine's compiling may take in it
++// before blocks are put off to a later frame (the frame's time left over after emulation, in the
++// host's ticks). A race starting compiled hundreds of blocks in a frame or two, each frame then late
++// (2026-11-09). Each machine counts its own compiling: with one count for all, the hidden copy's
++// compiling used up the game's time and the game compiled no careful copies while a capture ran.
++void jitSetCompileBudget(struct GBA* gba, uint64_t ticks) {
++	struct Jit* const jit = gba->jit;
++	if (jit) {
++		jit->compileFrameStart = jit->compileTicks;
++		jit->compileBudget = ticks;
++	}
++}
++#else
++void jitSetCompileBudget(struct GBA* gba, uint64_t ticks) {
++	(void) gba;
++	(void) ticks;
++}
+ #endif
+ 
+ // Whether compiling has used up its time in this frame.
+-static bool compileBusy(void) {
++static bool compileBusy(const struct Jit* jit) {
+ #if defined(__3DS__)
+-	return jitCompileTicks - jitCompileFrameStart > jitCompileBudget;
++	return jit->compileTicks - jit->compileFrameStart > jit->compileBudget;
+ #else
++	(void) jit;
+ 	return false;
+ #endif
+ }
+@@ -1441,9 +1517,9 @@ void jitSetCompileAfter(int times) {
+ }
+ 
+ // Times a block's start is stepped through before it's compiled, as things are.
+-static int compileAfter(void) {
++static int compileAfter(const struct Jit* jit) {
+ 	int const busy = compileAfterSetting + 2 > COMPILE_AFTER_BUSY ? compileAfterSetting + 2 : COMPILE_AFTER_BUSY;
+-	return compileBusy() ? busy : compileAfterSetting;
++	return compileBusy(jit) ? busy : compileAfterSetting;
+ }
+ 
+ // Returns the block for a PC: an existing one, one brought back unchanged from before a rewrite, or
+@@ -1466,7 +1542,7 @@ static struct Block* getBlock(struct GBA* gba, uint32_t pc, bool thumb) {
+ 	// then steps to the end of the block
+ 	// without looking each instruction up.
+ 	uint8_t* seen = &jit->seenCount[lookupHash(key)];
+-	if (*seen < compileAfter() && !gba->traceFile) {
++	if (*seen < compileAfter(jit) && !gba->traceFile) {
+ #if defined(__3DS__)
+ 		jitBudgetPutOff += *seen >= compileAfterSetting;
+ #endif
+@@ -1480,6 +1556,7 @@ static struct Block* getBlock(struct GBA* gba, uint32_t pc, bool thumb) {
+ 	block = compileBlock(gba, pc, thumb, NULL);
+ 	if (!block) {
+ 		++jit->flushReasons[1];
++		jit->heapLowFlushes += jit->heapLow;
+ 		jitFlush(gba);
+ 		block = compileBlock(gba, pc, thumb, NULL);
+ 	}
+@@ -2157,7 +2234,7 @@ void jitRunLoop(struct GBA* gba) {
+ 				// A place that keeps being returned to, as an interrupt returns to the same instruction line
+ 				// after line, gets a block of its own; the rest, whose events fall all over, are stepped.
+ 				uint8_t* seen = &jit->seenCount[lookupHash(key)];
+-				if (!jit->midAfter || *seen < jit->midAfter || jit->midCompiled >= jit->codeSize >> MID_BLOCK_SHIFT || compileBusy()) {
++				if (!jit->midAfter || *seen < jit->midAfter || jit->midCompiled >= jit->codeSize >> MID_BLOCK_SHIFT || compileBusy(jit)) {
+ 					if (jit->midAfter && *seen < jit->midAfter) {
+ 						++*seen;
+ 					}
+@@ -2262,7 +2339,7 @@ void jitRunLoop(struct GBA* gba) {
+ 				// to the event instead, as when there's no room for one.
+ 				// Nor is one compiled in a frame that has used up its time for compiling, or once careful
+ 				// copies have taken their share of the code memory (CAREFUL_SHARE).
+-				bool const earned = link->from->twin || (link->from->checkFires >= CAREFUL_AFTER && !compileBusy() && !carefulFull(jit));
++				bool const earned = link->from->twin || (link->from->checkFires >= CAREFUL_AFTER && !compileBusy(jit) && !carefulFull(jit));
+ 				if (!earned) {
+ 					struct Block* from = link->from;
+ 					if (gba->video.frameCounter - from->firesFrom > CAREFUL_FRAMES) {
+@@ -2305,7 +2382,7 @@ void jitRunLoop(struct GBA* gba) {
+ 			// When tracing, every block is entered from here.
+ 			// A block not met yet is left to the run loop, which steps through it the first time.
+ 			if (!jit->flushRequested && !jit->waitsChanged && compilable(gba, next, thumb) && !gba->traceFile &&
+-			    (findBlock(jit, blockKey(next, thumb)) || jit->seenCount[lookupHash(blockKey(next, thumb))] >= compileAfter())) {
++			    (findBlock(jit, blockKey(next, thumb)) || jit->seenCount[lookupHash(blockKey(next, thumb))] >= compileAfter(jit))) {
+ 				uint64_t flushes = jit->flushes;
+ 				struct Block* target = getBlock(gba, next, thumb);
+ 				if (target && flushes == jit->flushes) {
+@@ -2835,6 +2912,7 @@ bool jitInit(struct GBA* gba) {
+ 	jit->gba = gba;
+ 	gba->jit = jit;
+ 	jit->midAfter = MID_AFTER;
++	jit->compileBudget = ~0ull;
+ #if defined(__3DS__)
+ 	jit->codeSize = CODE_SIZE;
+ 	jit->code = jitHostAllocCode(&jit->codeSize);
+diff --git a/src/cpu/jit.h b/src/cpu/jit.h
+index 6286202..fe20759 100644
+--- a/src/cpu/jit.h
++++ b/src/cpu/jit.h
+@@ -34,6 +34,8 @@ void jitFlush(struct GBA*);
+ void jitSetMidAfter(struct GBA*, int times);
+ // How many visits to a new block are stepped through before it is compiled (1 to 250, for every machine; 0 or less: 2, as built).
+ void jitSetCompileAfter(int times);
++// The host ticks this machine may spend compiling in a frame before blocks are put off; call at the start of a frame (the 3DS).
++void jitSetCompileBudget(struct GBA*, uint64_t ticks);
+ // false: a careful copy lets only events that start no DMA run after an instruction, as it did before it let more.
+ void jitSetDeferMore(struct GBA*, bool on);
+ // The code memory compiled code takes so far, and (size) all there is: for a frontend that empties it
+diff --git a/src/cpu/x64/backend.c b/src/cpu/x64/backend.c
+index 5401282..a33efd2 100644
+--- a/src/cpu/x64/backend.c
++++ b/src/cpu/x64/backend.c
+@@ -2848,7 +2848,7 @@ static bool compileInStretch(struct Jit* jit, struct Block* block, struct Inst*
+ 		xJmp(e, jit->exitRoutine);
+ 	}
+ 	block->outCount = c.linkCount;
+-	block->out = malloc(c.linkCount * sizeof(*block->out));
++	block->out = jitAlloc(c.jit, c.linkCount * sizeof(*block->out));
+ 	memcpy(block->out, c.links, c.linkCount * sizeof(*block->out));
+ 	for (int i = 0; i < block->outCount; ++i) {
+ 		struct Link* link = &block->out[i];

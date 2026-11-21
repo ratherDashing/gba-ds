@@ -79,6 +79,7 @@ int SDL_UnlockMutex(SDL_mutex* m);
 #define SDL_PIXELFORMAT_ARGB8888 0x16362004u
 #define SDL_PIXELFORMAT_ABGR8888 0x16762004u
 #define SDL_PIXELFORMAT_XBGR8888 0x16561804u
+#define SDL_PIXELFORMAT_RGB565 0x15151002u /* (only for streaming textures: mGBA's 16-bit pictures) */
 #define SDL_PIXELFORMAT_RGBA32 SDL_PIXELFORMAT_ABGR8888
 typedef struct SDL_PixelFormat {
 	Uint32 format;

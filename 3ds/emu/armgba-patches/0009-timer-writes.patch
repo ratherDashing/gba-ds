@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Wed, 18 Nov 2026 01:00:00 -0500
+Subject: armGBA: a timer's reload or control write takes effect at once, and the timers' replan and quiet-overflow planning do less
+
+
+diff --git a/src/io/timer.c b/src/io/timer.c
+index d020194..2cc1e8c 100644
+--- a/src/io/timer.c
++++ b/src/io/timer.c
+@@ -90,34 +90,20 @@ static int quietOverflows(struct GBA* gba, int id) {
+ 			limit = ticks;
+ 		}
+ 	}
+-	struct {
+-		int size;
+-		int remaining;
+-		bool asks;
+-	} fifos[2];
+-	int count = 0;
+ 	for (int fifo = 0; fifo < 2; ++fifo) {
+ 		if (!feeds(gba, fifo, id)) {
+ 			continue;
+ 		}
+ 		struct Fifo* channel = fifo ? &gba->audio.chB : &gba->audio.chA;
+-		int size = channel->fifoWrite - channel->fifoRead;
+-		fifos[count].size = size < 0 ? size + AUDIO_FIFO_SIZE : size;
+-		fifos[count].remaining = channel->internalRemaining;
+-		fifos[count].asks = channel->dmaSource > 0 && dmaFifoArmed(gba, channel->dmaSource);
+-		++count;
+-	}
+-	for (int n = 1; n <= limit; ++n) {
+-		for (int i = 0; i < count; ++i) {
+-			if (fifos[i].asks && AUDIO_FIFO_SIZE - fifos[i].size > 4) {
+-				return n - 1;
+-			}
+-			if (!fifos[i].remaining && fifos[i].size) {
+-				--fifos[i].size;
+-				fifos[i].remaining = 4;
+-			}
+-			if (fifos[i].remaining) {
+-				--fifos[i].remaining;
++		if (channel->dmaSource > 0 && dmaFifoArmed(gba, channel->dmaSource)) {
++			// A word is used up every four overflows, the first after the bytes left of the current one; the DMA is asked
++			// for more once four words of room are free, and the overflow before that one is the last quiet.
++			int size = channel->fifoWrite - channel->fifoRead;
++			size = size < 0 ? size + AUDIO_FIFO_SIZE : size;
++			int const words = size - (AUDIO_FIFO_SIZE - 5);
++			int const last = words <= 0 ? 0 : channel->internalRemaining + 4 * words - 3;
++			if (last < limit) {
++				limit = last;
+ 			}
+ 		}
+ 	}
+@@ -188,6 +174,9 @@ void timerCatchUp(struct GBA* gba, uint32_t time, bool inclusive) {
+ void timerReplan(struct GBA* gba, uint32_t time) {
+ 	for (int id = 0; id < 4; ++id) {
+ 		struct Timer* timer = &gba->timers[id];
++		if (!timer->quiet) {
++			continue;
++		}
+ 		catchUp(gba, id, time, true);
+ 		if (timer->quiet) {
+ 			timer->quiet = 0;
+@@ -295,11 +284,34 @@ uint16_t timerReadCounter(struct GBA* gba, int id) {
+ 	return counter;
+ }
+ 
+-// Writes to a timer take effect one cycle later, so they are events.
++// Writes to a timer take effect one cycle later, so they are events. With no event due by then and no overflow
++// of the timer's own to settle, the write is applied at once as of that cycle (late -1), as gba.c's applyWrite does.
++static bool writeAtOnce(struct GBA* gba, const struct Timer* written, bool control) {
++	struct Timing* timing = &gba->timing;
++	if (gba->performingDma || gba->cpu.overclock || gba->inEvent || timing->reroot) {
++		return false;
++	}
++	if (timing->root && timingUntil(gba, timing->root) <= 1) {
++		return false;
++	}
++	// A quiet overflow due by then would feed a FIFO with a time ahead of the clock, which DMA's request can't take.
++	uint32_t const due = timingCurrentTime(gba) + 1;
++	for (int id = 0; id < 4; ++id) {
++		const struct Timer* timer = &gba->timers[id];
++		if (timer->quiet && (int32_t) (timer->started + period(timer) - due) <= 0) {
++			return false;
++		}
++	}
++	// Stopping a running timer past its overflow would hand overflow() a late of -1.
++	return !control || !written->running || written->counter + ((due - written->started) >> written->prescaleBits) < 0x10000;
++}
++
+ void timerWriteReload(struct GBA* gba, int id, uint16_t reload) {
+ 	struct Timer* timer = &gba->timers[id];
+ 	timer->pendingReload = reload;
+-	if (!timingIsScheduled(gba, &timer->reloadWrite)) {
++	if (writeAtOnce(gba, timer, false)) {
++		reloadWritten(gba, (void*) (intptr_t) id, (uint32_t) -1);
++	} else if (!timingIsScheduled(gba, &timer->reloadWrite)) {
+ 		timingSchedule(gba, &timer->reloadWrite, 1);
+ 	}
+ }
+@@ -307,7 +319,9 @@ void timerWriteReload(struct GBA* gba, int id, uint16_t reload) {
+ void timerWriteControl(struct GBA* gba, int id, uint16_t control) {
+ 	struct Timer* timer = &gba->timers[id];
+ 	timer->pendingControl = control & 0x00C7;
+-	if (!timingIsScheduled(gba, &timer->controlWrite)) {
++	if (writeAtOnce(gba, timer, true)) {
++		controlWritten(gba, (void*) (intptr_t) id, (uint32_t) -1);
++	} else if (!timingIsScheduled(gba, &timer->controlWrite)) {
+ 		timingSchedule(gba, &timer->controlWrite, 1);
+ 	}
+ }

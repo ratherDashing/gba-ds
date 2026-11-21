@@ -10,6 +10,7 @@
 #include "config.h"
 #include "esde.h"
 #include "esinteg.h"
+#include "bench.h"
 #include "game.h"
 #include "library.h"
 #include "logo.h"
@@ -32,6 +33,9 @@
 #include <string.h>
 #include <strings.h>
 #include <unistd.h>
+#ifdef __3DS__
+#include "host.h"
+#endif
 
 /* true if the folder has a .png in it */
 static bool dir_has_png(const char* path) {
@@ -200,6 +204,11 @@ int main(int argc, char** argv) {
 	signal(SIGINT, on_signal);
 	signal(SIGHUP, on_signal);
 
+#ifdef __3DS__
+	host_set_cores(cfg.sideCore, cfg.captureCore, cfg.aheadCore, cfg.videoCore, cfg.core1Limit, cfg.coreProbe);
+	host_set_lines_first(cfg.linesFirst);
+	host_set_capture_priority(cfg.capturePriority);
+#endif
 	if (!ui_init(&cfg, true)) return 1;
 	ui_theme(cfg.lightTheme);
 	ui_brightness(cfg.brightTop, cfg.brightBottom);
@@ -210,7 +219,9 @@ int main(int argc, char** argv) {
 #endif
 	if (cfg.inputScript[0]) ui_load_script(cfg.inputScript);
 
-	if (cfg.rom[0]) {
+	if (cfg.bench[0]) {
+		bench_run(&cfg);
+	} else if (cfg.rom[0]) {
 		while (game_run(&cfg, cfg.rom, false) == GAME_RELOAD && !uiQuit) fprintf(stderr, "restarting %s\n", cfg.rom);
 	} else {
 		char rom[1024];

@@ -102,20 +102,20 @@ bool logo_extract(const char* romPath, const char* gameCode, const char* outPng)
 	layers(&e, -1); /* backdrop only */
 	emu_state_load(&e, st);
 	emu_frame(&e, 0);
-	memcpy(back, e.fb, GBA_W * GBA_H * 4);
+	memcpy(back, emu_fb(&e), GBA_W * GBA_H * 4);
 	if (p->logo.mask) layers(&e, -2); /* a mask cuts the logo out of the whole picture */
 	else if (p->logo.layers) layer_set(&e, p->logo.layers); /* a logo over several layers (FFTA: its shadow) */
 	else layers(&e, p->logo.layer);
 	emu_state_load(&e, st);
 	emu_frame(&e, 0);
-	memcpy(fg, e.fb, GBA_W * GBA_H * 4);
+	memcpy(fg, emu_fb(&e), GBA_W * GBA_H * 4);
 	if (!p->logo.mask && p->logo.layers && p->logo.objMaxY > 0 && p->logo.objMaxY < GBA_H) {
 		/* below objMaxY, the BG layers without the sprites (Summon Night:
 		 * its PRESS START BUTTON is a sprite across the sword's hilt) */
 		layer_set(&e, p->logo.layers & ~0x10u);
 		emu_state_load(&e, st);
 		emu_frame(&e, 0);
-		memcpy(fg + p->logo.objMaxY * GBA_W, e.fb + p->logo.objMaxY * GBA_W, (size_t) (GBA_H - p->logo.objMaxY) * GBA_W * 4);
+		memcpy(fg + p->logo.objMaxY * GBA_W, emu_fb(&e) + p->logo.objMaxY * GBA_W, (size_t) (GBA_H - p->logo.objMaxY) * GBA_W * 4);
 	}
 	if (!p->logo.mask && p->logo.layers && p->logo.lowFrom > 0 && p->logo.lowFrom < GBA_H) {
 		/* from lowFrom down, only lowLayers (Sonic Pinball Party: its
@@ -123,7 +123,7 @@ bool logo_extract(const char* romPath, const char* gameCode, const char* outPng)
 		layer_set(&e, p->logo.lowLayers);
 		emu_state_load(&e, st);
 		emu_frame(&e, 0);
-		memcpy(fg + p->logo.lowFrom * GBA_W, e.fb + p->logo.lowFrom * GBA_W, (size_t) (GBA_H - p->logo.lowFrom) * GBA_W * 4);
+		memcpy(fg + p->logo.lowFrom * GBA_W, emu_fb(&e) + p->logo.lowFrom * GBA_W, (size_t) (GBA_H - p->logo.lowFrom) * GBA_W * 4);
 	}
 	layers(&e, -2);
 	emu_close(&e);

@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Tue, 17 Nov 2026 15:00:00 -0500
+Subject: armGBA: palette and OAM accesses, IE and IME loads and the IE/IF word load run inline in the a32 memory routines
+
+
+diff --git a/src/cpu/a32/backend.c b/src/cpu/a32/backend.c
+index d1fdf04..22cd230 100644
+--- a/src/cpu/a32/backend.c
++++ b/src/cpu/a32/backend.c
+@@ -663,6 +663,61 @@ static void emitOffset(struct Emitter* e, int bits, int size) {
+ 	}
+ }
+ 
++// Tells the renderer about a store into the palette or OAM at offset r0 that changes something:
++// compares the size bytes there with r2 and, if they differ, stores them and sets what in
++// memoryChanged. Uses r1, r3 and r12.
++static void emitSmallVideoStore(struct Emitter* e, int size, uint32_t data, int what) {
++	fieldAddr(e, R3, data);
++	if (size == 4) {
++		aMemR(e, true, false, R12, R3, R0, 0);
++		aDpR(e, C_AL, D_CMP, true, 0, R12, R2, S_LSL, 0);
++	} else {
++		aMemHR(e, true, H_HALF, R12, R3, R0);
++		aDpR(e, C_AL, D_EOR, false, R1, R12, R2, S_LSL, 0);
++		aDpR(e, C_AL, D_MOV, true, R1, 0, R1, S_LSL, 16);
++	}
++	uint8_t* same = aB(e, C_EQ, NULL);
++	if (size == 4) {
++		aMemR(e, false, false, R2, R3, R0, 0);
++	} else {
++		aMemHR(e, false, H_HALF, R2, R3, R0);
++	}
++	ldrbF(e, R1, OFF(renderer.memoryChanged));
++	aDpI(e, C_AL, D_ORR, false, R1, R1, (uint32_t) what);
++	strbF(e, R1, OFF(renderer.memoryChanged));
++	patchHere(e, same);
++}
++
++// Palette RAM (palette true) or OAM, 1 KiB each, mirrored; r1 = address. Neither stalls for the
++// display, and only a 32-bit palette access has a wait state. Byte stores go to C.
++static void emitSmallVideoAccess(struct Emitter* e, int kind, bool romCode, bool palette, uint8_t** toSlow, int* slowCount) {
++	bool store = kind >= MEM_STORE32;
++	int size = accessSize(kind);
++	int cycles = (palette && size == 4 ? 2 : 1) + (store ? 0 : 1);
++	if (store) {
++		// Compiled code covering video memory, or a line whose H-blank has come, is C's to handle.
++		ldrbF(e, R0, OFF(videoCode));
++		aDpI(e, C_AL, D_CMP, true, 0, R0, 0);
++		toSlow[(*slowCount)++] = aB(e, C_NE, NULL);
++		timeUntil(e, R0, R3, cycles, OFF(video.drawDue));
++		toSlow[(*slowCount)++] = aB(e, C_PL, NULL);
++	}
++	cmnCycles(e, cycles);
++	toSlow[(*slowCount)++] = aB(e, C_GE, NULL);
++	emitOffset(e, 10, size);
++	if (store) {
++		emitSmallVideoStore(e, size, palette ? OFF(palette) : OFF(oam), palette ? RENDER_PALETTE : RENDER_OAM);
++		if (romCode) {
++			emitMissSignal(e, kind, false);
++		}
++	} else {
++		fieldAddr(e, R3, palette ? OFF(palette) : OFF(oam));
++		emitLoadData(e, kind, R3);
++	}
++	aAddI(e, R_CYC, R_CYC, cycles, R12);
++	aBx(e, LR);
++}
++
+ // romCode is set for cartridge code with the prefetch buffer, whose data accesses to the cartridge
+ // stop it.
+ static uint8_t* emitMemRoutine(struct Jit* jit, struct Emitter* e, int kind, bool romCode) {
+@@ -673,7 +728,7 @@ static uint8_t* emitMemRoutine(struct Jit* jit, struct Emitter* e, int kind, boo
+ 	int32_t waitN = size == 4 ? OFF(waitN32) : OFF(waitN16);
+ 	// The access and a load's internal cycle.
+ 	int fixed = store ? 1 : 2;
+-	uint8_t* toSlow[24];
++	uint8_t* toSlow[32];
+ 	int slowCount = 0;
+ 
+ 	aDpR(e, C_AL, D_MOV, false, R0, 0, R1, S_LSR, 24);
+@@ -694,6 +749,20 @@ static uint8_t* emitMemRoutine(struct Jit* jit, struct Emitter* e, int kind, boo
+ 		aDpI(e, C_AL, D_CMP, true, 0, R0, REGION_ROM2_EX - REGION_ROM0);
+ 		toRom = aB(e, C_LS, NULL);
+ 	}
++	if (kind == MEM_LOAD32) {
++		aCmpI(e, R0, REGION_IO - REGION_ROM0, R3);
++		toIo = aB(e, C_EQ, NULL);
++	}
++	// Byte stores to palette RAM and OAM are rare; they stay with C.
++	uint8_t* toPalette = NULL;
++	uint8_t* toOam = NULL;
++	if (kind != MEM_STORE8) {
++		int32_t base = store ? 0 : REGION_ROM0;
++		aCmpI(e, R0, REGION_PALETTE - base, R3);
++		toPalette = aB(e, C_EQ, NULL);
++		aCmpI(e, R0, REGION_OAM - base, R3);
++		toOam = aB(e, C_EQ, NULL);
++	}
+ 	toSlow[slowCount++] = aB(e, C_AL, NULL);
+ 
+ 	for (int r = 0; r < 2; ++r) {
+@@ -820,32 +889,68 @@ static uint8_t* emitMemRoutine(struct Jit* jit, struct Emitter* e, int kind, boo
+ 		emitVramAccess(e, kind, romCode, toSlow, &slowCount);
+ 	}
+ 
+-	if (toIo) {
++	if (toPalette) {
++		patchHere(e, toPalette);
++		emitSmallVideoAccess(e, kind, romCode, true, toSlow, &slowCount);
++		patchHere(e, toOam);
++		emitSmallVideoAccess(e, kind, romCode, false, toSlow, &slowCount);
++	}
++
++	if (toIo && kind == MEM_LOAD32) {
++		// IE and IF together, which an interrupt handler reads as one word: the same two values as the
++		// halfword loads below.
++		patchHere(e, toIo);
++		emitGuard(e, fixed, -1, toSlow, &slowCount);
++		aUbfx(e, R0, R1, 0, 24);
++		aDpI(e, C_AL, D_BIC, false, R0, R0, 3);
++		aCmpI(e, R0, REG_IE, R3);
++		toSlow[slowCount++] = aB(e, C_NE, NULL);
++		timeUntil(e, R2, R3, fixed, OFF(irq.ifStable));
++		toSlow[slowCount++] = aB(e, C_PL, NULL);
++		fieldAddr(e, R3, OFF(io));
++		emitLoadData(e, kind, R3);
++		aDpI(e, C_AL, D_ADD, false, R_CYC, R_CYC, fixed);
++		aBx(e, LR);
++	} else if (toIo) {
+ 		// Registers games poll that ioRead returns as stored: KEYINPUT; VCOUNT and DISPSTAT until
+-		// the next line or H-blank; and IF until an H-blank IRQ request it works out, when ioRead
+-		// brings them up to date.
+-		static const uint32_t plain[] = { REG_DISPCNT, REG_DISPSTAT, REG_VCOUNT, REG_IF, REG_KEYINPUT };
++		// the next line or H-blank; IF until an H-blank IRQ request it works out, when ioRead
++		// brings them up to date; and IE and IME, which events change.
++		static const struct {
++			uint32_t reg;
++			int32_t stable;
++		} regs[] = {
++			{ REG_IME, -1 }, { REG_IE, -1 }, { REG_IF, OFF(irq.ifStable) }, { REG_VCOUNT, OFF(video.stableUntil) },
++			{ REG_DISPSTAT, OFF(video.stableUntil) }, { REG_KEYINPUT, -1 }, { REG_DISPCNT, -1 },
++		};
+ 		patchHere(e, toIo);
+ 		emitGuard(e, fixed, -1, toSlow, &slowCount);
+ 		aUbfx(e, R0, R1, 0, 24);
+ 		aDpI(e, C_AL, D_BIC, false, R0, R0, 1);
+-		uint8_t* toPlain[5];
+-		for (int i = 0; i < 5; ++i) {
+-			aCmpI(e, R0, plain[i], R3);
+-			toPlain[i] = aB(e, C_EQ, NULL);
++		uint8_t* toReg[7];
++		for (int i = 0; i < 7; ++i) {
++			aCmpI(e, R0, regs[i].reg, R3);
++			toReg[i] = aB(e, C_EQ, NULL);
+ 		}
+ 		toSlow[slowCount++] = aB(e, C_AL, NULL);
+-		patchHere(e, toPlain[3]);
+-		timeUntil(e, R2, R3, fixed, OFF(irq.ifStable));
+-		toSlow[slowCount++] = aB(e, C_PL, NULL);
+-		uint8_t* toLoad = aB(e, C_AL, NULL);
+-		patchHere(e, toPlain[1]);
+-		patchHere(e, toPlain[2]);
+-		timeUntil(e, R2, R3, fixed, OFF(video.stableUntil));
+-		toSlow[slowCount++] = aB(e, C_PL, NULL);
+-		patchHere(e, toLoad);
+-		patchHere(e, toPlain[0]);
+-		patchHere(e, toPlain[4]);
++		// Each register's own check, if it has one, then the load they share.
++		uint8_t* toLoad[7];
++		int loads = 0;
++		for (int i = 0; i < 7; ++i) {
++			if (regs[i].stable >= 0) {
++				patchHere(e, toReg[i]);
++				timeUntil(e, R2, R3, fixed, regs[i].stable);
++				toSlow[slowCount++] = aB(e, C_PL, NULL);
++				toLoad[loads++] = aB(e, C_AL, NULL);
++			}
++		}
++		for (int i = 0; i < loads; ++i) {
++			patchHere(e, toLoad[i]);
++		}
++		for (int i = 0; i < 7; ++i) {
++			if (regs[i].stable < 0) {
++				patchHere(e, toReg[i]);
++			}
++		}
+ 		fieldAddr(e, R3, OFF(io));
+ 		emitLoadData(e, kind, R3);
+ 		aDpI(e, C_AL, D_ADD, false, R_CYC, R_CYC, fixed);

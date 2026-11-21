@@ -1,0 +1,230 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Tue, 17 Nov 2026 15:00:00 -0500
+Subject: armGBA: events inside blocks spill only the cycle counter and prefetch base, r0-r4 move with one LDM or STM, the idle head test is a bitmask
+
+
+diff --git a/src/cpu/a32/backend.c b/src/cpu/a32/backend.c
+index 6138b1c..d1fdf04 100644
+--- a/src/cpu/a32/backend.c
++++ b/src/cpu/a32/backend.c
+@@ -30,9 +30,8 @@ enum {
+ };
+ 
+ static const int8_t hostReg[16] = { R4, R5, R6, R7, R8, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+-static const int pinned[] = { R4, R5, R6, R7, R8 };
+-static const int pinnedGuest[] = { 0, 1, 2, 3, 4 };
+ 
++_Static_assert(REG(0) == 0, "spill and reload move r0-r4 with one LDM or STM from the state's start");
+ _Static_assert(sizeof(struct LookupEntry) == 12 && offsetof(struct LookupEntry, entry) == 8, "dispatchKey's table layout");
+ 
+ // Tells the host about code that was written or changed; otherwise it may run what was there
+@@ -154,9 +153,7 @@ static void loadBase(struct Emitter* e, int ra, int rb) {
+ // The routine that stores the guest registers held in host registers, the cycle counter and the
+ // flags in r9 to the CPU state. Preserves r0.
+ static void emitSpill(struct Emitter* e) {
+-	for (int i = 0; i < 5; ++i) {
+-		strF(e, pinned[i], REG(pinnedGuest[i]));
+-	}
++	aLdmStm(e, false, R_GBA, (1 << R4) | (1 << R5) | (1 << R6) | (1 << R7) | (1 << R8));
+ 	ldrF(e, R1, OFF(cpu.nextEvent));
+ 	aDpR(e, C_AL, D_ADD, false, R1, R1, R_CYC, S_LSL, 0);
+ 	strF(e, R1, OFF(cpu.cycles));
+@@ -171,9 +168,7 @@ static void emitSpill(struct Emitter* e) {
+ 
+ // The reverse; also preserves r0.
+ static void emitReload(struct Emitter* e) {
+-	for (int i = 0; i < 5; ++i) {
+-		ldrF(e, pinned[i], REG(pinnedGuest[i]));
+-	}
++	aLdmStm(e, true, R_GBA, (1 << R4) | (1 << R5) | (1 << R6) | (1 << R7) | (1 << R8));
+ 	ldrF(e, R_CYC, OFF(cpu.cycles));
+ 	ldrF(e, R1, OFF(cpu.nextEvent));
+ 	aDpR(e, C_AL, D_SUB, false, R_CYC, R_CYC, R1, S_LSL, 0);
+@@ -182,6 +177,32 @@ static void emitReload(struct Emitter* e) {
+ 	aBx(e, LR);
+ }
+ 
++// What a C helper that never touches the guest's registers or flags needs: the cycle counter and
++// the prefetch buffer's base. Preserves r0.
++static void emitSpillCycles(struct Emitter* e) {
++	ldrF(e, R2, OFF(cpu.nextEvent));
++	aDpR(e, C_AL, D_ADD, false, R1, R2, R_CYC, S_LSL, 0);
++	strF(e, R1, OFF(cpu.cycles));
++	ldrF(e, R1, OFF(jitBase));
++	aDpR(e, C_AL, D_ADD, false, R1, R1, R2, S_LSL, 0);
++	ldrF(e, R2, OFF(timing.masterCycles));
++	aDpR(e, C_AL, D_ADD, false, R1, R1, R2, S_LSL, 0);
++	strF(e, R1, OFF(prefetcher.base));
++	aBx(e, LR);
++}
++
++static void emitReloadCycles(struct Emitter* e) {
++	ldrF(e, R1, OFF(cpu.nextEvent));
++	ldrF(e, R_CYC, OFF(cpu.cycles));
++	aDpR(e, C_AL, D_SUB, false, R_CYC, R_CYC, R1, S_LSL, 0);
++	ldrF(e, R2, OFF(prefetcher.base));
++	aDpR(e, C_AL, D_SUB, false, R2, R2, R1, S_LSL, 0);
++	ldrF(e, R1, OFF(timing.masterCycles));
++	aDpR(e, C_AL, D_SUB, false, R2, R2, R1, S_LSL, 0);
++	strF(e, R2, OFF(jitBase));
++	aBx(e, LR);
++}
++
+ // The routine C calls to run compiled code: saves the host's registers, loads the guest's, and
+ // jumps to the given block. Ten registers keep the stack 8-byte aligned.
+ static void emitEnter(struct Jit* jit, struct Emitter* e) {
+@@ -847,6 +868,10 @@ bool backendInit(struct Jit* jit) {
+ 	emitSpill(&e);
+ 	jit->reloadRoutine = e.p;
+ 	emitReload(&e);
++	jit->spillCyclesRoutine = e.p;
++	emitSpillCycles(&e);
++	jit->reloadCyclesRoutine = e.p;
++	emitReloadCycles(&e);
+ 	jit->enter = (int (*)(struct GBA*, void*)) (void*) e.p;
+ 	emitEnter(jit, &e);
+ 	jit->exitRoutine = e.p;
+@@ -2798,13 +2823,13 @@ static bool compileInStretch(struct Jit* jit, struct Block* block, struct Inst*
+ 		storeHead(&c, stub->pc + 2 * c.width);
+ 		uint8_t* leaveHere = NULL;
+ 		if (!block->precharged) {
+-			aBl(e, jit->spillRoutine);
++			aBl(e, jit->spillCyclesRoutine);
+ 			aMov(e, R0, R_GBA);
+ 			aMovI(e, R1, stub->cost);
+ 			aMovI(e, R2, stub->deferrable);
+ 			aMovI(e, R3, (uint32_t) (uintptr_t) block);
+ 			callAbs(e, jitHelperCareful);
+-			aBl(e, jit->reloadRoutine);
++			aBl(e, jit->reloadCyclesRoutine);
+ 			aDpI(e, C_AL, D_CMP, true, 0, R0, CAREFUL_RUN);
+ 			aB(e, C_EQ, stub->resume);
+ 			aDpI(e, C_AL, D_CMP, true, 0, R0, CAREFUL_LEAVE);
+@@ -2864,11 +2889,11 @@ static bool compileInStretch(struct Jit* jit, struct Block* block, struct Inst*
+ 		uint32_t next = c.insts[0].address + (index + 1) * c.width;
+ 		patchHere(e, c.deferred[i].site);
+ 		storeHead(&c, next + 2 * c.width);
+-		aBl(e, jit->spillRoutine);
++		aBl(e, jit->spillCyclesRoutine);
+ 		aMov(e, R0, R_GBA);
+ 		aMovI(e, R1, (uint32_t) (uintptr_t) block);
+ 		callAbs(e, jitHelperDeferred);
+-		aBl(e, jit->reloadRoutine);
++		aBl(e, jit->reloadCyclesRoutine);
+ 		aDpI(e, C_AL, D_CMP, true, 0, R0, 0);
+ 		aB(e, C_EQ, block->entries[index + 1]);
+ 		storeConst(&c, OFF(exitPc), next);
+diff --git a/src/cpu/jit-internal.h b/src/cpu/jit-internal.h
+index 8ab16da..3a9ce9b 100644
+--- a/src/cpu/jit-internal.h
++++ b/src/cpu/jit-internal.h
+@@ -317,6 +317,8 @@ struct Jit {
+ 		uint32_t probes;
+ 		uint32_t skips;
+ 	} idleHeads[IDLE_HEADS];
++	// Which of 64 hash buckets hold an idleHeads key, so most run loop turns skip the search.
++	uint32_t idleHeadBits[2];
+ 	// Heads that never skipped, which aren't made heads again until a flush.
+ 	uint32_t idleRejected[IDLE_HEADS];
+ 	int idleRejectedNext;
+@@ -405,6 +407,10 @@ struct Jit {
+ 	uint8_t* exitRoutine;
+ 	uint8_t* spillRoutine;
+ 	uint8_t* reloadRoutine;
++	// Spill and reload of only the cycle counter and the prefetch buffer's base, for C helpers that
++	// leave the guest's registers and flags alone.
++	uint8_t* spillCyclesRoutine;
++	uint8_t* reloadCyclesRoutine;
+ 	uint8_t* dispatchArm;
+ 	uint8_t* dispatchThumb;
+ 	uint8_t* dispatchBx;
+diff --git a/src/cpu/jit.c b/src/cpu/jit.c
+index 308c894..13c74f8 100644
+--- a/src/cpu/jit.c
++++ b/src/cpu/jit.c
+@@ -140,6 +140,8 @@ static bool burstEdge(struct GBA* gba, uint32_t pc, bool thumb) {
+ 	return inRom(pc) && !gba->prefetchEnabled && (!((pc + 2 * width) & 0x1FFFF) || !((pc + 3 * width) & 0x1FFFF));
+ }
+ 
++static void idleHeadsChanged(struct Jit* jit);
++
+ // Blocks are found by key: the address, with the instruction set in its low bit.
+ static uint32_t hashBlock(uint32_t key) {
+ 	return ((key ^ (key >> 16)) * 0x9E3779B1u >> 16) & (BLOCK_HASH_SIZE - 1);
+@@ -535,6 +537,7 @@ void jitFlush(struct GBA* gba) {
+ 	memset(jit->idleLoops, 0, sizeof(jit->idleLoops));
+ 	memset(jit->idleSpans, 0, sizeof(jit->idleSpans));
+ 	memset(jit->idleHeads, 0, sizeof(jit->idleHeads));
++	idleHeadsChanged(jit);
+ 	memset(jit->idleRejected, 0, sizeof(jit->idleRejected));
+ 	++jit->idleSpanGen;
+ 	jit->staleValid = false;
+@@ -1812,7 +1815,23 @@ static void idleProbe(struct GBA* gba, const struct IdleState* start) {
+ 	loop->period = period;
+ }
+ 
++static uint32_t idleBucket(uint32_t key) {
++	return key * 0x9E3779B1u >> 26;
++}
++
++static void idleHeadsChanged(struct Jit* jit) {
++	jit->idleHeadBits[0] = jit->idleHeadBits[1] = 0;
++	for (int i = 0; i < IDLE_HEADS; ++i) {
++		uint32_t bucket = idleBucket(jit->idleHeads[i].key);
++		jit->idleHeadBits[bucket >> 5] |= 1u << (bucket & 31);
++	}
++}
++
+ bool jitIsIdleHead(const struct Jit* jit, uint32_t key) {
++	uint32_t bucket = idleBucket(key);
++	if (!(jit->idleHeadBits[bucket >> 5] >> (bucket & 31) & 1)) {
++		return false;
++	}
+ 	for (int i = 0; i < IDLE_HEADS; ++i) {
+ 		if (jit->idleHeads[i].key == key) {
+ 			return true;
+@@ -1842,6 +1861,7 @@ static void idleHeadCount(struct Jit* jit, uint32_t r15, bool probe) {
+ 			++jit->idleHeads[i].skips;
+ 		} else if (++jit->idleHeads[i].probes >= IDLE_GIVE_UP && !jit->idleHeads[i].skips) {
+ 			jit->idleHeads[i].key = 0;
++			idleHeadsChanged(jit);
+ 			jit->idleRejected[jit->idleRejectedNext] = key;
+ 			jit->idleRejectedNext = (jit->idleRejectedNext + 1) % IDLE_HEADS;
+ 			idleRecompile(jit, key);
+@@ -1907,6 +1927,7 @@ static void idleNote(struct Jit* jit, const struct Block* constBlock) {
+ 	}
+ 	uint32_t old = jit->idleHeads[slot].key;
+ 	jit->idleHeads[slot] = (typeof(jit->idleHeads[0])) { span->head, 0, 0 };
++	idleHeadsChanged(jit);
+ 	if (old) {
+ 		idleRecompile(jit, old);
+ 	}
+@@ -2418,14 +2439,17 @@ static bool runDue(struct GBA* gba, const struct Block* block) {
+ // instruction an event falls in.
+ int jitHelperCareful(struct GBA* gba, int32_t cost, int deferrable, const struct Block* block) {
+ 	struct CPU* cpu = &gba->cpu;
+-	// Events put off by the branch or block end that led here run first, between the instructions.
++	// Events put off by the branch or block end that led here run first, between the instructions;
++	// runDue has then checked the boundary already.
++	bool checked = false;
+ 	if (gba->jitDeferred) {
+ 		if (!runDue(gba, block)) {
+ 			return CAREFUL_LEAVE;
+ 		}
+ 		gba->jitDeferred = false;
++		checked = true;
+ 	}
+-	if (!boundaryOk(gba, block)) {
++	if (!checked && !boundaryOk(gba, block)) {
+ 		return CAREFUL_LEAVE;
+ 	}
+ 	if (cpu->cycles + cost < cpu->nextEvent) {
+@@ -2694,6 +2718,7 @@ bool jitInit(struct GBA* gba) {
+ 		return false;
+ 	}
+ 	jit->codeEnd = jit->code + jit->codeSize;
++	idleHeadsChanged(jit);
+ 	jit->lookup = calloc(LOOKUP_SIZE, sizeof(*jit->lookup));
+ 	if (!jit->lookup) {
+ 		jitDeinit(gba);

@@ -1,0 +1,46 @@
+diff --git a/include/mgba-util/image.h b/include/mgba-util/image.h
+index 12f7a2ca8..4a10d143d 100644
+--- a/include/mgba-util/image.h
++++ b/include/mgba-util/image.h
+@@ -267,7 +267,7 @@ static inline mColor mColorFrom555(uint16_t value) {
+ 	return color;
+ }
+ 
+-ATTRIBUTE_UNUSED static unsigned mColorMix5Bit(int weightA, unsigned colorA, int weightB, unsigned colorB) {
++ATTRIBUTE_UNUSED static inline unsigned mColorMix5Bit(int weightA, unsigned colorA, int weightB, unsigned colorB) {
+ 	unsigned c = 0;
+ 	unsigned a, b;
+ #ifdef COLOR_16_BIT
+@@ -305,26 +305,12 @@ ATTRIBUTE_UNUSED static unsigned mColorMix5Bit(int weightA, unsigned colorA, int
+ 	c = (c & 0x7C1F) | ((c >> 16) & 0x03E0);
+ #endif
+ #else
+-	a = colorA & 0xFF;
+-	b = colorB & 0xFF;
+-	c |= ((a * weightA + b * weightB) / 16) & 0x1FF;
+-	if (c & 0x00000100) {
+-		c = 0x000000FF;
+-	}
+-
+-	a = colorA & 0xFF00;
+-	b = colorB & 0xFF00;
+-	c |= ((a * weightA + b * weightB) / 16) & 0x1FF00;
+-	if (c & 0x00010000) {
+-		c = (c & 0x000000FF) | 0x0000FF00;
+-	}
+-
+-	a = colorA & 0xFF0000;
+-	b = colorB & 0xFF0000;
+-	c |= ((a * weightA + b * weightB) / 16) & 0x1FF0000;
+-	if (c & 0x01000000) {
+-		c = (c & 0x0000FFFF) | 0x00FF0000;
+-	}
++	/* (weights up to 16: red and blue share a multiply, a 16-bit lane holds a sum of at most 255 * 32) */
++	a = (((colorA & 0x00FF00FF) * weightA + (colorB & 0x00FF00FF) * weightB) >> 4) & 0x01FF01FF;
++	b = (((colorA & 0xFF00) * weightA + (colorB & 0xFF00) * weightB) >> 12) & 0x1FF;
++	a = (a & 0x00FF00FF) | ((a >> 8) & 0x00010001) * 0xFF;
++	b = (b & 0xFF) | ((b >> 8) & 1) * 0xFF;
++	c = a | (b << 8);
+ #endif
+ 	return c;
+ }

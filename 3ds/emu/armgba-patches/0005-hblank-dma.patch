@@ -1,0 +1,217 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Tue, 17 Nov 2026 11:56:51 -0500
+Subject: armGBA: HBlank DMA units from RAM to video registers move in one loop,
+ and a video sync that is already done is skipped
+
+
+diff --git a/src/gba.c b/src/gba.c
+index 8929a84..cdc790d 100644
+--- a/src/gba.c
++++ b/src/gba.c
+@@ -613,6 +613,8 @@ void gbaSetOverclock(struct GBA* gba, int8_t overclock) {
+ 	gba->irq.ifStable += moved;
+ 	timingResetNextEvent(gba);
+ 	gbaIrqSync(gba);
++	// The old clock's deadline says nothing about the new one, so the sync can't skip.
++	gba->video.stableUntil = timingCpuTime(gba);
+ 	videoSync(gba);
+ 	// As after a state load, the run loop starts afresh.
+ 	jitStateLoaded(gba, false);
+diff --git a/src/gba.h b/src/gba.h
+index c66ea35..c5022e5 100644
+--- a/src/gba.h
++++ b/src/gba.h
+@@ -946,6 +946,7 @@ void memoryStore32(struct GBA*, uint32_t address, uint32_t value, int* cycles);
+ void memoryStore16(struct GBA*, uint32_t address, uint16_t value, int* cycles);
+ // Moves count DMA units between plain regions without leaving them; returns the last latch.
+ int memoryDmaCopy(struct GBA*, struct Dma*, int count, bool wide, int32_t sourceStep, int32_t destStep);
++int memoryDmaToIo(struct GBA*, struct Dma*, int count, bool wide, int32_t sourceStep, int32_t destStep);
+ void memoryStore8(struct GBA*, uint32_t address, uint8_t value, int* cycles);
+ uint32_t memoryLoadMultiple(struct GBA*, uint32_t address, int mask, int direction, int* cycles);
+ uint32_t memoryStoreMultiple(struct GBA*, uint32_t address, int mask, int direction, int* cycles);
+@@ -1010,8 +1011,14 @@ void ioWrite32(struct GBA*, uint32_t address, uint32_t value);
+ void videoInit(struct GBA*);
+ void videoReset(struct GBA*);
+ void videoStartAt(struct GBA*, int vcount, int32_t untilHblank);
+-// Brings the line, VCOUNT and DISPSTAT up to date.
+-void videoSync(struct GBA*);
++// Brings the line, VCOUNT and DISPSTAT up to now. Until stableUntil the last sync has set all this one
++// would, so it is skipped.
++void videoSyncDue(struct GBA*);
++static inline void videoSync(struct GBA* gba) {
++	if (gba->cpu.overclock || (int32_t) (timingCpuTime(gba) - gba->video.stableUntil) >= 0) {
++		videoSyncDue(gba);
++	}
++}
+ int videoLine(struct GBA*);
+ void videoHblankDmaArmed(struct GBA*);
+ uint32_t videoNextHblank(struct GBA*, uint32_t from);
+diff --git a/src/io/dma.c b/src/io/dma.c
+index 6961a3f..42184ea 100644
+--- a/src/io/dma.c
++++ b/src/io/dma.c
+@@ -314,6 +314,13 @@ static void runChannel(struct GBA* gba) {
+ 				continue;
+ 			}
+ 		}
++		if ((dest >> 24) == REGION_IO && (source >> 24) >= REGION_EWRAM && (source >> 24) <= REGION_IWRAM) {
++			int moved = memoryDmaToIo(gba, dma, dma->nextCount, size == 4, sourceStep, destStep);
++			if (moved) {
++				dma->nextCount -= moved;
++				continue;
++			}
++		}
+ 		bool sourceSeq = true;
+ 		bool destSeq = true;
+ 		if (!cartridge) {
+diff --git a/src/io/io.c b/src/io/io.c
+index 60eb922..3dfe632 100644
+--- a/src/io/io.c
++++ b/src/io/io.c
+@@ -98,18 +98,26 @@ static void writeSound(struct GBA* gba, uint32_t address, uint16_t value) {
+ 	}
+ }
+ 
++// The video registers, apart from DISPSTAT and VCOUNT, belong to the renderer.
++static inline bool isVideoRegister(uint32_t address) {
++	return address < REG_SOUND1CNT_LO && (address > REG_VCOUNT || address < REG_DISPSTAT);
++}
++
++static inline void writeVideoRegister(struct GBA* gba, uint32_t address, uint16_t value) {
++	gba->io[address >> 1] = renderWriteRegister(gba, address, value);
++	if (gba->renderThread) {
++		renderThreadRegister(gba, address, value);
++	}
++}
++
+ // Handles a 16-bit write to an I/O register at address (an offset into the I/O space). Each case
+ // does what the write does and masks value down to the bits that read back; a case that returns has
+ // stored its own.
+ void ioWrite(struct GBA* gba, uint32_t address, uint16_t value) {
+-	// The video registers, apart from DISPSTAT and VCOUNT, belong to the renderer.
+-	if (address < REG_SOUND1CNT_LO && (address > REG_VCOUNT || address < REG_DISPSTAT)) {
++	if (isVideoRegister(address)) {
+ 		// Lines that have started have taken what they latch at their start.
+ 		videoSync(gba);
+-		gba->io[address >> 1] = renderWriteRegister(gba, address, value);
+-		if (gba->renderThread) {
+-			renderThreadRegister(gba, address, value);
+-		}
++		writeVideoRegister(gba, address, value);
+ 		return;
+ 	}
+ 	// With the master switch off, the sound registers can't be written.
+@@ -489,6 +497,13 @@ void ioWrite32(struct GBA* gba, uint32_t address, uint32_t value) {
+ 		value = dmaWriteDest(gba, 3, value);
+ 		break;
+ 	default:
++		if (isVideoRegister(address) && isVideoRegister(address | 2)) {
++			// No time passes between the halves, so the second sync would find nothing to do.
++			videoSync(gba);
++			writeVideoRegister(gba, address, value & 0xFFFF);
++			writeVideoRegister(gba, address | 2, value >> 16);
++			return;
++		}
+ 		ioWrite(gba, address, value & 0xFFFF);
+ 		ioWrite(gba, address | 2, value >> 16);
+ 		return;
+diff --git a/src/memory.c b/src/memory.c
+index a7a479d..72f21cc 100644
+--- a/src/memory.c
++++ b/src/memory.c
+@@ -438,6 +438,47 @@ int memoryDmaCopy(struct GBA* gba, struct Dma* dma, int count, bool wide, int32_
+ 	return n;
+ }
+ 
++// Moves up to count DMA units from EWRAM or IWRAM to I/O registers, timed as busDmaRead and busDmaWrite
++// would. Each unit's cycles are worked out again, as a register can be WAITCNT.
++int memoryDmaToIo(struct GBA* gba, struct Dma* dma, int count, bool wide, int32_t sourceStep, int32_t destStep) {
++	struct CPU* cpu = &gba->cpu;
++	const uint8_t* waits = wide ? gba->waitS32 : gba->waitS16;
++	uint32_t s = dma->nextSource;
++	uint32_t d = dma->nextDest;
++	int n = 0;
++	for (; n < count && !gba->dmaReenter; ++n) {
++		if ((s >> 24) < REGION_EWRAM || (s >> 24) > REGION_IWRAM || (d >> 24) != REGION_IO) {
++			break;
++		}
++		cpu->cycles += 1 + waits[s >> 24];
++		if (cpu->cycles >= cpu->nextEvent) {
++			processEvents(gba);
++		}
++		uint32_t latch = plainLoad(gba, s, wide);
++		if (!wide) {
++			latch *= 0x10001;
++		}
++		dma->latch = latch;
++		gba->dmaLatch = latch;
++		gba->lastAccessDma = true;
++		cpu->cycles += 1 + waits[REGION_IO];
++		if (cpu->cycles >= cpu->nextEvent) {
++			processEvents(gba);
++		}
++		if (wide) {
++			ioWrite32(gba, d & 0xFFFFFC, latch);
++		} else {
++			ioWrite(gba, d & 0xFFFFFE, (uint16_t) (latch >> (8 * (d & 2))));
++		}
++		gba->lastAccessDma = true;
++		s += sourceStep;
++		d += destStep;
++	}
++	dma->nextSource = s;
++	dma->nextDest = d;
++	return n;
++}
++
+ // A 32-bit load without the final cycle counting: adds the region's wait from waits (the N or the S
+ // table) to *wait. Shared by single loads and block transfers, which differ in what they add.
+ static uint32_t load32Raw(struct GBA* gba, uint32_t address, int* wait, const uint8_t* waits) {
+diff --git a/src/video/render.c b/src/video/render.c
+index c49ceb2..2044d15 100644
+--- a/src/video/render.c
++++ b/src/video/render.c
+@@ -3172,11 +3172,14 @@ static bool twinDraws(const struct HookSlot* slot) {
+ }
+ 
+ // The slot whose second picture is being drawn, if it is.
+-static struct HookSlot* twinOf(struct GBA* gba) {
+-	struct HookSlot* slot = findHooks(gba);
++static struct HookSlot* twinIn(struct HookSlot* slot) {
+ 	return slot && slot->twin && !slot->twinStale && slot->hooks->second ? slot : NULL;
+ }
+ 
++static struct HookSlot* twinOf(struct GBA* gba) {
++	return twinIn(findHooks(gba));
++}
++
+ static void drawLine(struct GBA* gba, int y, bool skipped) {
+ 	struct HookSlot* slot = findHooks(gba);
+ 	if (!slot) {
+@@ -3288,7 +3291,7 @@ uint16_t renderWriteRegister(struct GBA* gba, uint32_t address, uint16_t value)
+ 		kept = value & any->hooks->maskedBits;
+ 		value &= ~any->hooks->maskedBits;
+ 	}
+-	struct HookSlot* slot = twinOf(gba);
++	struct HookSlot* slot = twinIn(any);
+ 	if (slot) {
+ 		struct Renderer* renderer = &slot->twin->renderer;
+ 		renderer->copyCycle = gba->renderer.copy ? gba->renderer.copyCycle : (int32_t) (timingCurrentTime(gba) - gba->video.lineStart);
+diff --git a/src/video/video.c b/src/video/video.c
+index 5593f3d..d03f1e5 100644
+--- a/src/video/video.c
++++ b/src/video/video.c
+@@ -135,9 +135,9 @@ static void startLine(struct GBA* gba, uint32_t late) {
+ 	gba->io[IO(REG_DISPSTAT)] = dispstat;
+ }
+ 
+-// Brings the line, VCOUNT and DISPSTAT up to now. stableUntil is the time until which compiled code
+-// can read the two registers as they stand.
+-void videoSync(struct GBA* gba) {
++// The work of videoSync. stableUntil is the time until which compiled code can read the two registers
++// as they stand.
++void videoSyncDue(struct GBA* gba) {
+ 	struct Video* video = &gba->video;
+ 	uint32_t now = timingCurrentTime(gba);
+ 	while ((int32_t) (now - nextLineStart(gba)) >= 0) {

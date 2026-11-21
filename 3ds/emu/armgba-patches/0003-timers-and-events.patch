@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Tue, 17 Nov 2026 09:43:42 -0500
+Subject: armGBA: timers and the interrupt pipeline's events are deferrable
+ without asking DMA, video and timers
+
+
+diff --git a/src/gba.c b/src/gba.c
+index c097152..8929a84 100644
+--- a/src/gba.c
++++ b/src/gba.c
+@@ -84,6 +84,12 @@ static void applyIrq(struct GBA* gba, void* context, uint32_t late) {
+ 	}
+ }
+ 
++// Whether an event is one of the pipeline's stages: none starts DMA, so each can run after the
++// instruction it falls in.
++bool gbaIrqEvent(const struct Event* event) {
++	return event->callback == applyIrq || event->callback == availableChanged || event->callback == lineChanged;
++}
++
+ // Sets up a pool's four events, all with the same callback.
+ static void initChanges(struct IrqChange* slots, EventCallback callback, unsigned priority) {
+ 	for (int i = 0; i < 4; ++i) {
+diff --git a/src/gba.h b/src/gba.h
+index 348d551..c5e8c66 100644
+--- a/src/gba.h
++++ b/src/gba.h
+@@ -983,6 +983,7 @@ void timingResetNextEvent(struct GBA*);
+ // Whether the events due by time can run late, at the next instruction boundary: none of them
+ // starts DMA or ends a run.
+ bool timingDeferrable(struct GBA*, int32_t time);
++bool gbaIrqEvent(const struct Event*);
+ void processEvents(struct GBA*);
+ 
+ // step.c: the exact CPU, used for the instructions around events.
+diff --git a/src/io/timer.c b/src/io/timer.c
+index 8a8e2cf..d020194 100644
+--- a/src/io/timer.c
++++ b/src/io/timer.c
+@@ -142,9 +142,17 @@ static void catchUp(struct GBA* gba, int id, uint32_t time, bool inclusive) {
+ 	}
+ }
+ 
++static void overflowEvent(struct GBA* gba, void* context, uint32_t late);
++static void reloadWritten(struct GBA* gba, void* context, uint32_t late);
++static void controlWritten(struct GBA* gba, void* context, uint32_t late);
++
+ // Whether a timer event can run after the instruction it falls in instead of inside it: not if it
+ // can start DMA, which an overflow asking for more FIFO data does.
+ bool timerDeferrable(struct GBA* gba, const struct Event* event) {
++	// Only a timer's own events can ask for FIFO data; the list hands this every event in a window.
++	if (event->callback != overflowEvent && event->callback != reloadWritten && event->callback != controlWritten) {
++		return true;
++	}
+ 	for (int id = 0; id < 4; ++id) {
+ 		struct Timer* timer = &gba->timers[id];
+ 		if (event != &timer->event && event != &timer->controlWrite && event != &timer->reloadWrite) {
+diff --git a/src/timing.c b/src/timing.c
+index 758cabc..54061e2 100644
+--- a/src/timing.c
++++ b/src/timing.c
+@@ -237,6 +237,9 @@ bool timingDeferrable(struct GBA* gba, int32_t time) {
+ 		if (untilEvent(gba, event) > time) {
+ 			break;
+ 		}
++		if (gbaIrqEvent(event)) {
++			continue;
++		}
+ 		if (event->endsRun || dmaStartEvent(event) || !videoDeferrable(gba, event) || !timerDeferrable(gba, event)) {
+ 			return false;
+ 		}

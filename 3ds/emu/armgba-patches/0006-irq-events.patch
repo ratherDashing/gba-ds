@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Tue, 17 Nov 2026 15:00:00 -0500
+Subject: armGBA: CPU writes to IE, IF and IME take effect at once when no event is due
+
+
+diff --git a/src/gba.c b/src/gba.c
+index cdc790d..812412f 100644
+--- a/src/gba.c
++++ b/src/gba.c
+@@ -65,23 +65,40 @@ static void lineChanged(struct GBA* gba, void* context, uint32_t late) {
+ }
+ 
+ // The first stage: the registers take their new values, and the later stages are scheduled if they
+-// change.
+-static void applyIrq(struct GBA* gba, void* context, uint32_t late) {
++// change. delay is the cycles from now to the moment this stands for.
++static void applyStage(struct GBA* gba, int32_t delay, int32_t late) {
+ 	struct Irq* irq = &gba->irq;
+-	gbaIrqSync(gba);
+-	freeChange(context);
+ 	gba->io[IO(REG_IE)] = irq->ie;
+ 	gba->io[IO(REG_IF)] = irq->iflags;
+ 	gba->io[IO(REG_IME)] = irq->ime;
+ 	bool available = irq->ie & irq->iflags;
+ 	if (available != irq->available) {
+-		scheduleChange(gba, irq->availableChange, available, 1, (int32_t) late);
++		scheduleChange(gba, irq->availableChange, available, delay + 1, late);
+ 	}
+ 	bool line = irq->ime && available;
+ 	if (line != irq->lineDriven) {
+ 		irq->lineDriven = line;
+-		scheduleChange(gba, irq->lineChange, line, 2, (int32_t) late);
++		scheduleChange(gba, irq->lineChange, line, delay + 2, late);
++	}
++}
++
++static void applyIrq(struct GBA* gba, void* context, uint32_t late) {
++	gbaIrqSync(gba);
++	freeChange(context);
++	applyStage(gba, 0, (int32_t) late);
++}
++
++// A CPU write reaches the registers a cycle later; with no event due by then it takes effect now, and the later
++// stages go where the first one would put them. A DMA's write keeps the event: DMA runs events in its own cycles.
++static void applyWrite(struct GBA* gba) {
++	struct Irq* irq = &gba->irq;
++	const struct Event* next = gba->timing.root;
++	bool wait = gba->performingDma || gba->cpu.overclock || gba->inEvent || gba->timing.reroot || irq->quietPending || gbaQuietHblank(gba);
++	if (wait || (next && timingUntil(gba, (struct Event*) next) <= 1)) {
++		scheduleChange(gba, irq->apply, false, 1, 0);
++		return;
+ 	}
++	applyStage(gba, 1, 0);
+ }
+ 
+ // Whether an event is one of the pipeline's stages: none starts DMA, so each can run after the
+@@ -543,33 +560,47 @@ void gbaIrqQuietChanged(struct GBA* gba, bool wasQuiet) {
+ 
+ // The three interrupt registers. Each write goes through the pipeline's first stage one cycle
+ // later.
+-void gbaWriteIe(struct GBA* gba, uint16_t value) {
++static void writeIe(struct GBA* gba, uint16_t value, bool applyAtOnce) {
+ 	gbaIrqSync(gba);
+ 	bool wasQuiet = gbaQuietHblank(gba);
+ 	uint16_t old = gba->irq.ie;
+ 	gba->irq.ie = value & 0x3FFF;
+-	scheduleChange(gba, gba->irq.apply, false, 1, 0);
+ 	if ((old ^ gba->irq.ie) & (1 << IRQ_HBLANK)) {
++		scheduleChange(gba, gba->irq.apply, false, 1, 0);
+ 		gbaIrqQuietChanged(gba, wasQuiet);
+ 		// H-blank events on every line, or not.
+ 		videoHblankDmaArmed(gba);
++	} else if (applyAtOnce) {
++		applyWrite(gba);
+ 	}
+ }
+ 
++void gbaWriteIe(struct GBA* gba, uint16_t value) {
++	writeIe(gba, value, true);
++}
++
++// A 32-bit write to IE and IF is one write, so the first stage takes both: IE's half leaves it to IF's.
++void gbaWriteIeIf(struct GBA* gba, uint16_t ie, uint16_t acknowledge) {
++	writeIe(gba, ie, false);
++	gbaWriteIf(gba, acknowledge);
++}
++
+ // Writing a 1 to an IF bit acknowledges that interrupt.
+ void gbaWriteIf(struct GBA* gba, uint16_t value) {
+ 	gbaIrqSync(gba);
+ 	gba->irq.iflags &= ~value;
+-	scheduleChange(gba, gba->irq.apply, false, 1, 0);
+ 	if ((value & (1 << IRQ_HBLANK)) && gbaQuietHblank(gba)) {
++		scheduleChange(gba, gba->irq.apply, false, 1, 0);
+ 		// An H-blank that just happened asks after the write.
+ 		startQuiet(gba, timingCurrentTime(gba));
++	} else {
++		applyWrite(gba);
+ 	}
+ }
+ 
+ void gbaWriteIme(struct GBA* gba, uint16_t value) {
+ 	gba->irq.ime = value & 1;
+-	scheduleChange(gba, gba->irq.apply, false, 1, 0);
++	applyWrite(gba);
+ }
+ 
+ // The key interrupt: any of the chosen keys, or all of them at once, as KEYCNT says. It is checked
+diff --git a/src/gba.h b/src/gba.h
+index c5022e5..1811112 100644
+--- a/src/gba.h
++++ b/src/gba.h
+@@ -912,6 +912,7 @@ void gbaIrqSync(struct GBA*);
+ void gbaIrqQuietChanged(struct GBA*, bool wasQuiet);
+ void gbaWriteIe(struct GBA*, uint16_t value);
+ void gbaWriteIf(struct GBA*, uint16_t value);
++void gbaWriteIeIf(struct GBA*, uint16_t ie, uint16_t acknowledge);
+ void gbaWriteIme(struct GBA*, uint16_t value);
+ void gbaTestKeypadIrq(struct GBA*, uint32_t late);
+ void gbaHalt(struct GBA*);
+diff --git a/src/io/io.c b/src/io/io.c
+index 3dfe632..cd7f0c1 100644
+--- a/src/io/io.c
++++ b/src/io/io.c
+@@ -496,6 +496,9 @@ void ioWrite32(struct GBA* gba, uint32_t address, uint32_t value) {
+ 	case 0x0D8:
+ 		value = dmaWriteDest(gba, 3, value);
+ 		break;
++	case REG_IE:
++		gbaWriteIeIf(gba, value & 0xFFFF, value >> 16);
++		return;
+ 	default:
+ 		if (isVideoRegister(address) && isVideoRegister(address | 2)) {
+ 			// No time passes between the halves, so the second sync would find nothing to do.

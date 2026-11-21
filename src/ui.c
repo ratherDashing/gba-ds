@@ -124,6 +124,16 @@ static uint32_t parse_btns(const char* s) {
 	return m;
 }
 
+/* A new script from tick 0 (the test bench's next job). */
+void ui_script_restart(const char* path) {
+	free(script);
+	script = NULL;
+	scriptLen = scriptPos = 0;
+	scriptBtns = 0;
+	ticks = 0;
+	ui_load_script(path);
+}
+
 void ui_load_script(const char* path) {
 	FILE* f = fopen(path, "r");
 	if (!f) {
@@ -1349,58 +1359,46 @@ void ui_shader(int sh) {
 	ccGain = uiShader >= SH_SUB_LIGHT ? subPresets[uiShader - SH_SUB_LIGHT].gain : 100;
 	cc_refresh();
 }
+bool ui_color_correct_on(void) {
+	return ccOn;
+}
 uint32_t ui_color_correct(uint32_t p) {
 	if (!ccOn) return p;
 	unsigned key = (p >> 3 & 31) | (p >> 11 & 31) << 5 | (p >> 19 & 31) << 10;
 	return ccLut[key] | (p & 0xFF000000u);
 }
 
-static void update_rows(SDL_Texture* t, const void* px, int pitch, int y0, int rows);
-
-void ui_update_texture(SDL_Texture* t, const void* px, int pitch) {
-	update_rows(t, px, pitch, 0, -1);
-}
-
-void ui_update_texture_rows(SDL_Texture* t, const void* px, int pitch, int y0, int rows) {
-	update_rows(t, px, pitch, y0, rows);
-}
-
-/* (rows < 0: the whole picture; else those rows of it, px still the whole) */
-static void update_rows(SDL_Texture* t, const void* px, int pitch, int y0, int rows) {
+/* The texture's rows y0 to y1 - 1, or all of it (y1 <= y0), from px, which starts at its first row. */
+static void update_texture_rows(SDL_Texture* t, const void* px, int pitch, int y0, int y1, bool cc) {
 	if (!t) return;
-	int tw = 0, th = 0;
-	SDL_Rect part;
-	if (rows >= 0) {
-		SDL_QueryTexture(t, NULL, NULL, &tw, &th);
-		if (y0 < 0) rows += y0, y0 = 0;
-		if (y0 + rows > th) rows = th - y0;
-		if (rows <= 0) return;
-		part = (SDL_Rect) { 0, y0, tw, rows };
-		px = (const uint8_t*) px + (size_t) y0 * pitch;
-	}
-	if (ccOn) {
+	int w, h;
+	bool whole = y1 <= y0;
+	if (SDL_QueryTexture(t, NULL, NULL, &w, &h) != 0) return;
+	if (whole) y0 = 0, y1 = h;
+	if (cc && ccOn && pitch >= w * 4) {
 		/* (through the colour correction's table, alpha kept) */
 		static uint32_t* buf;
 		static size_t bufN;
-		int w, h;
-		if (SDL_QueryTexture(t, NULL, NULL, &w, &h) == 0 && pitch >= w * 4) {
-			if (rows >= 0) h = rows;
-			size_t n = (size_t) (pitch / 4) * h;
-			if (n > bufN) {
-				uint32_t* nb = realloc(buf, n * sizeof(uint32_t));
-				if (nb) buf = nb, bufN = n;
+		size_t n = (size_t) (pitch / 4) * h;
+		if (n > bufN) {
+			uint32_t* nb = realloc(buf, n * sizeof(uint32_t));
+			if (nb) buf = nb, bufN = n;
+		}
+		if (n <= bufN) {
+			const uint32_t* src = px;
+			for (size_t i = (size_t) (pitch / 4) * y0, e = (size_t) (pitch / 4) * y1; i < e; ++i) {
+				uint32_t p = src[i];
+				buf[i] = ccLut[(p >> 3 & 31) | (p >> 11 & 31) << 5 | (p >> 19 & 31) << 10] | (p & 0xFF000000u);
 			}
-			if (n <= bufN) {
-				const uint32_t* src = px;
-				for (size_t i = 0; i < n; ++i) {
-					uint32_t p = src[i];
-					buf[i] = ccLut[(p >> 3 & 31) | (p >> 11 & 31) << 5 | (p >> 19 & 31) << 10] | (p & 0xFF000000u);
-				}
-				px = buf;
-			}
+			px = buf;
 		}
 	}
-	SDL_UpdateTexture(t, rows >= 0 ? &part : NULL, px, pitch);
+	if (whole) {
+		SDL_UpdateTexture(t, NULL, px, pitch);
+	} else {
+		SDL_Rect r = { 0, y0, w, y1 - y0 };
+		SDL_UpdateTexture(t, &r, (const char*) px + (size_t) y0 * pitch, pitch);
+	}
 	int slot = -1;
 	for (int i = 0; i < TEXVER_N && slot < 0; ++i) {
 		if (texVer[i].t == t) slot = i;
@@ -1412,6 +1410,31 @@ static void update_rows(SDL_Texture* t, const void* px, int pitch, int y0, int r
 	if (texVer[slot].t != t) texVer[slot].t = t, texVer[slot].v = 0;
 	++texVer[slot].v;
 }
+
+void ui_update_texture(SDL_Texture* t, const void* px, int pitch) {
+	update_texture_rows(t, px, pitch, 0, 0, true);
+}
+
+void ui_update_texture_rows(SDL_Texture* t, const void* px, int pitch, int y0, int rows) {
+	if (rows <= 0) return;
+	if (y0 < 0) rows += y0, y0 = 0;
+	int th;
+	if (t && SDL_QueryTexture(t, NULL, NULL, NULL, &th) == 0 && y0 + rows > th) rows = th - y0;
+	if (rows > 0) update_texture_rows(t, px, pitch, y0, y0 + rows, true);
+}
+
+#ifdef COLOR_16_BIT
+void ui_update_texture_565_cc(SDL_Texture* t, const uint16_t* px, int stride) {
+	static uint32_t buf[240 * 160];
+	for (int y = 0; y < 160; ++y) {
+		for (int x = 0; x < 240; ++x) {
+			unsigned c = px[y * stride + x];
+			buf[y * 240 + x] = ccLut[(c >> 11) | (c >> 6 & 31) << 5 | (c & 31) << 10];
+		}
+	}
+	update_texture_rows(t, buf, 240 * 4, 0, 0, false);
+}
+#endif
 
 /* Retained views (Android: both screens). A view's draw calls are recorded
  * instead of drawn, and at ui_present they're replayed only if they differ
@@ -1674,6 +1697,9 @@ double ui_display_hz(int view) {
 		}
 	}
 #endif /* __wasi__ */
+#endif
+#ifdef __3DS__
+	hz = 268111856.0 / 4481136.0; /* (the LCDs' refresh: 4481136 GPU clocks a frame, about 59.831 Hz) */
 #endif
 	if (hz <= 0) {
 		SDL_DisplayMode m;
@@ -2027,9 +2053,45 @@ static SDL_Texture* shader_mask(int v, int dw, int dh, int gw, int gh, int kc) {
 	return pipe_pattern(v, dw, dh, gw, gh, cfg->shader, cfg->lcdStrength);
 }
 
-static void draw_pixels(SDL_Renderer* ren, int v, SDL_Texture* src, int w, int h, const SDL_Rect* dstp, int lcd);
+static void draw_pixels(SDL_Renderer* ren, int v, SDL_Texture* src, int w, int h, const SDL_Rect* dstp, int lcd, const UiLayer* layers,
+                        int nLayers);
+static void image_pixels(int screen, SDL_Texture* const* texPerView, int w, int h, const char* mode, int lcd, const UiLayer* layers,
+                         int nLayers);
 
 void ui_image_pixels(int screen, SDL_Texture* const* texPerView, int w, int h, const char* mode, int lcd) {
+	image_pixels(screen, texPerView, w, h, mode, lcd, NULL, 0);
+}
+
+/* Whether the picture can be drawn from layers (ui_image_pixels_over): not
+ * where it gets filtered before the layers go on (it'd blur into their
+ * edges), so not for Smooth, nor on Android's recorded screens. */
+bool ui_pixels_over_ok(int screen, int w, int h, const char* mode, int lcd) {
+#ifdef __ANDROID__
+	(void) screen, (void) w, (void) h, (void) mode, (void) lcd;
+	return false;
+#else
+	(void) lcd;
+	if (cfg->smooth) return false;
+	Screen* s = &screens[screen];
+	SDL_Rect pic = { s->rect.x + s->pic.x, s->rect.y + s->pic.y, s->pic.w, s->pic.h }, dst;
+	fit_rect(&pic, w, h, mode, &dst);
+	int k = SDL_max(1, SDL_min(dst.w / w, dst.h / h));
+	return (dst.w == w * k && dst.h == h * k) || SDL_RenderTargetSupported(views[s->view].ren);
+#endif
+}
+
+void ui_image_pixels_over(int screen, SDL_Texture* const* texPerView, int w, int h, const char* mode, int lcd, const UiLayer* layers,
+                          int nLayers) {
+#ifdef __ANDROID__
+	(void) layers, (void) nLayers;
+	ui_image_pixels(screen, texPerView, w, h, mode, lcd);
+#else
+	image_pixels(screen, texPerView, w, h, mode, lcd, layers, nLayers);
+#endif
+}
+
+static void image_pixels(int screen, SDL_Texture* const* texPerView, int w, int h, const char* mode, int lcd, const UiLayer* layers,
+                         int nLayers) {
 	RECORD(screen, OP_PIXELS) {
 		rec_tex(o, texPerView);
 		o->a = w, o->b = h, o->d = lcd;
@@ -2053,12 +2115,25 @@ void ui_image_pixels(int screen, SDL_Texture* const* texPerView, int w, int h, c
 		if (hadClip) SDL_IntersectRect(&prev, &s->rect, &c); /* inside an existing ui_clip */
 		SDL_RenderSetClipRect(ren, &c);
 	}
-	draw_pixels(ren, v, src, w, h, &dst, lcd);
+	draw_pixels(ren, v, src, w, h, &dst, lcd, layers, nLayers);
 	if (clip) SDL_RenderSetClipRect(ren, hadClip ? &prev : NULL);
 }
 
+/* The layers over a picture drawn at (x, y), k screen pixels to each of its own. */
+static void draw_layers(SDL_Renderer* ren, int v, const UiLayer* layers, int n, int x, int y, int k) {
+	for (int i = 0; i < n; ++i) {
+		SDL_Texture* t = layers[i].tex[v];
+		if (!t) continue;
+		SDL_Rect to = { x + layers[i].dst.x * k, y + layers[i].dst.y * k, layers[i].dst.w * k, layers[i].dst.h * k };
+		SDL_SetTextureScaleMode(t, SDL_ScaleModeNearest);
+		SDL_RenderCopy(ren, t, &layers[i].src, &to);
+	}
+}
+
 /* ui_image_pixels' drawing, into dst on the current (screen) target. */
-static void draw_pixels(SDL_Renderer* ren, int v, SDL_Texture* src, int w, int h, const SDL_Rect* dstp, int lcd) {
+static void draw_pixels(SDL_Renderer* ren, int v, SDL_Texture* src, int w, int h, const SDL_Rect* dstp, int lcd, const UiLayer* layers,
+                        int nLayers) {
+	if (!src) return; /* (no texture could be made: not the cached target's last picture, which is another game's) */
 	SDL_Rect dst = *dstp;
 	int k = SDL_max(1, SDL_min(dst.w / w, dst.h / h));
 	bool exact = dst.w == w * k && dst.h == h * k;
@@ -2067,6 +2142,7 @@ static void draw_pixels(SDL_Renderer* ren, int v, SDL_Texture* src, int w, int h
 	if (!lcd && (exact || cfg->smooth)) {
 		SDL_SetTextureScaleMode(src, cfg->smooth ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
 		SDL_RenderCopy(ren, src, NULL, &dst);
+		if (exact) draw_layers(ren, v, layers, nLayers, dst.x, dst.y, k);
 		return;
 	}
 	if (lcd && exact && k * c >= 3) {
@@ -2075,6 +2151,7 @@ static void draw_pixels(SDL_Renderer* ren, int v, SDL_Texture* src, int w, int h
 		 * reload the whole framebuffer. */
 		SDL_SetTextureScaleMode(src, SDL_ScaleModeNearest);
 		SDL_RenderCopy(ren, src, NULL, &dst);
+		draw_layers(ren, v, layers, nLayers, dst.x, dst.y, k);
 		SDL_Texture* grid = shader_mask(v, dst.w, dst.h, gw, gh, k * c);
 		if (grid) SDL_RenderCopy(ren, grid, NULL, &dst);
 		return;
@@ -2082,7 +2159,7 @@ static void draw_pixels(SDL_Renderer* ren, int v, SDL_Texture* src, int w, int h
 	if (lcd && (dst.w < gw * 3 || dst.h < gh * 3)) {
 		/* small cells (a 640x480 screen): the picture as without the grid,
 		 * then a grid made at the screen's resolution on top */
-		draw_pixels(ren, v, src, w, h, &dst, 0);
+		draw_pixels(ren, v, src, w, h, &dst, 0, layers, nLayers);
 		SDL_Texture* grid = shader_mask(v, dst.w, dst.h, gw, gh, 0);
 		if (grid) SDL_RenderCopy(ren, grid, NULL, &dst);
 		return;
@@ -2105,6 +2182,7 @@ static void draw_pixels(SDL_Renderer* ren, int v, SDL_Texture* src, int w, int h
 	SDL_SetRenderTarget(ren, target);
 	SDL_SetTextureScaleMode(src, SDL_ScaleModeNearest);
 	SDL_RenderCopy(ren, src, NULL, NULL);
+	draw_layers(ren, v, layers, nLayers, 0, 0, k);
 	if (lcd) {
 		SDL_Texture* grid = shader_mask(v, w * k, h * k, gw, gh, k * c);
 		if (grid) SDL_RenderCopy(ren, grid, NULL, NULL);
@@ -2236,6 +2314,22 @@ static void extracted_path(const Config* c, const char* code, char* path, size_t
 	const MapProfile* prof = profile_find(code);
 	if (prof && prof->logo.rev) snprintf(path, n, "%s/logos/%.4s-r%d.png", c->stateDir, code, prof->logo.rev);
 	else snprintf(path, n, "%s/logos/%.4s.png", c->stateDir, code);
+}
+
+/* The game's own logo made now, if it isn't yet (the test bench, before its timing). */
+void ui_logo_prepare(const Config* c, const char* rom) {
+	uint8_t h[0xB0];
+	if (!emu_rom_header(rom, h, sizeof(h))) return;
+	char code[5] = { (char) h[0xAC], (char) h[0xAD], (char) h[0xAE], (char) h[0xAF], 0 };
+	char path[1200];
+	snprintf(path, sizeof(path), "%s/logos", c->stateDir);
+	mkdirs(path);
+	extracted_path(c, code, path, sizeof(path));
+	struct stat st;
+	if (stat(path, &st) == 0) return;
+	Uint32 t0 = SDL_GetTicks();
+	bool ok = logo_extract(rom, code, path);
+	fprintf(stderr, "logo: %s %s in %u ms (before the bench's timing)\n", code, ok ? "made" : "not made", (unsigned) (SDL_GetTicks() - t0));
 }
 
 /* The player's own logo for the game: <asset_dir>/logos/<CODE>.png|.bmp|.jpg|.webp. */

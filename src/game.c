@@ -1,5 +1,6 @@
 /* One play session: the emulator, the second-screen map, and the pause menu. */
 #include "game.h"
+#include "bench.h"
 #ifdef __wasi__
 extern void web_sleep(unsigned ms) __attribute__((import_module("env"), import_name("web_sleep")));
 #endif
@@ -37,6 +38,9 @@ extern void web_sleep(unsigned ms) __attribute__((import_module("env"), import_n
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#endif
+#ifdef __3DS__
+#include "host.h"
 #endif
 
 /* Times the game thread was taken off its core (involuntary context
@@ -116,6 +120,8 @@ static struct {
 } ahead = { .lock = PTHREAD_MUTEX_INITIALIZER, .cond = PTHREAD_COND_INITIALIZER };
 static bool aheadInFlight; /* the worker is emulating the next frame */
 static bool aheadReady;    /* it has: that frame is emulated but not yet used */
+static double lateness = 1; /* capture_throttle: frames' work over their budget, averaged (1: on time) */
+static int captureFrames, lastCaptureFrames; /* capture_duty: frames the capture under way has taken so far, and the last one took */
 static uint32_t aheadFb[GBA_W * GBA_H]; /* the frame on screen, while the worker writes the next */
 
 /* Bits above the GBA keys, for run_frame: the SNES layout's camera pan
@@ -606,7 +612,7 @@ static void twin_second(void* arg) {
 	 * for the game's view) */
 	if (tall_carry(twinProf) && tw->carried) emu_oam_write(&tw->e, tw->oam);
 	emu_frame(&tw->e, twinFrameKeys & 0x3FF);
-	memcpy(tw->pic, tw->e.fb, sizeof(tw->pic));
+	emu_fb_copy(&tw->e, tw->pic);
 	if (tall_carry(twinProf)) {
 		emu_oam_read(&tw->e, tw->oam);
 		for (int i = 0; i < 1024; ++i) tw->shadow[i] = emu_read8(&tw->e, twinProf->tall.live.oam + i);
@@ -873,6 +879,11 @@ static bool ahead_start(uint32_t keys) {
 	pthread_mutex_lock(&ahead.lock);
 	if (!ahead.started) {
 		ahead.quit = false;
+#ifdef __3DS__
+		/* (the New 3DS's third core, unless mGBA's drawing thread is there) */
+		host_next_thread_core(host_ahead_core(emu_threaded(&emu)));
+		host_next_thread_name("frame buffer");
+#endif
 		ahead.started = pthread_create(&ahead.thread, NULL, ahead_worker, NULL) == 0;
 	}
 	bool ok = ahead.started;
@@ -948,6 +959,11 @@ static const char* dump_text(char* buf, size_t n) {
 static GamePaths gp;
 
 static SDL_Texture* gameTex[2];
+#ifdef COLOR_16_BIT
+/* the picture as mGBA's own RGB565, for the GPU's transfer as it is; gameIs16: view i's last picture went there */
+static SDL_Texture* gameTex16[2];
+static bool gameIs16[2];
+#endif
 static SDL_Texture* mapTex[2];
 /* profile.combat: in a fight, the second screen is the map's background
  * with the logo small and dimmed (combatTex, mapW x mapH, made once) */
@@ -1007,6 +1023,32 @@ static bool hudOn; /* the frame being emulated is split */
 #define HUD_CH (GBA_H * 2)
 static uint32_t hudCanvas[HUD_CW * HUD_CH], hudBack[HUD_CW * HUD_CH], hudGrab[GBA_W * GBA_H];
 static bool hudBackValid;
+/* hud_layers: hudCanvas is the backdrop alone, made again only when it
+ * changes; the HUD's pieces (hudOver, a pixel to a GBA pixel) and the big
+ * map (hudMapPx) are laid over it by the GPU as the picture is drawn
+ * (hud_draw), so a frame sends only what moved, not the whole picture */
+static bool hudLayered;
+static SDL_Texture* hudOverTex[2];
+static SDL_Texture* hudMapTex[2];
+static SDL_Texture* hudFlatTex[2]; /* the layers flattened, where they can't be drawn as layers (Smooth) */
+static uint32_t hudOver[GBA_W * GBA_H];      /* the pieces as the textures have them: alpha 0 where nothing */
+static uint32_t hudOverBuild[GBA_W * GBA_H]; /* this frame's */
+static bool hudOverRow[GBA_H], hudOverUse[GBA_H]; /* rows of hudOver, of hudOverBuild with a piece in them */
+static int16_t hudOverSpan[GBA_H][2], hudBuildSpan[GBA_H][2]; /* the first and last pixel of a piece in those rows */
+static uint32_t hudMapPx[GBA_W * GBA_H], hudMapBuild[GBA_W * GBA_H]; /* the big map's box, rows hudMapTexW apart */
+static int hudMapTexW, hudMapTexH;
+static SDL_Rect hudMapSrc, hudMapDst; /* the map's part of hudMapTex, and its place on the canvas (w 0: no big map) */
+static uint32_t* hudFlat;
+static uint64_t hudBaseKey; /* which backdrop hudCanvas holds as it is (0: none, or changed since) */
+static unsigned hudBaseSerial, hudTitleSerial, hudTitleGen; /* a count of remakes of hudCanvas, and as of the level's name on it */
+static unsigned hudLayerGen = 1, hudFlatGen; /* a count of changes to the layers, and as of the flattened picture */
+static unsigned hudBackGen, hudLogoBackGen, hudLogoBelowGen, cardLogoGen; /* a count of each backdrop's remakes */
+/* what each view's textures don't have yet */
+static struct {
+	bool base, map, flat;
+	unsigned overStrips; /* bit i: rows 8i to 8i + 7 of hudOver */
+} hudOld[2];
+#define HUD_KEY(kind, gen) ((uint64_t) (kind) << 32 | (uint32_t) (gen))
 static int hudFrames; /* split frames since the race (re)started */
 static int mapX0, mapY0, mapX1, mapY1; /* the map's box on the HUD, measured over the first frames */
 static bool mapFound;
@@ -1070,6 +1112,7 @@ static uint32_t hudLogoBelow[HUD_CW * HUD_CH]; /* profile hud.logoBelow: dark gr
  * the HUD (mapTitleN rows; 0: none taken yet) */
 static uint32_t mapTitle[GBA_W * 32];
 static int mapTitleN;
+static unsigned mapTitleGen; /* a count of changes to mapTitle */
 static bool hudLogoBelowDone;
 static int snapShow, snapRevert;   /* consecutive frames matching show / a revert screen */
 static uint32_t snapShown[GBA_W * GBA_H]; /* the copy on the second screen (kept with save states) */
@@ -3790,10 +3833,10 @@ static void draw_menu(void) {
 
 /* ---------------------------------------------------------------- helpers */
 
-static int probes_hit(const uint32_t* fb, const Probe* p, int tol) {
+static int probes_hit(Emu* e, const Probe* p, int tol) {
 	int n = 0;
 	for (int i = 0; i < 8 && (p[i].x || p[i].y || p[i].rgb); ++i) {
-		uint32_t c = fb[p[i].y * GBA_W + p[i].x];
+		uint32_t c = emu_pixel(e, p[i].x, p[i].y);
 		int dr = (int) (c & 0xFF) - (int) ((p[i].rgb >> 16) & 0xFF);
 		int dg = (int) ((c >> 8) & 0xFF) - (int) ((p[i].rgb >> 8) & 0xFF);
 		int db = (int) ((c >> 16) & 0xFF) - (int) (p[i].rgb & 0xFF);
@@ -3822,10 +3865,10 @@ static void snapshot_hiding_sprites_poke(const SpriteRule* hide, int n, const Sp
 		stSize = st ? sz : 0;
 	}
 	if (!st || !emu_state_save(&emu, st)) {
-		memcpy(out, emu.fb, sizeof(raw));
+		emu_fb_copy(&emu, out);
 		return;
 	}
-	memcpy(raw, emu.fb, sizeof(raw));
+	emu_fb_copy(&emu, raw);
 	SpriteRule all[12];
 	int na = 0;
 	for (int i = 0; i < nKept && na < 12; ++i) all[na++] = kept[i];
@@ -3836,25 +3879,25 @@ static void snapshot_hiding_sprites_poke(const SpriteRule* hide, int n, const Sp
 	/* (a core whose picture is a frame late (armGBA on the 3DS) runs another
 	 * for the first one's picture: the state is put back after either way) */
 	for (int i = 0, n = 1 + emu_frame_lag(&emu); i < n; ++i) emu_frame(&emu, 0);
-	memcpy(out, emu.fb, sizeof(raw));
+	emu_fb_copy(&emu, out);
 	emu_hide_sprites(&emu, nKept ? kept : NULL, nKept);
 	emu_state_load(&emu, st);
 	int16_t drop[2048];
 	while (emu_audio_read(&emu, drop, 1024) > 0) {}
-	memcpy(emu.fb, raw, sizeof(raw));
+	emu_fb_set(&emu, raw);
 }
 
 /* Logo-only games: copy a recognised screen (THPS2 goal sheet) to the second
  * screen; back to the logo at the menus. */
 /* The grabbed sky and scenery (the rows above the horizon), scaled up to
  * cover the canvas (centred), and dimmed well back. */
-static bool frame_is_dark(const uint32_t* fb);
+static bool frame_is_dark(Emu* e);
 /* One colour all over, nearly: a fade to black or to white, a blank screen. */
-static bool frame_is_flat(const uint32_t* fb) {
+static bool frame_is_flat(Emu* e, const uint32_t* fb) { /* (fb: a picture of its own; else the game's) */
 	long sum = 0, n = 0;
 	static int l[GBA_W * GBA_H / 7 + 1];
 	for (int i = 0; i < GBA_W * GBA_H; i += 7) {
-		uint32_t c = fb[i];
+		uint32_t c = fb ? fb[i] : emu_pixel_n(e, i);
 		l[n] = (int) ((c & 0xFF) + ((c >> 8) & 0xFF) + ((c >> 16) & 0xFF));
 		sum += l[n++];
 	}
@@ -3926,7 +3969,7 @@ static void hud_make_backdrop(void) {
 			luma += (c & 0xFF) + ((c >> 8) & 0xFF) + ((c >> 16) & 0xFF);
 		}
 		long level = luma / SDL_max(drawn, 1) / 3;
-		bool good = drawn > GBA_W * GBA_H / 2 && level > 60 && !frame_is_flat(hudGrab);
+		bool good = drawn > GBA_W * GBA_H / 2 && level > 60 && !frame_is_flat(NULL, hudGrab);
 		/* after a fade, only once the brightness has stopped rising */
 		static long lastLevel;
 		if (hudSettle && good && labs(level - lastLevel) > 3) good = false;
@@ -3952,6 +3995,7 @@ static void hud_make_backdrop(void) {
 		fprintf(stderr, "frame %llu: backdrop from %d rows (%s)\n", (unsigned long long) frameCount, h, path);
 	}
 	if (!hudBackValid) return;
+	++hudBackGen;
 	/* where the layers drew nothing: black, not the 'nothing here' colour */
 	uint32_t clear = emu_hud_clear();
 	for (int i = 0; i < GBA_W * GBA_H; ++i) {
@@ -4036,6 +4080,7 @@ static void hud_make_backdrop(void) {
  * and the cup table, and they can't be read over it.) */
 static void hud_make_logo_back(void) {
 	hudLogoDone = true;
+	++hudLogoBackGen;
 	for (int i = 0; i < HUD_CW * HUD_CH; ++i) hudLogoBack[i] = SCREEN_LIVE;
 }
 
@@ -4050,6 +4095,7 @@ static uint32_t heldNum[GBA_W * GBA_H];
 static int heldNumW, heldNumH;
 static void hud_make_logo_below(void) {
 	hudLogoBelowDone = true;
+	++hudLogoBelowGen;
 	for (int i = 0; i < HUD_CW * HUD_CH; ++i) hudLogoBelow[i] = SCREEN_LIVE; /* (under the HUD: GEN-1) */
 	const typeof(hudProf->hud.held)* hp = &hudProf->hud.held;
 	if (hp->y1 && heldN > 0) {
@@ -4192,6 +4238,7 @@ static void card_backdrop(void) {
 			o[0] = o[1] = o[HUD_CW] = o[HUD_CW + 1] = c;
 		}
 	}
+	++hudBackGen;
 	hudBackValid = true;
 	hudFadeIn = 0;
 	bg_pal_levels(hudPalRef);
@@ -4204,6 +4251,7 @@ static void card_backdrop(void) {
 static const uint32_t* card_logo(void) {
 	static uint32_t cardLogo[HUD_CW * HUD_CH];
 	if (!cardLogoMade) {
+		++cardLogoGen;
 		for (int i = 0; i < HUD_CW * HUD_CH; ++i) cardLogo[i] = SCREEN_LIVE; /* (under the HUD: GEN-1) */
 		cardLogoMade = logo_draw(cardLogo, HUD_CW, HUD_CH, HUD_CW / GBA_W, hudProf->hud.card.whole ? 0 : 48 * 2, 255);
 	}
@@ -4216,6 +4264,7 @@ static const uint32_t* card_logo(void) {
 static uint32_t mapHeld[GBA_W * GBA_H];
 static bool mapHeldOk;
 static bool hudPicNew = true; /* (this frame's HUD picture is a new one: emu_hud_fresh) */
+static uint32_t hudPicSerial; /* (goes up with each new HUD picture, so what was found in hudPx is kept till then) */
 static int mapUndrawn; /* frames since the map was last drawn */
 static uint16_t mapDots[32][3];
 static int nMapDots;
@@ -4304,10 +4353,219 @@ static void map_hold_update(const typeof(hudProf->hud)* h, uint32_t clear) {
 	}
 }
 
+/* The first pixel of a row from x to x1 that isn't the clear colour (x1 + 1: none), over the empty stretches eight at a time */
+static inline int next_lit(const uint32_t* row, int x, int x1, uint32_t clear) {
+	if (x > x1 || (row[x] & 0xFFFFFF) != clear) return x;
+	for (++x; x + 7 <= x1; x += 8) {
+		uint32_t d = (row[x] ^ clear) | (row[x + 1] ^ clear) | (row[x + 2] ^ clear) | (row[x + 3] ^ clear) | (row[x + 4] ^ clear) |
+		             (row[x + 5] ^ clear) | (row[x + 6] ^ clear) | (row[x + 7] ^ clear);
+		if (d & 0xFFFFFF) break;
+	}
+	while (x <= x1 && (row[x] & 0xFFFFFF) == clear) ++x;
+	return x;
+}
+
+/* ---- hud_layers (see hudLayered) */
+
+static void hud_stale_all(void) {
+	for (int v = 0; v < 2; ++v) hudOld[v].base = hudOld[v].map = hudOld[v].flat = true, hudOld[v].overStrips = (1u << (GBA_H / 8)) - 1;
+	++hudLayerGen;
+}
+
+/* the level's name is on hudCanvas over its backdrop, whose key stays: the views need the canvas, and it isn't remade */
+static void hud_canvas_titled(void) {
+	for (int v = 0; v < 2; ++v) hudOld[v].base = true;
+	++hudLayerGen;
+	hudTitleSerial = hudBaseSerial, hudTitleGen = mapTitleGen;
+}
+
+/* hudCanvas has changed: held as the backdrop `key` (0: edited in place, so made again next time) */
+static void hud_base_changed(uint64_t key) {
+	hudBaseKey = key;
+	++hudBaseSerial;
+	for (int v = 0; v < 2; ++v) hudOld[v].base = true;
+	++hudLayerGen;
+}
+
+/* hudCanvas is made from src, unless it already is that backdrop */
+static void hud_backdrop_from(const uint32_t* src, uint64_t key) {
+	if (hudLayered && hudBaseKey == key) return;
+	memcpy(hudCanvas, src, sizeof(hudCanvas));
+	hud_base_changed(key);
+}
+
+/* ... or, with the layers off, the canvas rows c0 .. c0 + cn - 1 of it (hud_compose's band) */
+static void hud_backdrop_band(const uint32_t* src, uint64_t key, size_t c0, size_t cn) {
+	if (hudLayered) hud_backdrop_from(src, key);
+	else memcpy(hudCanvas + c0, src + c0, cn * 4);
+}
+
+/* Pieces from lo to hi are in hudOverBuild's row y (a stretch of pixels going to one row is told once) */
+static void hud_over_span(int y, int lo, int hi) {
+	if (y < 0) return;
+	if (!hudOverUse[y]) hudOverUse[y] = true, hudBuildSpan[y][0] = (int16_t) lo, hudBuildSpan[y][1] = (int16_t) hi;
+	else hudBuildSpan[y][0] = (int16_t) SDL_min(hudBuildSpan[y][0], lo), hudBuildSpan[y][1] = (int16_t) SDL_max(hudBuildSpan[y][1], hi);
+}
+
+/* A frame's pieces are made in hudOverBuild, from a clean sheet */
+static void hud_over_begin(void) {
+	for (int y = 0; y < GBA_H; ++y) {
+		if (!hudOverUse[y]) continue;
+		memset(&hudOverBuild[y * GBA_W + hudBuildSpan[y][0]], 0, (size_t) (hudBuildSpan[y][1] - hudBuildSpan[y][0] + 1) * 4);
+		hudOverUse[y] = false;
+	}
+}
+
+/* ... and the rows that differ from the textures' go into hudOver, to be sent */
+static void hud_over_end(void) {
+	for (int y = 0; y < GBA_H; ++y) {
+		if (!hudOverUse[y] && !hudOverRow[y]) continue;
+		/* (only the stretch either row has pieces in: the rest is clear in both) */
+		int x0 = GBA_W, x1 = -1;
+		if (hudOverRow[y]) x0 = hudOverSpan[y][0], x1 = hudOverSpan[y][1];
+		if (hudOverUse[y]) x0 = SDL_min(x0, hudBuildSpan[y][0]), x1 = SDL_max(x1, hudBuildSpan[y][1]);
+		hudOverRow[y] = hudOverUse[y];
+		hudOverSpan[y][0] = hudBuildSpan[y][0], hudOverSpan[y][1] = hudBuildSpan[y][1];
+		if (!memcmp(&hudOver[y * GBA_W + x0], &hudOverBuild[y * GBA_W + x0], (size_t) (x1 - x0 + 1) * 4)) continue;
+		memcpy(&hudOver[y * GBA_W + x0], &hudOverBuild[y * GBA_W + x0], (size_t) (x1 - x0 + 1) * 4);
+		for (int v = 0; v < 2; ++v) hudOld[v].overStrips |= 1u << (y / 8);
+		++hudLayerGen;
+	}
+}
+
 static void hud_upload(void) {
 	for (int i = 0; i < nViews; ++i) {
 		if (!(HUD_TEX_SHARED && i > 0 && hudTex[i] == hudTex[0])) ui_update_texture(hudTex[i], hudCanvas, HUD_CW * 4);
 	}
+}
+
+/* No pieces or map over the canvas */
+static void hud_layers_off(void) {
+	hud_over_begin();
+	hud_over_end();
+	if (hudMapSrc.w) hudMapSrc.w = 0, ++hudLayerGen;
+}
+
+/* hudCanvas holds the whole picture (no pieces or map over it) and has to be sent: the layers off */
+static void hud_canvas_whole(void) {
+	if (!hudLayered) {
+		hud_upload();
+		return;
+	}
+	hud_base_changed(0);
+	hud_layers_off();
+}
+
+/* A view's textures, made when it first shows the HUD (not for the screen that never does) */
+static void hud_view_textures(int v) {
+	static Uint32 tried[2];
+	if (hudTex[v] && hudOverTex[v] && (hudMapTex[v] || !hudMapTexW)) return;
+	if (tried[v] && SDL_GetTicks() - tried[v] < 1000) return; /* (no room: not tried again every frame) */
+	tried[v] = SDL_GetTicks() | 1;
+	if (!hudTex[v]) {
+		hudTex[v] = SDL_CreateTexture(views[v].ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, HUD_CW, HUD_CH);
+		if (hudTex[v]) SDL_SetTextureBlendMode(hudTex[v], SDL_BLENDMODE_NONE), hudOld[v].base = true;
+	}
+	if (!hudOverTex[v]) {
+		hudOverTex[v] = SDL_CreateTexture(views[v].ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, GBA_W, GBA_H);
+		if (hudOverTex[v]) SDL_SetTextureBlendMode(hudOverTex[v], SDL_BLENDMODE_BLEND), hudOld[v].overStrips = (1u << (GBA_H / 8)) - 1;
+	}
+	if (!hudMapTex[v] && hudMapTexW) {
+		hudMapTex[v] = SDL_CreateTexture(views[v].ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, hudMapTexW, hudMapTexH);
+		if (hudMapTex[v]) SDL_SetTextureBlendMode(hudMapTex[v], SDL_BLENDMODE_BLEND), hudOld[v].map = true;
+	}
+}
+
+/* The picture's layers on one view's textures, what they lack sent */
+static void hud_sync(int v) {
+	hud_view_textures(v);
+	if (hudOld[v].base && hudTex[v]) {
+		ui_update_texture(hudTex[v], hudCanvas, HUD_CW * 4);
+		hudOld[v].base = false;
+	}
+	while (hudOld[v].overStrips && hudOverTex[v]) {
+		unsigned m = hudOld[v].overStrips;
+		int a = __builtin_ctz(m), b = a;
+		/* (a run of strips, over gaps of one: a send has its own cost) */
+		while (b + 1 < GBA_H / 8 && (m >> (b + 1) & 1 || (b + 2 < GBA_H / 8 && m >> (b + 2) & 1))) ++b;
+		for (int i = a; i <= b; ++i) hudOld[v].overStrips &= ~(1u << i);
+		ui_update_texture_rows(hudOverTex[v], hudOver, GBA_W * 4, a * 8, SDL_min(b * 8 + 8, GBA_H) - a * 8);
+	}
+	if (hudOld[v].map && hudMapTex[v]) {
+		ui_update_texture(hudMapTex[v], hudMapPx, hudMapTexW * 4);
+		hudOld[v].map = false;
+	}
+}
+
+/* The layers as one picture, as hudCanvas would have been without them (for a view that can't draw them) */
+static const uint32_t* hud_flatten(void) {
+	if (!hudFlat) hudFlat = malloc(sizeof(hudCanvas));
+	if (!hudFlat) return hudCanvas;
+	if (hudFlatGen != hudLayerGen) {
+		memcpy(hudFlat, hudCanvas, sizeof(hudCanvas));
+		for (int y = 0; y < GBA_H; ++y) {
+			if (!hudOverRow[y]) continue;
+			for (int x = 0; x < GBA_W; ++x) {
+				uint32_t c = hudOver[y * GBA_W + x];
+				if (!c) continue;
+				uint32_t* o = &hudFlat[y * 2 * HUD_CW + x * 2];
+				o[0] = o[1] = o[HUD_CW] = o[HUD_CW + 1] = c;
+			}
+		}
+		if (hudMapSrc.w) {
+			int q = hudMapDst.w / hudMapSrc.w;
+			for (int y = 0; y < hudMapSrc.h; ++y) {
+				for (int x = 0; x < hudMapSrc.w; ++x) {
+					uint32_t c = hudMapPx[(hudMapSrc.y + y) * hudMapTexW + hudMapSrc.x + x];
+					if (!c) continue;
+					for (int j = 0; j < q; ++j) {
+						uint32_t* o = &hudFlat[(hudMapDst.y + y * q + j) * HUD_CW + hudMapDst.x + x * q];
+						for (int i = 0; i < q; ++i) o[i] = c;
+					}
+				}
+			}
+		}
+		hudFlatGen = hudLayerGen;
+		for (int v = 0; v < 2; ++v) hudOld[v].flat = true;
+	}
+	return hudFlat;
+}
+
+
+/* The HUD's second screen on screen s */
+static void hud_draw(int s) {
+	int lcd = SHADER_ON ? 2 : 0, v = screens[s].view;
+	if (!hudLayered) {
+		ui_image_pixels(s, hudTex, HUD_CW, HUD_CH, cfg->mapScale, lcd);
+		return;
+	}
+	if (!ui_pixels_over_ok(s, HUD_CW, HUD_CH, cfg->mapScale, lcd)) {
+		const uint32_t* flat = hud_flatten();
+		if (!hudFlatTex[v]) {
+			hudFlatTex[v] = SDL_CreateTexture(views[v].ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, HUD_CW, HUD_CH);
+			if (hudFlatTex[v]) SDL_SetTextureBlendMode(hudFlatTex[v], SDL_BLENDMODE_NONE);
+			hudOld[v].flat = true;
+		}
+		if (hudOld[v].flat) ui_update_texture(hudFlatTex[v], flat, HUD_CW * 4), hudOld[v].flat = false;
+		ui_image_pixels(s, hudFlatTex, HUD_CW, HUD_CH, cfg->mapScale, lcd);
+		return;
+	}
+	hud_sync(v);
+	/* the pieces' rows, a layer for each stretch of them (the GPU draws no more than there is) */
+	UiLayer layers[8];
+	int n = 0;
+	int last = -1;
+	for (int y = 0; y < GBA_H; ++y) last = hudOverRow[y] ? y : last;
+	for (int y = 0; y <= last; ++y) {
+		if (!hudOverRow[y]) continue;
+		int y1 = y;
+		for (int k = y + 1; k <= last && k <= y1 + 8; ++k) y1 = hudOverRow[k] ? k : y1;
+		if (n == 6) y1 = last;
+		layers[n++] = (UiLayer) { hudOverTex, { 0, y, GBA_W, y1 - y + 1 }, { 0, y * 2, HUD_CW, (y1 - y + 1) * 2 } };
+		y = y1;
+	}
+	if (hudMapSrc.w) layers[n++] = (UiLayer) { hudMapTex, hudMapSrc, hudMapDst };
+	ui_image_pixels_over(s, hudTex, HUD_CW, HUD_CH, cfg->mapScale, lcd, layers, n);
 }
 
 /* hud_compose's band: the whole picture, none of it (only what goes on the
@@ -4319,9 +4577,81 @@ static void hud_upload(void) {
 static int hud_band_y0(int band) { return band * HUD_BAND_ROWS; }
 static int hud_band_n(int band) { return band == 2 ? HUD_CH - 2 * HUD_BAND_ROWS : HUD_BAND_ROWS; }
 
+/* The pieces that go back onto the game picture, from a list of runs made once for each HUD picture and set of moves
+ * (the game picture is new every frame, the core makes a HUD picture one frame in five). */
+#define HUD_PUT_MAX 2048
+static void hud_put_pieces(const HudMove* moves, const HudMove* movesIn, int mosV, uint32_t clear, const bool* moving, const int* moveDx,
+                           const int* moveDy) {
+	static struct {
+		uint32_t pic, clear;
+		const HudMove* in;
+		int mosV, n;
+		bool ok, moving[HUD_MOVES];
+		int dx[HUD_MOVES], dy[HUD_MOVES];
+		struct { uint16_t x, y, n; uint32_t src; } run[HUD_PUT_MAX]; /* n pixels from hudPx[src] to the picture's row y, from x */
+	} put;
+	bool any = false;
+	for (int m = 0; moves && m < HUD_MOVES; ++m) any |= moving[m] && moves[m].toGame;
+	if (!any) return;
+	bool same = put.ok && put.pic == hudPicSerial && put.in == movesIn && put.mosV == mosV && put.clear == clear &&
+	            !memcmp(put.moving, moving, sizeof(put.moving)) && !memcmp(put.dx, moveDx, sizeof(put.dx)) && !memcmp(put.dy, moveDy, sizeof(put.dy));
+	if (same) {
+		for (int i = 0; i < put.n; ++i) {
+#ifdef COLOR_16_BIT
+			for (int k = 0; k < put.run[i].n; ++k) emu_fb_put(&emu, put.run[i].x + k, put.run[i].y, hudPx[put.run[i].src + k]);
+#else
+			emu_fb_put_run(&emu, put.run[i].x, put.run[i].y, &hudPx[put.run[i].src], put.run[i].n);
+#endif
+		}
+		return;
+	}
+	put.pic = hudPicSerial, put.in = movesIn, put.mosV = mosV, put.clear = clear, put.n = 0, put.ok = true;
+	memcpy(put.moving, moving, sizeof(put.moving)), memcpy(put.dx, moveDx, sizeof(put.dx)), memcpy(put.dy, moveDy, sizeof(put.dy));
+	for (int m = 0; m < HUD_MOVES; ++m) {
+		const HudMove* mv = &moves[m];
+		if (!moving[m] || !mv->toGame) continue;
+		int dx = moveDx[m], dy = moveDy[m], left = SDL_max(mv->x0, 0), right = SDL_min(mv->x1, GBA_W - 1) + 1;
+		if (left >= right) continue;
+		for (int y = SDL_max(mv->y0, 0); y <= SDL_min(mv->y1, GBA_H - 1); ++y) {
+			int ny = y + dy;
+			if (ny < 0 || ny >= GBA_H) continue;
+			/* (an earlier piece's box owns its pixels: where one meets this row, the row is cut at its edges) */
+			const HudMove* before[HUD_MOVES];
+			int nBefore = 0, cuts[2 * HUD_MOVES + 2], nCuts = 0;
+			cuts[nCuts++] = left, cuts[nCuts++] = right;
+			for (int k = 0; k < m; ++k) {
+				const HudMove* o = &moves[k];
+				if (!moving[k] || y < o->y0 || y > o->y1) continue;
+				before[nBefore++] = o;
+				cuts[nCuts++] = SDL_clamp(o->x0, left, right), cuts[nCuts++] = SDL_clamp(o->x1 + 1, left, right);
+			}
+			for (int i = 1; i < nCuts; ++i) {
+				int v = cuts[i], j = i;
+				for (; j > 0 && cuts[j - 1] > v; --j) cuts[j] = cuts[j - 1];
+				cuts[j] = v;
+			}
+			const uint32_t* row = &hudPx[y * GBA_W];
+			for (int seg = 0; seg + 1 < nCuts; ++seg) {
+				bool taken = false;
+				for (int k = 0; k < nBefore && !taken; ++k) taken = cuts[seg] >= before[k]->x0 && cuts[seg] <= before[k]->x1;
+				int lo = SDL_max(cuts[seg], -dx), hi = SDL_min(cuts[seg + 1], GBA_W - dx);
+				for (int x = lo; !taken && (x = next_lit(row, x, hi - 1, clear)) < hi;) {
+					int e = x + 1;
+					while (e < hi && (row[e] & 0xFFFFFF) != clear) ++e;
+					for (int i = x; i < e; ++i) emu_fb_put(&emu, i + dx, ny, row[i]); /* back onto the game picture */
+					if (put.n < HUD_PUT_MAX) put.run[put.n++] = (typeof(put.run[0])) { (uint16_t) (x + dx), (uint16_t) ny, (uint16_t) (e - x), (uint32_t) (y * GBA_W + x) };
+					else put.ok = false; /* (too many to list: made again each frame) */
+					x = e;
+				}
+			}
+		}
+	}
+}
+
 static void hud_compose(int band) {
 	const typeof(hudProf->hud)* h = &hudProf->hud;
 	uint32_t clear = emu_hud_clear();
+	const bool lay = hudLayered; /* (whole pictures only: bands are for the layers off) */
 	/* (what's done once a picture: with its first band, or the whole) */
 	bool first = band == HB_ALL || band == 0;
 	bool canvas = band != HB_NONE;
@@ -4340,8 +4670,7 @@ static void hud_compose(int band) {
 	 * picture of a race can come 12 frames in) */
 	if (first && racing && h->map.x1 && (hudFrames <= 8 || !mapFound || hudFrames <= mapFoundAt + 8 || h->mapAt.scale)) {
 		for (int y = h->map.y0; y <= h->map.y1; ++y) {
-			for (int x = h->map.x0; x <= h->map.x1; ++x) {
-				if ((hudPx[y * GBA_W + x] & 0xFFFFFF) == clear) continue;
+			for (int x = h->map.x0; (x = next_lit(&hudPx[y * GBA_W], x, h->map.x1, clear)) <= h->map.x1; ++x) {
 				if (!mapFound) mapX0 = mapX1 = x, mapY0 = mapY1 = y, mapFound = true, mapFoundAt = hudFrames > 8 ? hudFrames : 0;
 				mapX0 = SDL_min(mapX0, x), mapX1 = SDL_max(mapX1, x);
 				mapY0 = SDL_min(mapY0, y), mapY1 = SDL_max(mapY1, y);
@@ -4380,16 +4709,18 @@ static void hud_compose(int band) {
 		for (int y = h->sign.y0; y <= h->sign.y1; ++y) {
 			for (int x = h->sign.x0; x <= h->sign.x1; ++x) {
 				uint32_t c = hudPx[y * GBA_W + x];
-				if ((c & 0xFFFFFF) != clear) emu.fb[y * GBA_W + x] = c;
+				if ((c & 0xFFFFFF) != clear) emu_fb_put(&emu, x, y, c);
 			}
 		}
 	}
+	/* (the level's name has gone: the backdrop it was laid on is made again) */
+	if (lay && canvas && hudBaseKey && hudTitleSerial == hudBaseSerial && !(h->mapTitleRows && mapTitleN)) hudBaseKey = 0;
 	if (!canvas) {
 		/* (the picture kept as it is: only the pieces that go back onto the
 		 * game screen, below, which the game picture needs every frame) */
 	} else if (hudScene) {
 		if (!hudLogoDone) hud_make_logo_back();
-		memcpy(hudCanvas + c0, hudLogoBack + c0, cn * 4);
+		hud_backdrop_band(hudLogoBack, HUD_KEY(1, hudLogoBackGen), c0, cn);
 	} else if ((hudAlt ? h->alt.mapBelow : h->mapBelow) && mapShownIdx >= 0 && mapW == GBA_W && mapH == GBA_H && map_px(mapShownIdx)) {
 		/* (hud.mapBelow, hud.alt.mapBelow: the map picture behind, at the game's size) */
 		const uint32_t* mp = map_px(mapShownIdx);
@@ -4399,11 +4730,11 @@ static void hud_compose(int band) {
 				o[0] = o[1] = o[HUD_CW] = o[HUD_CW + 1] = mp[y * GBA_W + x] | 0xFF000000;
 			}
 		}
+		hud_base_changed(0);
 	} else if (h->logoBelow || h->logoBehind) {
 		if (!hudLogoBelowDone) hud_make_logo_below();
-		memcpy(hudCanvas + c0, hudLogoBelow + c0, cn * 4);
+		hud_backdrop_band(hudLogoBelow, HUD_KEY(2, hudLogoBelowGen), c0, cn);
 	} else if (hudBackValid) {
-		memcpy(hudCanvas + c0, hudBack + c0, cn * 4);
 		/* the game fading the whole screen to black or white: the
 		 * backdrop too. By BLDCNT (every BG layer, darken or brighten, by
 		 * BLDY, in 16ths) */
@@ -4427,29 +4758,39 @@ static void hud_compose(int band) {
 			hudBackValid = false;
 			hudFadeEff = eff;
 			for (size_t i = c0; i < c0 + cn; ++i) hudCanvas[i] = eff == 2 ? 0xFFFFFFFF : 0xFF000000;
+			hud_base_changed(0);
 			fade = 0;
-		} else if (hudFadeIn > 0) {
-			/* a new backdrop, faded in over 16 frames from how the last
-			 * scene faded out, or less if the game's own fade is less */
-			int in = (first ? hudFadeIn-- : hudFadeIn) * 4;
-			if (in > fade || eff != hudFadeEff) eff = hudFadeEff, fade = in;
-		}
-		if (fade) {
-			for (size_t i = c0; i < c0 + cn; ++i) {
-				uint32_t c = hudCanvas[i], o = 0xFF000000;
-				for (int k = 0; k < 24; k += 8) {
-					int v = (c >> k) & 0xFF;
-					v = eff == 3 ? v - v * fade / 64 : v + (255 - v) * fade / 64;
-					o |= (uint32_t) v << k;
+		} else {
+			if (hudFadeIn > 0) {
+				/* a new backdrop, faded in over 16 frames from how the last
+				 * scene faded out, or less if the game's own fade is less */
+				int in = (first ? hudFadeIn-- : hudFadeIn) * 4;
+				if (in > fade || eff != hudFadeEff) eff = hudFadeEff, fade = in;
+			}
+			/* (the backdrop as faded by this much: kept while it stays so, not faded again each frame) */
+			uint64_t key = HUD_KEY(3, hudBackGen) | (fade ? ((uint64_t) ((eff & 3) << 7 | fade) + 1) << 48 : 0);
+			if (!lay || hudBaseKey != key) {
+				memcpy(hudCanvas + c0, hudBack + c0, cn * 4);
+				if (fade) {
+					uint8_t lut[256];
+					for (int v = 0; v < 256; ++v) lut[v] = (uint8_t) (eff == 3 ? v - v * fade / 64 : v + (255 - v) * fade / 64);
+					for (size_t i = c0; i < c0 + cn; ++i) {
+						uint32_t c = hudCanvas[i];
+						hudCanvas[i] = 0xFF000000 | lut[c & 0xFF] | (uint32_t) lut[(c >> 8) & 0xFF] << 8 | (uint32_t) lut[(c >> 16) & 0xFF] << 16;
+					}
 				}
-				hudCanvas[i] = o;
+				hud_base_changed(key);
 			}
 		}
 	} else if (h->card.tile) {
-		memcpy(hudCanvas + c0, card_logo() + c0, cn * 4);
+		const uint32_t* cl = card_logo();
+		hud_backdrop_band(cl, HUD_KEY(4, cardLogoGen), c0, cn);
 	} else {
 		uint32_t plain = h->mapCnt ? (hudFadeEff == 2 ? 0xFFFFFFFF : 0xFF000000) : h->black ? SCREEN_LIVE : 0xFF1A1010;
-		for (size_t i = c0; i < c0 + cn; ++i) hudCanvas[i] = plain;
+		if (!lay || hudBaseKey != HUD_KEY(5, plain)) {
+			for (size_t i = c0; i < c0 + cn; ++i) hudCanvas[i] = plain;
+			hud_base_changed(HUD_KEY(5, plain));
+		}
 	}
 	/* moved pieces (the scene's, or racing's): how far each goes this frame */
 	const HudMove* movesIn = hudScene ? h->scene.moves : racing ? h->moves : NULL;
@@ -4472,27 +4813,50 @@ static void hud_compose(int band) {
 	/* hud.mapTitleRows: the level's name from the map picture on top, the
 	 * HUD that far down */
 	int titleDy = h->mapTitleRows && mapTitleN ? mapTitleN + 2 : 0; /* (2 rows apart) */
-	for (int y = 0; canvas && y < titleDy; ++y) {
+	/* (a kept backdrop still has the name on it: laid over again, the whole canvas would be sent every frame) */
+	const bool titleKept = lay && hudBaseKey && hudTitleSerial == hudBaseSerial && hudTitleGen == mapTitleGen;
+	for (int y = 0; canvas && y < titleDy && !titleKept; ++y) {
 		if (y * 2 < cr0 || y * 2 >= cr1) continue;
 		for (int x = 0; x < GBA_W; ++x) {
 			uint32_t* o = &hudCanvas[y * 2 * HUD_CW + x * 2];
 			o[0] = o[1] = o[HUD_CW] = o[HUD_CW + 1] = mapTitle[y * GBA_W + x];
 		}
 	}
+	if (titleDy && !titleKept) {
+		if (lay && canvas && hudBaseKey) hud_canvas_titled();
+		else hud_base_changed(0);
+	}
 	int moveDx[HUD_MOVES] = { 0 }, moveDy[HUD_MOVES] = { 0 };
 	bool moving[HUD_MOVES] = { false };
 	int pieceLo[HUD_MOVES] = { 0 }, pieceTop[HUD_MOVES] = { 0 };
+	/* where each piece's lit pixels lie, found once for each HUD picture, as the core makes one in five frames */
+	static struct {
+		uint32_t pic, clear;
+		const HudMove* in;
+		int mosV;
+		bool have[HUD_MOVES];
+		int lo[HUD_MOVES], hi[HUD_MOVES], top[HUD_MOVES], bot[HUD_MOVES];
+	} found;
+	if (found.pic != hudPicSerial || found.in != movesIn || found.mosV != mosV || found.clear != clear) {
+		memset(&found, 0, sizeof(found));
+		found.pic = hudPicSerial, found.in = movesIn, found.mosV = mosV, found.clear = clear;
+	}
 	for (int m = 0; moves && m < HUD_MOVES; ++m) {
 		const HudMove* mv = &moves[m];
 		if (!mv->how && !mv->vhow && !mv->toGame) continue;
 		if (mv->ifTile && !oam_has_tile(mv->ifTile)) continue;
-		int lo = GBA_W, hi = -1, top = GBA_H, bot = -1;
-		for (int y = SDL_max(mv->y0, 0); y <= SDL_min(mv->y1, GBA_H - 1); ++y) {
-			for (int x = SDL_max(mv->x0, 0); x <= SDL_min(mv->x1, GBA_W - 1); ++x) {
-				if ((hudPx[y * GBA_W + x] & 0xFFFFFF) == clear) continue;
-				lo = SDL_min(lo, x), hi = SDL_max(hi, x), top = SDL_min(top, y), bot = SDL_max(bot, y);
+		if (!found.have[m]) {
+			int lo = GBA_W, hi = -1, top = GBA_H, bot = -1;
+			for (int y = SDL_max(mv->y0, 0); y <= SDL_min(mv->y1, GBA_H - 1); ++y) {
+				int x1 = SDL_min(mv->x1, GBA_W - 1);
+				for (int x = SDL_max(mv->x0, 0); (x = next_lit(&hudPx[y * GBA_W], x, x1, clear)) <= x1; ++x) {
+					lo = SDL_min(lo, x), hi = SDL_max(hi, x), top = SDL_min(top, y), bot = SDL_max(bot, y);
+				}
 			}
+			found.have[m] = true;
+			found.lo[m] = lo, found.hi[m] = hi, found.top[m] = top, found.bot[m] = bot;
 		}
+		int lo = found.lo[m], hi = found.hi[m], top = found.top[m], bot = found.bot[m];
 		if (hi < 0) continue;
 		moving[m] = true;
 		moveDx[m] = mv->how == 'C' ? mv->x - (lo + hi) / 2 : mv->how == 'R' ? mv->x - hi : mv->how == 'L' ? mv->x - lo : 0;
@@ -4518,29 +4882,13 @@ static void hud_compose(int band) {
 		}
 		if (ubot >= 0) moveDx[m] = ulo - pieceLo[m], moveDy[m] = ubot + 1 + mv->under - pieceTop[m];
 	}
-	/* the pieces that go back onto the game picture: every frame (it's a
-	 * new picture each frame), from their own boxes (a pixel belongs to the
-	 * first moving piece whose box has it) */
-	for (int m = 0; moves && m < HUD_MOVES; ++m) {
-		const HudMove* mv = &moves[m];
-		if (!moving[m] || !mv->toGame) continue;
-		for (int y = SDL_max(mv->y0, 0); y <= SDL_min(mv->y1, GBA_H - 1); ++y) {
-			for (int x = SDL_max(mv->x0, 0); x <= SDL_min(mv->x1, GBA_W - 1); ++x) {
-				uint32_t c = hudPx[y * GBA_W + x];
-				if ((c & 0xFFFFFF) == clear) continue;
-				bool earlier = false;
-				for (int k = 0; k < m && !earlier; ++k) {
-					const HudMove* o = &moves[k];
-					earlier = moving[k] && x >= o->x0 && x <= o->x1 && y >= o->y0 && y <= o->y1;
-				}
-				if (earlier) continue;
-				int nx = x + moveDx[m], ny = y + moveDy[m];
-				if (nx < 0 || nx >= GBA_W || ny < 0 || ny >= GBA_H) continue;
-				emu.fb[ny * GBA_W + nx] = c; /* back onto the game picture */
-			}
-		}
-	}
+	hud_put_pieces(moves, movesIn, mosV, clear, moving, moveDx, moveDy);
 	if (!canvas) return;
+	if (lay) hud_over_begin();
+	int movingIdx[HUD_MOVES], nMoving = 0; /* (the pieces that move, to look through for each pixel) */
+	for (int m = 0; m < HUD_MOVES; ++m) {
+		if (moving[m]) movingIdx[nMoving++] = m;
+	}
 	for (int y = 0; y < GBA_H; ++y) {
 		if (band != HB_ALL) {
 			/* (a row whose pixels can't land in these canvas rows, as they
@@ -4555,31 +4903,67 @@ static void hud_compose(int band) {
 			}
 			if (!may) continue;
 		}
-		for (int x = 0; x < GBA_W; ++x) {
-			uint32_t c = hudPx[y * GBA_W + x];
-			if ((c & 0xFFFFFF) == clear) continue;
-			int nx = x, ny = y;
+		if (h->rows && y >= h->rows) continue; /* (hud.rows: the game draws the rest) */
+		/* (the moving boxes this row meets, and where the sign and the map are not shown) */
+		int rowBox[HUD_MOVES], nRowBox = 0;
+		for (int k = 0; k < nMoving; ++k) {
+			const HudMove* mv = &moves[movingIdx[k]];
+			if (y >= mv->y0 && y <= mv->y1) rowBox[nRowBox++] = movingIdx[k];
+		}
+		bool signRow = sign && y >= h->sign.y0 && y <= h->sign.y1, mapRow = bigMap && y >= by0 && y <= by1;
+		/* (the row cut where a box starts or ends: each stretch has one box, or none, and is placed as it is) */
+		int cuts[2 * HUD_MOVES + 6], nCuts = 0;
+		cuts[nCuts++] = 0;
+		for (int k = 0; k < nRowBox; ++k) cuts[nCuts++] = moves[rowBox[k]].x0, cuts[nCuts++] = moves[rowBox[k]].x1 + 1;
+		if (signRow) cuts[nCuts++] = h->sign.x0, cuts[nCuts++] = h->sign.x1 + 1;
+		if (mapRow) cuts[nCuts++] = bx0, cuts[nCuts++] = bx1 + 1;
+		cuts[nCuts++] = GBA_W;
+		for (int i = 1; i < nCuts; ++i) {
+			int v = cuts[i], j = i;
+			for (; j > 0 && cuts[j - 1] > v; --j) cuts[j] = cuts[j - 1];
+			cuts[j] = v;
+		}
+		const uint32_t* row = &hudPx[y * GBA_W];
+		for (int seg = 0; seg + 1 < nCuts; ++seg) {
+			int a = SDL_clamp(cuts[seg], 0, GBA_W), b = SDL_clamp(cuts[seg + 1], 0, GBA_W);
+			if (a >= b) continue;
+			if (signRow && a >= h->sign.x0 && a <= h->sign.x1) continue;
+			if (mapRow && a >= bx0 && a <= bx1) continue;
+			int dx = 0, dy = 0;
 			bool toGame = false;
-			for (int m = 0; m < HUD_MOVES; ++m) {
-				const HudMove* mv = &moves[m];
-				if (moving[m] && x >= mv->x0 && x <= mv->x1 && y >= mv->y0 && y <= mv->y1) {
-					nx = x + moveDx[m], ny = y + moveDy[m];
-					toGame = mv->toGame;
+			for (int k = 0; k < nRowBox; ++k) {
+				const HudMove* mv = &moves[rowBox[k]];
+				if (a >= mv->x0 && a <= mv->x1) {
+					dx = moveDx[rowBox[k]], dy = moveDy[rowBox[k]];
+					toGame = mv->toGame; /* (on the game picture, above) */
 					break;
 				}
 			}
-			if (nx < 0 || nx >= GBA_W || ny < 0 || ny >= GBA_H) continue;
-			if (toGame) continue; /* (on the game picture, above) */
-			if (h->rows && y >= h->rows) continue; /* (hud.rows: the game draws the rest) */
-			if (sign && x >= h->sign.x0 && x <= h->sign.x1 && y >= h->sign.y0 && y <= h->sign.y1) continue;
-			if (bigMap && x >= bx0 && x <= bx1 && y >= by0 && y <= by1) continue;
+			int ny = y + dy;
+			if (toGame || ny < 0 || ny >= GBA_H) continue;
 			ny += titleDy;
-			if (ny >= GBA_H) continue;
-			if (ny * 2 < cr0 || ny * 2 >= cr1) continue;
-			uint32_t* o = &hudCanvas[ny * 2 * HUD_CW + nx * 2];
-			o[0] = o[1] = o[HUD_CW] = o[HUD_CW + 1] = c;
+			int lo = SDL_max(a, -dx), hi = SDL_min(b, GBA_W - dx);
+			if (ny >= GBA_H || lo >= hi || (!lay && (ny * 2 < cr0 || ny * 2 >= cr1))) continue;
+			int first = -1, last = 0;
+			for (int x = lo; (x = next_lit(row, x, hi - 1, clear)) < hi;) {
+				int e = x + 1;
+				while (e < hi && (row[e] & 0xFFFFFF) != clear) ++e;
+				for (int i = x; i < e; ++i) {
+					if (lay) {
+						hudOverBuild[ny * GBA_W + i + dx] = row[i] | 0xFF000000;
+					} else {
+						uint32_t* o = &hudCanvas[ny * 2 * HUD_CW + (i + dx) * 2];
+						o[0] = o[1] = o[HUD_CW] = o[HUD_CW + 1] = row[i];
+					}
+				}
+				if (first < 0) first = x;
+				last = e - 1;
+				x = e;
+			}
+			if (lay && first >= 0) hud_over_span(ny, first + dx, last + dx);
 		}
 	}
+	if (lay) hud_over_end();
 	if (bigMap) {
 		/* 2x if it fits comfortably right of the faces and below the top
 		 * row (about 200 x 128 HUD pixels), else 1.5x; centred there */
@@ -4588,6 +4972,30 @@ static void hud_compose(int band) {
 		int cx = 139 * 2, cy = 94 * 2;
 		if (h->mapAt.scale) q = h->mapAt.scale * 2, cx = h->mapAt.cx * 2, cy = h->mapAt.bottom * 2 + 2 - hh * q / 2;
 		int tx = SDL_clamp(cx - w * q / 2, 0, HUD_CW - w * q), ty = SDL_clamp(cy - hh * q / 2, 0, HUD_CH - hh * q);
+		if (lay) {
+			/* (the map's own picture, put on by the GPU at q to a pixel) */
+			if (w > hudMapTexW || hh > hudMapTexH) {
+				if (hudMapSrc.w) hudMapSrc.w = 0, ++hudLayerGen;
+				return;
+			}
+			for (int y = by0; y <= by1; ++y) {
+				for (int x = bx0; x <= bx1; ++x) {
+					uint32_t c = hudPx[y * GBA_W + x];
+					if (hold && mapUndrawn <= 3 && (c & 0xFFFFFF) == clear) c = mapHeld[y * GBA_W + x];
+					hudMapBuild[(y - by0) * hudMapTexW + x - bx0] = (c & 0xFFFFFF) == clear ? 0 : c | 0xFF000000;
+				}
+			}
+			SDL_Rect src = { 0, 0, w, hh }, dst = { tx, ty, w * q, hh * q };
+			bool same = hudMapSrc.w == w && hudMapSrc.h == hh && !memcmp(&hudMapDst, &dst, sizeof(dst));
+			for (int y = 0; y < hh && same; ++y) same = !memcmp(&hudMapPx[y * hudMapTexW], &hudMapBuild[y * hudMapTexW], (size_t) w * 4);
+			if (!same) {
+				for (int y = 0; y < hh; ++y) memcpy(&hudMapPx[y * hudMapTexW], &hudMapBuild[y * hudMapTexW], (size_t) w * 4);
+				hudMapSrc = src, hudMapDst = dst;
+				for (int v = 0; v < 2; ++v) hudOld[v].map = true;
+				++hudLayerGen;
+			}
+			return;
+		}
 		for (int y = by0; y <= by1; ++y) {
 			for (int x = bx0; x <= bx1; ++x) {
 				uint32_t c = hudPx[y * GBA_W + x];
@@ -4604,6 +5012,7 @@ static void hud_compose(int band) {
 			}
 		}
 	}
+	if (lay && hudMapSrc.w) hudMapSrc.w = 0, ++hudLayerGen; /* (no big map this frame) */
 }
 
 /* The BG layers whose tile maps mostly use palettes below pal (shown or
@@ -4719,10 +5128,10 @@ static void update_hud(void) {
 		} else if (heldArmed) {
 			int n = 0;
 			while (n < 8 && (h->held.probes[n].x || h->held.probes[n].y || h->held.probes[n].rgb)) ++n;
-			if (probes_hit(emu.fb, h->held.probes, h->held.tol) >= (h->held.min ? h->held.min : n)) {
+			if (probes_hit(&emu, h->held.probes, h->held.tol) >= (h->held.min ? h->held.min : n)) {
 				heldArmed = false;
 				heldN = SDL_min(h->held.y1, GBA_H - 1) - h->held.y0 + 1;
-				memcpy(heldPic, emu.fb + h->held.y0 * GBA_W, (size_t) heldN * GBA_W * 4);
+				memcpy(heldPic, emu_fb(&emu) + h->held.y0 * GBA_W, (size_t) heldN * GBA_W * 4);
 				heldNumW = 0; /* (its own number is the latest till the next capture) */
 				hudLogoBelowDone = false;
 				if (debug) fprintf(stderr, "frame %llu: picture kept for under the HUD\n", (unsigned long long) frameCount);
@@ -4753,23 +5162,23 @@ static void update_hud(void) {
 					} else {
 						for (int i = 0; i < HUD_CW * HUD_CH; ++i) hudCanvas[i] = 0xFF000000;
 					}
-					hud_upload();
+					hud_canvas_whole();
 				}
 			} else {
 				/* the whole screen over there */
 				for (int y = 0; y < GBA_H; ++y) {
 					for (int x = 0; x < GBA_W; ++x) {
 						uint32_t* o = &hudCanvas[y * 2 * HUD_CW + x * 2];
-						o[0] = o[1] = o[HUD_CW] = o[HUD_CW + 1] = emu.fb[y * GBA_W + x] | 0xFF000000;
+						o[0] = o[1] = o[HUD_CW] = o[HUD_CW + 1] = emu_fb(&emu)[y * GBA_W + x] | 0xFF000000;
 					}
 				}
-				hud_upload();
+				hud_canvas_whole();
 				/* (and the split off, if it was on) */
 				if (hudOn) emu_hud_split(&emu, false, 0, NULL, 0, hudPx), hudOn = false;
 				return;
 			}
 		} else {
-			memcpy(mirrorHeld, emu.fb, sizeof(mirrorHeld));
+			emu_fb_copy(&emu, mirrorHeld);
 			mirrorHave = true;
 			if (mirrorOn) {
 				mirrorOn = hudShown = false;
@@ -4857,7 +5266,7 @@ static void update_hud(void) {
 				 * band on black without the HUD and the characters) */
 				int nh = rule_count(h->card.hide, 6);
 				if (nh || h->card.poke.addr) snapshot_hiding_sprites_poke(h->card.hide, nh, NULL, 0, cardBest, h->card.poke.addr, h->card.poke.value);
-				else memcpy(cardBest, emu.fb, sizeof(cardBest));
+				else emu_fb_copy(&emu, cardBest);
 				cardScore = 0;
 				card_backdrop();
 				cardTaken = h->card.hideTillTake; /* (the HUD over it from the next frame) */
@@ -4870,15 +5279,23 @@ static void update_hud(void) {
 			else if (side && hudBackValid) card_backdrop();
 		}
 		if (hudBackValid) {
-			memcpy(hudCanvas, hudBack, sizeof(hudCanvas));
-			hud_upload();
+			/* (a take already on the canvas as sent, with no level's name over it, isn't copied and sent again every
+			 * frame: 600 KB each way, a few ms of a New 3DS's frame for as long as the card is up) */
+			uint64_t key = HUD_KEY(3, hudBackGen);
+			if (hudLayered && hudBaseKey == key && hudTitleSerial != hudBaseSerial) {
+				hud_layers_off();
+			} else {
+				memcpy(hudCanvas, hudBack, sizeof(hudCanvas));
+				if (hudLayered) hud_base_changed(key), hud_layers_off();
+				else hud_upload();
+			}
 			hudShown = true;
 		} else if (h->card.drop[0].addr && hudFrames == 1) {
 			/* (hud.card.drop, Sonic Advance 3, no take yet: its HUD stays
 			 * on the game screen over the card, so not on the second
 			 * screen too till the take: the logo alone) */
 			memcpy(hudCanvas, card_logo(), sizeof(hudCanvas));
-			hud_upload();
+			hud_canvas_whole();
 			hudShown = true;
 		}
 	} else if (hudOn && race) {
@@ -4904,6 +5321,11 @@ static void update_hud(void) {
 			 * from: armGBA on the 3DS draws the HUD one frame in five) */
 			bool fresh = emu_hud_fresh();
 			hudPicNew = fresh;
+			hudPicSerial += fresh;
+			if (hudLayered) {
+				/* (the layers kept as they are between new pictures; the pieces that go on the game screen every frame) */
+				hud_compose(fresh || grabbed || !hudShown || hudFrames <= 3 ? HB_ALL : HB_NONE);
+			} else {
 #if HUD_TEX_SHARED
 			/* (the 3DS: a new HUD picture made and uploaded a third at a time
 			 * over the next three frames, as making it (4.4 ms) and moving
@@ -4929,6 +5351,7 @@ static void update_hud(void) {
 			hud_compose(HB_ALL);
 			hud_upload();
 #endif
+			}
 			if (logoForced && !(hudProf->logoIf[0].addr && memprobes_match(hudProf->logoIf, 2, &emu)) &&
 			    !(hudProf->logoIfOr[0].addr && memprobes_match(hudProf->logoIfOr, 2, &emu))) {
 				/* (a new HUD picture: the logo's hold is over) */
@@ -4969,7 +5392,7 @@ static void update_hud(void) {
 			 * SA3-3) */
 			static uint32_t noHud[GBA_W * GBA_H];
 			snapshot_hiding_sprites(hudObjs, rule_count(hudObjs, 12), NULL, 0, noHud);
-			memcpy(emu.fb, noHud, sizeof(noHud));
+			emu_fb_set(&emu, noHud);
 		}
 		else if (cardScore >= 0 && !hudBackValid) card_backdrop();
 		if (debug) fprintf(stderr, "frame %llu: title card %s\n", (unsigned long long) frameCount, card ? "up" : "gone");
@@ -4986,7 +5409,10 @@ static void update_hud(void) {
 		 * renderer) */
 		static bool splitting;
 		bool some = mask || nObjs || h->band;
-		if (some || splitting) emu_hud_split(&emu, race && some, mask, objs, nObjs, hudPx);
+		if (some || splitting) {
+			emu_hud_split(&emu, race && some, mask, objs, nObjs, hudPx);
+			++hudPicSerial; /* (it clears hudPx when the split goes on or its layers change, with no new picture) */
+		}
 		splitting = race && some;
 		if (race && some) emu_hud_copy(&emu, cardObjs); /* (the card stays on the game screen too) */
 		hudCard = card;
@@ -5043,7 +5469,7 @@ static void update_hud(void) {
 				emu_hud_grab(&emu, m, hudGrab);
 			} else {
 				if (nh) snapshot_hiding_sprites(h->backdropHide, nh, hudObjs, rule_count(hudObjs, 12), hudGrab);
-				else memcpy(hudGrab, emu.fb, sizeof(hudGrab));
+				else emu_fb_copy(&emu, hudGrab);
 				hud_make_backdrop();
 			}
 		}
@@ -5053,7 +5479,7 @@ static void update_hud(void) {
 	 * take the scene again (retried until its brightness settles) */
 	static int darkRun;
 	if (h->mapCnt) {
-		bool dark = frame_is_flat(emu.fb);
+		bool dark = frame_is_flat(&emu, NULL);
 		if (dark) {
 			++darkRun;
 		} else {
@@ -5072,7 +5498,7 @@ static void update_hud(void) {
 	/* (not while the game screen is blank between scenes: the second
 	 * screen stays as dark, or as white, as the fade left it) */
 	bool gone = !race && hudShown && !(h->keep[0].addr && memprobes_match(h->keep, 4, &emu)) &&
-	            !(h->mapCnt && frame_is_flat(emu.fb));
+	            !(h->mapCnt && frame_is_flat(&emu, NULL));
 	goneFor = gone ? goneFor + 1 : 0;
 	if (goneFor >= 20) {
 		hudShown = false;
@@ -5194,7 +5620,7 @@ static void update_tall(void) {
 	int k = twinShakeNow;
 	int v = SDL_max(SDL_min(s - k, vmax), top) + k;
 	int safe = carry && L->carry.gameFrom ? L->carry.gameFrom - 1 : 0;
-	TallSrc game = { emu.fb, s, carry ? L->carry.gameFrom : 0, 0 };
+	TallSrc game = { emu_fb(&emu), s, carry ? L->carry.gameFrom : 0, 0 };
 	TallSrc a = { twins[0].up && twins[0].havePic ? twins[0].pic : NULL, twins[0].picRow, 0, safe }; /* (this frame's only) */
 	TallSrc b = { twins[1].pic, twins[1].picRow, 0, safe };
 	TallSrc topSrc[3] = { game, a, b }, botSrc[3] = { b, a, game };
@@ -5221,7 +5647,7 @@ static void update_tall(void) {
 	bool havePrevTop = tallLive && !firstLive;
 	int topMissing = 0;
 	for (int y = 0; y < GBA_H; ++y) {
-		if (y < gf) memcpy(&tallTop[y * GBA_W], &emu.fb[y * GBA_W], sizeof(uint32_t) * GBA_W);
+		if (y < gf) memcpy(&tallTop[y * GBA_W], &emu_fb(&emu)[y * GBA_W], sizeof(uint32_t) * GBA_W);
 		else if (gf && y == gf) for (int x = 0; x < GBA_W; ++x) tallTop[y * GBA_W + x] = 0xFF000000u;
 		else topMissing += !tall_line(&tallTop[y * GBA_W], v + y, topSrc, 3);
 		missing += !tall_line(&tallBot[y * GBA_W], v + GBA_H + y, botSrc, 3);
@@ -5265,7 +5691,7 @@ static void update_tall(void) {
 		if (!msg && topMissing && havePrevTop) memcpy(tallTop, prevTop, sizeof(tallTop));
 		else if (!msg) tallTopLogo = false;
 	}
-	if (msg) memcpy(tallBot, emu.fb, sizeof(tallBot)); /* (and its score bar, below) */
+	if (msg) emu_fb_copy(&emu, tallBot); /* (and its score bar, below) */
 	if (msg != tallMsg && debug) fprintf(stderr, "frame %llu: %s\n", (unsigned long long) frameCount, msg ? "the game's screen on the bottom one (dimmed or a message)" : "the table on both screens again");
 	tallMsg = msg;
 	if (gameOnTop != tallGameTop && debug) fprintf(stderr, "frame %llu: top screen: %s\n", (unsigned long long) frameCount, gameOnTop ? "the game" : "a copy (the lower view)");
@@ -5359,7 +5785,7 @@ static void update_tall(void) {
 	int same = -1; /* (trace: where a copy shows the game's own rows, how many pixels differ) */
 	if (tallTrace && twins[1].picRow == s) {
 		same = 0;
-		for (int i = GBA_W * 24; i < GBA_W * t->hudRow; ++i) same += (twins[1].pic[i] & 0xFFFFFF) != (emu.fb[i] & 0xFFFFFF);
+		for (int i = GBA_W * 24; i < GBA_W * t->hudRow; ++i) same += (twins[1].pic[i] & 0xFFFFFF) != (emu_fb(&emu)[i] & 0xFFFFFF);
 	}
 	if (tallTrace && carry) {
 		/* (trace: the game's picture against the copies' at the same table
@@ -5373,7 +5799,7 @@ static void update_tall(void) {
 				if (cy < 0 || cy >= GBA_H) continue;
 				int r = y < 24 ? 0 : y < 150 ? 1 : 2;
 				++n[r];
-				for (int x = 0; x < GBA_W; ++x) d[r] += (tw->pic[cy * GBA_W + x] & 0xFFFFFF) != (emu.fb[y * GBA_W + x] & 0xFFFFFF);
+				for (int x = 0; x < GBA_W; ++x) d[r] += (tw->pic[cy * GBA_W + x] & 0xFFFFFF) != (emu_fb(&emu)[y * GBA_W + x] & 0xFFFFFF);
 			}
 		}
 		if (n[0] + n[1] + n[2]) fprintf(stderr, "cmp %d/%d %d/%d %d/%d\n", d[0], n[0], d[1], n[1], d[2], n[2]);
@@ -5381,7 +5807,7 @@ static void update_tall(void) {
 	if (getenv("GBADS_TALL_AT") && frameCount == (unsigned long long) atoll(getenv("GBADS_TALL_AT"))) {
 		static uint32_t sh[GBA_W * 3 * GBA_H];
 		for (int y = 0; y < GBA_H; ++y) for (int x = 0; x < GBA_W; ++x) {
-			sh[y * GBA_W * 3 + x] = emu.fb[y * GBA_W + x] | 0xFF000000;
+			sh[y * GBA_W * 3 + x] = emu_fb(&emu)[y * GBA_W + x] | 0xFF000000;
 			sh[y * GBA_W * 3 + GBA_W + x] = twins[0].pic[y * GBA_W + x] | 0xFF000000;
 			sh[y * GBA_W * 3 + 2 * GBA_W + x] = twins[1].pic[y * GBA_W + x] | 0xFF000000;
 		}
@@ -5412,26 +5838,23 @@ static void update_tall(void) {
 static void update_snapshot(void) {
 	const typeof(snapProf->snap)* sn = &snapProf->snap;
 	int tol = sn->tol ? sn->tol : 12;
-	if (probes_hit(emu.fb, sn->show, tol) >= sn->showMin) {
+	if (probes_hit(&emu, sn->show, tol) >= sn->showMin) {
 		snapRevert = 0;
 		if (++snapShow >= SDL_max(1, sn->stable)) {
-			const uint32_t* px = emu.fb;
 			if (sn->hide[0].x1) {
 				/* only when the picture changes (the sheets are still) */
 				static uint32_t last[GBA_W * GBA_H], clean[GBA_W * GBA_H];
-				if (mapShownIdx < 0 || memcmp(last, emu.fb, sizeof(last))) {
-					memcpy(last, emu.fb, sizeof(last));
+				if (mapShownIdx < 0 || !emu_fb_same(&emu, last)) {
+					emu_fb_copy(&emu, last);
 					int n = 0;
 					while (n < 4 && sn->hide[n].x1) ++n;
 					snapshot_hiding_sprites(sn->hide, n, NULL, 0, clean);
 					memcpy(snapShown, clean, sizeof(snapShown));
 					for (int i = 0; i < nViews; ++i) ui_update_texture(mapTex[i], clean, GBA_W * 4);
 				}
-				px = NULL;
-			}
-			if (px) {
-				memcpy(snapShown, px, sizeof(snapShown));
-				for (int i = 0; i < nViews; ++i) ui_update_texture(mapTex[i], px, GBA_W * 4);
+			} else {
+				emu_fb_copy(&emu, snapShown);
+				for (int i = 0; i < nViews; ++i) ui_update_texture(mapTex[i], snapShown, GBA_W * 4);
 			}
 			if (mapShownIdx < 0 && debug) fprintf(stderr, "frame %llu: screen copied to the second screen\n", (unsigned long long) frameCount);
 			mapShownIdx = 0;
@@ -5442,7 +5865,7 @@ static void update_snapshot(void) {
 	if (mapShownIdx < 0) return;
 	bool menu = false;
 	for (int k = 0; k < 2; ++k) {
-		if (sn->revertMin[k] && probes_hit(emu.fb, sn->revert[k], tol) >= sn->revertMin[k]) menu = true;
+		if (sn->revertMin[k] && probes_hit(&emu, sn->revert[k], tol) >= sn->revertMin[k]) menu = true;
 	}
 	if (!menu) {
 		snapRevert = 0;
@@ -5623,7 +6046,7 @@ static bool ctl_tap(int s, int x, int y) {
 }
 
 static void save_thumbs(void) {
-	SDL_Surface* s = SDL_CreateRGBSurfaceWithFormatFrom(emu.fb, GBA_W, GBA_H, 32, GBA_W * 4, SDL_PIXELFORMAT_XBGR8888);
+	SDL_Surface* s = SDL_CreateRGBSurfaceWithFormatFrom(emu_fb(&emu), GBA_W, GBA_H, 32, GBA_W * 4, SDL_PIXELFORMAT_XBGR8888);
 	if (s) {
 		SDL_SaveBMP(s, gp.thumb);
 		SDL_FreeSurface(s);
@@ -5714,7 +6137,7 @@ static bool state_is_retroarch(const char* path) {
 static void state_thumbnail(const char* path) {
 	uint8_t* px = malloc((size_t) GBA_W * GBA_H * 4);
 	if (!px) return;
-	memcpy(px, emu.fb, (size_t) GBA_W * GBA_H * 4); /* (bytes R, G, B, X) */
+	memcpy(px, emu_fb(&emu), (size_t) GBA_W * GBA_H * 4); /* (bytes R, G, B, X) */
 	for (size_t i = 0; i < (size_t) GBA_W * GBA_H; ++i) px[i * 4 + 3] = 255;
 	char png[1100], tmp[1110];
 	snprintf(png, sizeof(png), "%s.png", path);
@@ -5761,6 +6184,7 @@ static void screen_restore_apply(void) {
 	 * card and the level name go (back from the state, if it has them) */
 	if (hudProf && hudProf->hud.card.tile) hudBackValid = false, cardScore = -1, sideScore = -1;
 	mapTitleN = 0, hudLogoBelowDone = false;
+	++mapTitleGen;
 	heldN = 0, heldNumW = 0, heldArmed = true;
 	logoForced = false, logoHolding = 0;
 	if (!ours) {
@@ -5796,7 +6220,7 @@ static void screen_restore_apply(void) {
 	}
 	if ((d = blob_find(b, n, "TITL", &sz)) && sz >= 4) {
 		int rows = (int) rd32(d);
-		if (rows > 0 && rows <= 32 && sz == 4 + (size_t) GBA_W * rows * 4) memcpy(mapTitle, d + 4, sz - 4), mapTitleN = rows;
+		if (rows > 0 && rows <= 32 && sz == 4 + (size_t) GBA_W * rows * 4) memcpy(mapTitle, d + 4, sz - 4), mapTitleN = rows, ++mapTitleGen;
 	}
 	if (hudProf && hudProf->hud.held.y1 && (d = blob_find(b, n, "HELD", &sz)) && sz >= 4) {
 		int rows = (int) rd32(d);
@@ -6206,7 +6630,11 @@ static void bug_info(Text* t, const char* date, uint64_t back) {
 	char lp[1024];
 	log_path(lp, sizeof(lp));
 	text_add(t, "\n== The end of the log%s%s\n", lp[0] ? ", " : " (not found)", lp);
+#ifdef __3DS__
+	host_log_flush();
+#else
 	fflush(stderr);
+#endif
 	FILE* lf = lp[0] ? fopen(lp, "rb") : NULL;
 	if (!lf) return;
 	fseek(lf, 0, SEEK_END);
@@ -6819,6 +7247,7 @@ static void map_show_new(bool fresh) {
 		if (!mapTitleN) hudLogoBelowDone = false; /* (the logo moves down under it) */
 		mapTitleN = SDL_min(hudProf->hud.mapTitleRows, 32);
 		for (int i = 0; i < GBA_W * mapTitleN; ++i) mapTitle[i] = mapRes.frames[0][i] | 0xFF000000;
+		++mapTitleGen;
 	}
 	mapShownIdx = -1;
 	/* (pages, a few seconds each: Fire Emblem's unit status; they
@@ -6840,15 +7269,16 @@ static void map_show_new(bool fresh) {
 /* a profile's own live picture is up (liveView): drawn as it is */
 static bool liveOn;
 
-static bool frame_is_dark(const uint32_t* fb) {
-	int bright = 0, total = 0;
+static bool frame_is_dark(Emu* e) {
+	/* dark: under 1 bright pixel in 40 of the ones sampled; a lit picture says no after the first few hundred */
+	const int total = (GBA_W * GBA_H + 6) / 7, most = (total - 1) / 40;
+	int bright = 0;
 	for (int i = 0; i < GBA_W * GBA_H; i += 7) {
-		uint32_t c = fb[i];
+		uint32_t c = emu_pixel_n(e, i);
 		int lum = ((c & 0xFF) + ((c >> 8) & 0xFF) * 2 + ((c >> 16) & 0xFF)) >> 2;
-		bright += lum > 40;
-		++total;
+		if (lum > 40 && ++bright > most) return false;
 	}
-	return bright * 40 < total;
+	return true;
 }
 
 static int game_screen(void) {
@@ -7085,11 +7515,42 @@ void prefs_save(Config* cfg) {
 
 static bool gameTexAll = true; /* upload the game's frame to every view next time */
 
+/* The game's picture to view i's texture: `shown`, XBGR8888 with `pitch` words to a row, or (NULL) what mGBA drew. */
+static void game_upload(int i, const uint32_t* shown, int pitch) {
+#ifdef GBADS_PICDUMP
+	emu_pic_dump_shown(&emu, shown);
+#endif
+#ifdef COLOR_16_BIT
+	if (!shown && gameTex16[i] && !ui_color_correct_on()) {
+		ui_update_texture(gameTex16[i], emu.fb16, EMU_FB16_STRIDE * 2);
+		gameIs16[i] = true;
+		return;
+	}
+	gameIs16[i] = false;
+	if (!shown && ui_color_correct_on()) {
+		ui_update_texture_565_cc(gameTex[i], emu.fb16, EMU_FB16_STRIDE);
+		return;
+	}
+#endif
+	ui_update_texture(gameTex[i], shown ? shown : emu_fb(&emu), shown ? pitch * 4 : GBA_W * 4);
+}
+
+/* the textures draw_game puts on the views */
+static SDL_Texture* const* game_textures(void) {
+#ifdef COLOR_16_BIT
+	static SDL_Texture* now[2];
+	for (int i = 0; i < 2; ++i) now[i] = gameIs16[i] && gameTex16[i] ? gameTex16[i] : gameTex[i];
+	return now;
+#else
+	return gameTex;
+#endif
+}
+
 static void swap_screens(void) {
 	/* the game moves to the other view, whose copy of the frame may be old
 	 * (frames go only where the game is shown; the menu uploads none) */
 	if (emu.fb) {
-		for (int i = 0; i < nViews; ++i) ui_update_texture(gameTex[i], emu.fb, GBA_W * 4);
+		for (int i = 0; i < nViews; ++i) game_upload(i, NULL, GBA_W);
 	}
 	if (nScreens < 2) {
 		singleShowsMap = !singleShowsMap;
@@ -7275,39 +7736,57 @@ static void draw_osd(void) {
  * above it), centred in the rows below that. A user's own logo too big
  * for that is shrunk to fit. False if there's no logo. */
 #define LOGO_IDLE 128
-static bool logo_draw(uint32_t* px, int cw, int ch, int k, int top, int alpha) {
-	bool pixelArt = false;
-	int sub = 1;
-	SDL_Surface* lg = ui_logo_surface(cfg, romPath, emu.gameCode, &pixelArt, &sub);
-	if (!lg) return false;
-	int room = ch - top;
-	if (room <= 0) {
-		/* (no room below a HUD that fills the screen: Mega Man Battle
-		 * Network's custom screen, hud.rows GBA_H) */
-		SDL_FreeSurface(lg);
-		return false;
+/* A HUD game's logo, kept decoded: its backdrops are built again as the level's name or the held picture change, and the
+ * first build went to the SD card for the file in the middle of a frame (100-230 ms in Ninja Five-O, Sonic Advance 3). */
+static SDL_Surface* hudLogoSurf;
+static bool hudLogoPixel;
+static int hudLogoSub;
+
+static void hud_logo_surface_drop(void) {
+	if (hudLogoSurf) SDL_FreeSurface(hudLogoSurf);
+	hudLogoSurf = NULL;
+}
+
+/* A game with a HUD or a fight picture draws its logo in a frame, so the decoded logo is kept (a fight's first frame read and
+ * decoded the file: 68-70 ms in Zoids: Legacy and Advance Wars 2) */
+static bool logo_kept(void) {
+	return hudProf || combatProf || tallProf;
+}
+
+static SDL_Surface* hud_logo_surface(bool* pixelArt, int* sub) {
+	if (!logo_kept()) return ui_logo_surface(cfg, romPath, emu.gameCode, pixelArt, sub);
+	if (!hudLogoSurf) hudLogoSurf = ui_logo_surface(cfg, romPath, emu.gameCode, &hudLogoPixel, &hudLogoSub);
+	*pixelArt = hudLogoPixel, *sub = hudLogoSub;
+	return hudLogoSurf;
+}
+
+/* (the logo's file read now, at the start or when the logo changes, where the frame has no hurry) */
+static void hud_logo_prime(void) {
+	hud_logo_surface_drop();
+	if (!logo_kept()) return;
+	bool pixelArt;
+	int sub;
+	hud_logo_surface(&pixelArt, &sub);
+}
+
+/* The logo (nearest-neighbour to w x h) blended over the canvas at x0, y0. Each column's source is worked out once (a division a
+ * pixel was most of the 11 ms of a 372x142 logo), and a wholly opaque pixel is stored as the blend comes to, not worked out. */
+static void logo_blit(uint32_t* px, int cw, const SDL_Surface* lg, int w, int h, int x0, int y0, int alpha) {
+	int* col = malloc(sizeof(int) * (size_t) w);
+	if (col) {
+		for (int x = 0; x < w; ++x) col[x] = x * lg->w / w;
 	}
-	int w = SDL_max(1, lg->w * k / sub), h = SDL_max(1, lg->h * k / sub);
-	if (sub > k) {
-		/* a scraped logo at full resolution, onto a canvas with fewer
-		 * pixels per GBA pixel: averaged down to them (GEN-11) */
-		SDL_Surface* sm = ui_resample(lg, w, h);
-		if (sm) SDL_FreeSurface(lg), lg = sm;
-	}
-	if (w > cw || h > room) {
-		float sc = SDL_min((float) cw / lg->w, (float) room / lg->h);
-		w = SDL_max(1, (int) (lg->w * sc)), h = SDL_max(1, (int) (lg->h * sc));
-	}
-	/* centred on the canvas, or with a HUD above it in the room below */
-	int x0 = (cw - w) / 2, y0 = top ? top + (room - h) / 2 : (ch - h) / 2;
-	SDL_LockSurface(lg);
 	for (int y = 0; y < h; ++y) {
 		const uint8_t* row = (const uint8_t*) lg->pixels + (size_t) (y * lg->h / h) * lg->pitch;
 		for (int x = 0; x < w; ++x) {
-			const uint8_t* p = row + (size_t) (x * lg->w / w) * 4; /* RGBA32: bytes R, G, B, A */
+			const uint8_t* p = row + (size_t) (col ? col[x] : x * lg->w / w) * 4; /* RGBA32: bytes R, G, B, A */
 			int a = p[3] * alpha / 255;
 			if (!a) continue;
 			uint32_t* o = &px[(y0 + y) * cw + x0 + x];
+			if (a == 255) {
+				*o = 0xFF000000 | p[0] | (uint32_t) p[1] << 8 | (uint32_t) p[2] << 16;
+				continue;
+			}
 			uint32_t out = 0xFF000000;
 			for (int c = 0; c < 3; ++c) {
 				int bg = (*o >> (c * 8)) & 0xFF;
@@ -7316,8 +7795,51 @@ static bool logo_draw(uint32_t* px, int cw, int ch, int k, int top, int alpha) {
 			*o = out;
 		}
 	}
+	free(col);
+}
+
+/* The HUD's logo pictures that depend on the logo alone, drawn where the frame has no hurry (a held picture or the level's
+ * name decides the one under the HUD: that one waits for its use) */
+static void hud_logo_pictures(void) {
+	if (!hudProf) return;
+	const typeof(hudProf->hud)* h = &hudProf->hud;
+	if (h->card.tile) card_logo();
+	if ((h->logoBelow || h->logoBehind) && !h->held.y1 && !h->mapTitleRows && !hudLogoBelowDone) hud_make_logo_below();
+}
+
+static bool logo_draw(uint32_t* px, int cw, int ch, int k, int top, int alpha) {
+	bool pixelArt = false;
+	int sub = 1;
+	SDL_Surface* lg = hud_logo_surface(&pixelArt, &sub);
+	if (!lg) return false;
+	SDL_Surface* const kept = logo_kept() ? lg : NULL; /* (the cache's own: not freed here) */
+	int room = ch - top;
+	if (room <= 0) {
+		/* (no room below a HUD that fills the screen: Mega Man Battle
+		 * Network's custom screen, hud.rows GBA_H) */
+		if (lg != kept) SDL_FreeSurface(lg);
+		return false;
+	}
+	int w = SDL_max(1, lg->w * k / sub), h = SDL_max(1, lg->h * k / sub);
+	if (sub > k) {
+		/* a scraped logo at full resolution, onto a canvas with fewer
+		 * pixels per GBA pixel: averaged down to them (GEN-11) */
+		SDL_Surface* sm = ui_resample(lg, w, h);
+		if (sm) {
+			if (lg != kept) SDL_FreeSurface(lg);
+			lg = sm;
+		}
+	}
+	if (w > cw || h > room) {
+		float sc = SDL_min((float) cw / lg->w, (float) room / lg->h);
+		w = SDL_max(1, (int) (lg->w * sc)), h = SDL_max(1, (int) (lg->h * sc));
+	}
+	/* centred on the canvas, or with a HUD above it in the room below */
+	int x0 = (cw - w) / 2, y0 = top ? top + (room - h) / 2 : (ch - h) / 2;
+	SDL_LockSurface(lg);
+	logo_blit(px, cw, lg, w, h, x0, y0, alpha);
 	SDL_UnlockSurface(lg);
-	SDL_FreeSurface(lg);
+	if (lg != kept) SDL_FreeSurface(lg);
 	return true;
 }
 
@@ -7391,7 +7913,7 @@ static void draw_game(void) {
 				if (overlay_on(s)) draw_overlay(s, 1);
 				continue;
 			}
-			ui_image_pixels(s, gameTex, GBA_W, GBA_H, cfg->scale, SHADER_ON);
+			ui_image_pixels(s, game_textures(), GBA_W, GBA_H, cfg->scale, SHADER_ON);
 			if (hudProf && hudOn && hudAlt && hudProf->hud.alt.dimGame) {
 				/* (the phase banner moved to the other screen) */
 				SDL_Rect img = ui_image_rect(s, GBA_W, GBA_H, cfg->scale);
@@ -7422,7 +7944,7 @@ static void draw_game(void) {
 		} else if (hudShown && !logoForced) {
 			/* the HUD picture is at 2x: a grid cell per GBA pixel */
 			ui_fill(s, (SDL_Rect) { 0, 0, r.w, r.h }, borderColor);
-			ui_image_pixels(s, hudTex, HUD_CW, HUD_CH, cfg->mapScale, SHADER_ON ? 2 : 0);
+			hud_draw(s);
 		} else if (mapShownIdx >= 0 && !logoForced) {
 			ui_fill(s, (SDL_Rect) { 0, 0, r.w, r.h }, borderColor);
 			ui_image_pixels(s, mapTex, mapW, mapH, cfg->mapScale, SHADER_ON);
@@ -7537,7 +8059,7 @@ static void setting_applied(const Setting* st) {
 		ghostHave = false;
 	} else if (!strcmp(k, "swap")) {
 		if (emu.fb) {
-			for (int i = 0; i < nViews; ++i) ui_update_texture(gameTex[i], emu.fb, GBA_W * 4);
+			for (int i = 0; i < nViews; ++i) game_upload(i, NULL, GBA_W);
 		}
 	} else if (!strcmp(k, "screen_match") || !strcmp(k, "screen_placement")) {
 		ui_layout_pictures();
@@ -7807,6 +8329,7 @@ static void ss_setup(const char* rom, const char* code) {
 	logoOnly = false;
 	snapProf = NULL;
 	tallProf = NULL;
+	combatProf = NULL;
 	tallOn = false;
 	tallLive = false;
 	hudProf = NULL;
@@ -7868,7 +8391,9 @@ static void ss_setup(const char* rom, const char* code) {
 		hudOffLatch = false;
 		hudLogoDone = false;
 		hudLogoBelowDone = false;
+		cardLogoMade = false; /* (the last game's logo stays in card_logo's picture otherwise) */
 		mapTitleN = 0;
+		++mapTitleGen;
 		hudBackValid = false;
 		hudRegrab = 0;
 		snapShow = snapRevert = 0;
@@ -7893,20 +8418,46 @@ static void ss_setup(const char* rom, const char* code) {
 	}
 }
 
+/* hud_layers' state for the HUD profile (its textures are made as each view shows it: hud_view_textures) */
+static void hud_layers_textures(void) {
+	for (int i = 0; i < 2; ++i) {
+		if (hudOverTex[i]) SDL_DestroyTexture(hudOverTex[i]);
+		if (hudMapTex[i]) SDL_DestroyTexture(hudMapTex[i]);
+		if (hudFlatTex[i]) SDL_DestroyTexture(hudFlatTex[i]);
+		hudOverTex[i] = hudMapTex[i] = hudFlatTex[i] = NULL;
+	}
+	memset(hudOver, 0, sizeof(hudOver));
+	memset(hudOverBuild, 0, sizeof(hudOverBuild));
+	memset(hudOverRow, 0, sizeof(hudOverRow));
+	memset(hudOverUse, 0, sizeof(hudOverUse));
+	memset(hudMapPx, 0, sizeof(hudMapPx));
+	hudMapSrc.w = 0;
+	hudBaseKey = 0;
+	hud_stale_all();
+	hudMapTexW = hudMapTexH = 0;
+	if (!hudLayered) return;
+	const typeof(hudProf->hud.map)* m = &hudProf->hud.map;
+	if (m->x1) hudMapTexW = (SDL_clamp(m->x1, 0, GBA_W - 1) - SDL_max(m->x0, 0) + 8) & ~7, hudMapTexH = (SDL_clamp(m->y1, 0, GBA_H - 1) - SDL_max(m->y0, 0) + 8) & ~7;
+}
+
 /* the textures the second screen's set-up needs (again after a switch) */
 static void ss_textures(void) {
+	hudLayered = hudProf && cfg->hudLayers;
+#ifdef __ANDROID__
+	hudLayered = false; /* (its screens are drawn from recorded calls: see ui.c) */
+#endif
 	for (int i = 0; i < nViews; ++i) {
 		if (mapTex[i]) SDL_DestroyTexture(mapTex[i]);
 		if (combatTex[i]) SDL_DestroyTexture(combatTex[i]);
-		if (hudTex[i] && !(HUD_TEX_SHARED && i > 0)) SDL_DestroyTexture(hudTex[i]);
+		if (hudTex[i] && (i == 0 || hudTex[i] != hudTex[0])) SDL_DestroyTexture(hudTex[i]);
 		mapTex[i] = SDL_CreateTexture(views[i].ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, mapW, mapH);
 		combatTex[i] = combatProf ? SDL_CreateTexture(views[i].ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, mapW, mapH) : NULL;
 		if (combatTex[i]) SDL_SetTextureBlendMode(combatTex[i], SDL_BLENDMODE_NONE);
-		hudTex[i] = HUD_TEX_SHARED && i > 0 ? hudTex[0]
-		          : hudProf ? SDL_CreateTexture(views[i].ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, HUD_CW, HUD_CH) : NULL;
+		hudTex[i] = hudProf && !hudLayered ? (HUD_TEX_SHARED && i > 0 ? hudTex[0] : SDL_CreateTexture(views[i].ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, HUD_CW, HUD_CH)) : NULL;
 		if (hudTex[i]) SDL_SetTextureBlendMode(hudTex[i], SDL_BLENDMODE_NONE);
 		SDL_SetTextureBlendMode(mapTex[i], SDL_BLENDMODE_NONE);
 	}
+	hud_layers_textures();
 }
 
 /* After the device sleeps (or the renderer is reset), the GPU's copies of
@@ -7919,16 +8470,23 @@ static void rebuild_textures(void) {
 		if (gameTex[i]) SDL_DestroyTexture(gameTex[i]);
 		gameTex[i] = SDL_CreateTexture(views[i].ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, GBA_W, GBA_H);
 		if (gameTex[i]) SDL_SetTextureBlendMode(gameTex[i], SDL_BLENDMODE_NONE);
+#ifdef COLOR_16_BIT
+		if (gameTex16[i]) SDL_DestroyTexture(gameTex16[i]);
+		gameTex16[i] = SDL_CreateTexture(views[i].ren, SDL_PIXELFORMAT_RGB565, SDL_TEXTUREACCESS_STREAMING, GBA_W, GBA_H);
+		if (gameTex16[i]) SDL_SetTextureBlendMode(gameTex16[i], SDL_BLENDMODE_NONE);
+		gameIs16[i] = false;
+#endif
 	}
 	ss_textures();
-	if (emu.fb) for (int i = 0; i < nViews; ++i) ui_update_texture(gameTex[i], emu.fb, GBA_W * 4);
+	if (emu.fb) for (int i = 0; i < nViews; ++i) game_upload(i, NULL, GBA_W);
 	if (mapShownIdx >= 0) {
 		int idx = mapShownIdx;
 		overDirty = true;
 		upload_map_frame(idx);
 	}
 	if (combatMade) make_combat_canvas();
-	if (hudProf) hud_upload();
+	if (hudProf && hudLayered) hud_stale_all();
+	else if (hudProf) hud_upload();
 	ui_free_image(logoTex);
 	if (romPath && ui_load_logo(cfg, romPath, emu.gameCode, logoTex, &logoW, &logoH, &logoPixel)) make_logo_canvas();
 	else make_logo_canvas();
@@ -7946,6 +8504,7 @@ static void ss_switch(const char* rom, const char* code) {
 	hideWhenProf = NULL;
 	mapcap_destroy(mc);
 	mc = NULL;
+	profile_live_end();
 	for (int i = 0; i < MAP_MAX_FRAMES; ++i) {
 		free(mapRes.frames[i]);
 		mapRes.frames[i] = NULL;
@@ -7996,10 +8555,12 @@ static void logo_refresh(void) {
 	logoSub = 1;
 	bool got = ui_load_logo(cfg, romPath, emu.gameCode, logoTex, &logoW, &logoH, &logoPixel);
 	logoProvisional = ui_logo_provisional();
+	hud_logo_prime();
 	if (!got) return;
 	make_logo_canvas();
 	hudLogoBelowDone = hudLogoDone = false; /* the HUD's pictures with it */
 	cardLogoMade = false;
+	hud_logo_pictures();
 	if (combatMade) {
 		/* and the fight picture (and the map picture's logo behind) */
 		make_combat_canvas();
@@ -8043,6 +8604,9 @@ enum GameExit game_run(Config* c, const char* rom, bool fromLibrary) {
 
 static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary) {
 	cfg = c;
+	lateness = 1;
+	captureFrames = lastCaptureFrames = 0;
+	config_apply_core_env(c);
 	debug = getenv("GBADS_DEBUG") != NULL;
 	romPath = rom, lastLoop = 0;
 	game_paths(cfg, rom, &gp);
@@ -8050,6 +8614,24 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 	game_keys_reload();
 	patches_setup(rom); /* GEN-9: the patches folder, what's on, and the plan every core opens the ROM with */
 	profile_set_rom(NULL, 0);
+	emu_idle_loops(cfg->idleLoops);
+#ifdef __3DS__
+	/* (again for each game: the bench's per-job options) */
+	host_set_cores(cfg->sideCore, cfg->captureCore, cfg->aheadCore, cfg->videoCore, cfg->core1Limit, false);
+	host_set_video_wake(cfg->videoWake);
+	host_set_lines_first(cfg->linesFirst);
+	host_set_capture_priority(cfg->capturePriority);
+	host_set_cpu_tile(cfg->cpuTile);
+	host_set_async_upload(cfg->asyncUpload);
+	host_set_gpu_twin(cfg->gpuTwin);
+	host_set_twin_check(cfg->twinCheck);
+	host_set_raw_picture(cfg->rawPicture);
+	host_set_raw_check(cfg->rawCheck);
+	host_set_tex_check(cfg->texCheck);
+	emu_threaded_video(cfg->threadedVideo && isNew3ds()); /* (mGBA's drawing thread on the New 3DS's third core) */
+#else
+	emu_threaded_video(cfg->threadedVideo);
+#endif
 	emuRenderWorkers = cfg->renderWorkers == 2 ? 2 : 1;
 #ifdef __3DS__
 	{
@@ -8065,7 +8647,14 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 		if (emuHiddenCopy) emuRenderWorkers = 1;
 	}
 #endif
-	if (!emu_open(&emu, rom, gp.sav, true)) {
+#ifdef COLOR_16_BIT
+	emu_picture_linear(true);
+#endif
+	bool opened = emu_open(&emu, rom, gp.sav, true);
+#ifdef COLOR_16_BIT
+	emu_picture_linear(false);
+#endif
+	if (!opened) {
 		ui_osd("Couldn't load the game");
 		return fromLibrary ? GAME_TO_LIBRARY : GAME_QUIT_APP;
 	}
@@ -8106,6 +8695,11 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 	for (int i = 0; i < nViews; ++i) {
 		gameTex[i] = SDL_CreateTexture(views[i].ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, GBA_W, GBA_H);
 		SDL_SetTextureBlendMode(gameTex[i], SDL_BLENDMODE_NONE);
+#ifdef COLOR_16_BIT
+		gameTex16[i] = SDL_CreateTexture(views[i].ren, SDL_PIXELFORMAT_RGB565, SDL_TEXTUREACCESS_STREAMING, GBA_W, GBA_H);
+		if (gameTex16[i]) SDL_SetTextureBlendMode(gameTex16[i], SDL_BLENDMODE_NONE);
+		gameIs16[i] = false;
+#endif
 	}
 	ss_textures();
 	unsigned bc = (unsigned) strtoul(cfg->borderColor, NULL, 16);
@@ -8116,6 +8710,8 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 	logoSub = 1;
 	if (ui_load_logo(cfg, rom, emu.gameCode, logoTex, &logoW, &logoH, &logoPixel)) make_logo_canvas();
 	logoProvisional = ui_logo_provisional();
+	hud_logo_prime();
+	hud_logo_pictures();
 
 	memset(pageLen, 0, sizeof(pageLen));
 	memset(rowN, 0, sizeof(rowN));
@@ -8291,6 +8887,7 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 	android_pin_game_thread();
 #endif
 	while (!done) {
+		Uint64 loopT0 = SDL_GetPerformanceCounter(); /* (before the wait for the frame buffer's thread: capture_throttle counts it) */
 		{
 			/* the last iteration, if it was a stall (issue #50) */
 			Uint64 t = SDL_GetPerformanceCounter();
@@ -8324,6 +8921,7 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 		screen_restore_apply();
 		bug_tick();
 		Uint64 workT0 = SDL_GetPerformanceCounter(); /* this frame's work, without the wait at the end */
+		Uint64 preM1 = workT0, preM2 = workT0, preM3 = workT0; /* (where "pre" went, for bench_pre_note) */
 		long preempt0 = thread_preemptions();
 		double cpuMs0 = thread_cpu_ms();
 		if (((!logoTex[0] && !logoTex[1]) || logoProvisional) && logo_generation() != logoGen) {
@@ -8351,6 +8949,7 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 		}
 		ui_tick();
 		ui_read_buttons();
+		preM1 = SDL_GetPerformanceCounter();
 		{
 			const char* ld = ui_script_load();
 			if (ld && !state_load(ld)) fprintf(stderr, "could not load %s\n", ld);
@@ -8987,6 +9586,7 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 		 * which is what made the lag worse every time. */
 		int queuedNow = audio ? (int) (SDL_GetQueuedAudioSize(audio) / 4) : 0;
 		bool dropAudio = queuedNow > targetQueued * 3; /* hard cap on drift */
+		preM2 = SDL_GetPerformanceCounter();
 		/* Health report (always on, every 5 s when something went wrong): audio
 		 * underruns (the queue ran dry = a crackle), slow loop iterations, and
 		 * how often the background map capture was running. */
@@ -9028,6 +9628,7 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 		if (debug && audio && frameCount % 30 == 0) {
 			fprintf(stderr, "audio queue %d ms%s\n", queuedNow * 1000 / want.freq, ff ? " (ff)" : "");
 		}
+		preM3 = SDL_GetPerformanceCounter();
 		Uint64 emuT0 = SDL_GetPerformanceCounter(), raT = 0, audT = 0;
 		double emuCpu0 = thread_cpu_ms();
 		if (rewinding) {
@@ -9118,6 +9719,7 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 		Uint64 emuT1 = SDL_GetPerformanceCounter();
 		double emuCpu1 = thread_cpu_ms();
 		emuTicks += emuT1 - emuT0;
+		double benchEmuMs = (emuT1 - emuT0) * 1000.0 / SDL_GetPerformanceFrequency();
 		++frameCount;
 		/* the rewind buffer: a state every second emulated frame */
 		if (cfg->rewind && !rewinding && (rewindTick += runs) >= 2) {
@@ -9154,7 +9756,7 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 				if (debug && lf != logoForced) fprintf(stderr, "frame %llu: logo only %s\n", (unsigned long long) frameCount, lf ? "on" : "off");
 				logoForced = lf;
 			}
-			bool dark = frame_is_dark(emu.fb);
+			bool dark = frame_is_dark(&emu);
 			if (wasDark && !dark) refreshAt = (long) frameCount + 6;
 			wasDark = dark;
 			if (refreshAt >= 0 && (long) frameCount >= refreshAt) {
@@ -9179,6 +9781,8 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 			 * the new one starts as soon as it has stopped */
 			bool roomChanged = rk && rk != lastRoomKey && seenRoomFor >= 2;
 			if (roomChanged && mapcap_busy(mc)) mapcap_cancel(mc);
+			if (mapcap_busy(mc)) ++captureFrames;
+			else if (captureFrames) lastCaptureFrames = captureFrames, captureFrames = 0;
 			/* Back off while captures keep failing (e.g. the game says "playing"
 			 * but the map can't open: intro cutscenes, briefings). Each failed
 			 * attempt emulates a few seconds in the background, which starves
@@ -9202,6 +9806,12 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 			const MapProfile* ip = mapcap_profile(mc);
 			int every = ip && ip->interval > 0 && ip->interval < cfg->mapInterval ? ip->interval : cfg->mapInterval;
 			int interval = cheapFail ? every : every << SDL_min(fails, 3);
+			/* capture_throttle: further apart while the frames run late (squared: 87% speed, 1.3 times); not after
+			 * failures, whose backoff above already spaces them out */
+			if (cfg->captureThrottle > 0 && !fails) interval = (int) (interval * SDL_min(lateness * lateness, (double) cfg->captureThrottle));
+			/* capture_duty: the next periodic capture waits N times as long as the last one took, so one runs at most 1/N
+			 * of the time (a room change still asks for one at once) */
+			if (cfg->captureDuty > 0 && !fails) interval = SDL_max(interval, lastCaptureFrames * cfg->captureDuty);
 			/* after failures, a room change still triggers a try, but no more
 			 * often than the normal interval */
 			bool due = sinceMapRequest >= interval ||
@@ -9280,20 +9890,36 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 		Uint64 drawT0 = SDL_GetPerformanceCounter();
 		double drawCpu0 = thread_cpu_ms();
 		/* frame buffer: start the next frame now; this one is drawn from a copy */
+#ifdef COLOR_16_BIT
+		const uint32_t* shownFb = NULL; /* (NULL: the picture as mGBA drew it) */
+		int shownPitch = GBA_W;
+#else
 		const uint32_t* shownFb = emu.fb;
+		int shownPitch = emu_pitch(&emu); /* (raw_picture's pictures have rows 256 words apart) */
+#endif
 		/* (Pokemon Pinball's tall view always: two copies of the game beside
 		 * it only keep full speed with the frame emulated alongside the drawing) */
 		if ((cfg->frameBuffer || tallProf) && !ff && !rewinding) {
-			memcpy(aheadFb, emu.fb, sizeof(aheadFb));
-			if (ahead_start(keys)) aheadInFlight = true, shownFb = aheadFb;
+			emu_fb_copy(&emu, aheadFb);
+			if (ahead_start(keys)) aheadInFlight = true, shownFb = aheadFb, shownPitch = GBA_W;
 		}
-		if (mirrorOn && mirrorHave) shownFb = mirrorHeld; /* (hud.mirror: the picture from before) */
-		if (tallLive) shownFb = cfg->swap ? tallBot : tallTop; /* (profile.tall: the table's upper half on the top screen) */
-		if (cfg->ghosting) shownFb = ghost_frame(shownFb);
+		if (mirrorOn && mirrorHave) shownFb = mirrorHeld, shownPitch = GBA_W; /* (hud.mirror: the picture from before) */
+		if (tallLive) shownFb = cfg->swap ? tallBot : tallTop, shownPitch = GBA_W; /* (profile.tall: the table's upper half on the top screen) */
+		if (cfg->ghosting) shownFb = ghost_frame(shownFb && shownPitch == GBA_W ? shownFb : emu_fb(&emu)), shownPitch = GBA_W;
+#ifdef __3DS__
+		/* (the twin's rows the HUD's pieces were put on: written back before the GPU reads it) */
+		for (unsigned bands = emu.fbGpu ? emu.fbGpuDirty : 0; bands; bands &= bands - 1) {
+			host_flush_data(emu.fbGpu + __builtin_ctz(bands) * 8 * emu.fbGpuStride, 8 * emu.fbGpuStride * sizeof(uint32_t));
+		}
+		emu.fbGpuDirty = 0;
+		const bool picRaw = emu.fbGpu && emu.fbGpu == emu.fb;
+		host_picture_twin(emu.fb, ff || rewinding || picRaw ? NULL : emu.fbGpu); /* (fast forward: frames come faster than a copy is sure to be read) */
+		host_picture_raw(picRaw && !ff && !rewinding ? emu.fb : NULL);
+#endif
 		/* only the view the game is on needs it (all of them right after a swap,
 		 * since the menu draws the game without uploading) */
 		for (int i = 0; i < nViews; ++i) {
-			if (gameTexAll || i == screens[game_screen()].view) ui_update_texture(gameTex[i], shownFb, GBA_W * 4);
+			if (gameTexAll || i == screens[game_screen()].view) game_upload(i, shownFb, shownPitch);
 		}
 		gameTexAll = false;
 		/* (tests, GBADS_DRAW_SHOTS_ONLY: only the frames a screenshot or a
@@ -9336,6 +9962,19 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 		}
 		Uint64 drawT1 = SDL_GetPerformanceCounter();
 		drawTicks += drawT1 - drawT0;
+		bench_frame(frameCount, benchEmuMs, (drawT1 - drawT0) * 1000.0 / SDL_GetPerformanceFrequency(),
+		            (drawT0 - emuT1) * 1000.0 / SDL_GetPerformanceFrequency(), mc && mapcap_busy(mc),
+		            (emuT0 - workT0) * 1000.0 / SDL_GetPerformanceFrequency(), (drawT1 - workT0) * 1000.0 / SDL_GetPerformanceFrequency());
+		{
+			const double toMs = 1000.0 / (double) SDL_GetPerformanceFrequency();
+			bench_pre_note(frameCount, (double) (emuT0 - workT0) * toMs, (double) (preM1 - workT0) * toMs, (double) (preM2 - preM1) * toMs,
+			               (double) (preM3 - preM2) * toMs, (double) (emuT0 - preM3) * toMs);
+		}
+		bench_check(&emu, frameCount);
+		if (cfg->captureThrottle > 0 && !ff) {
+			double over = (double) (drawT1 - loopT0) / SDL_GetPerformanceFrequency() / frameSec;
+			lateness += (SDL_max(over, 1.0) - lateness) / 32;
+		}
 		{
 			const double msPer = 1000.0 / (double) SDL_GetPerformanceFrequency();
 			int vTop = screens[0].view, vBot = nScreens > 1 ? screens[1].view : vTop;
@@ -9454,11 +10093,15 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 	if (audioConv) SDL_FreeAudioStream(audioConv);
 	mapcap_destroy(mc);
 	mc = NULL;
+	profile_live_end();
 	emu_rewind_deinit();
 #ifdef __wasi__
 	webPlaying = false;
 #endif
 	twin_close();
+#ifdef __3DS__
+	host_checks_report();
+#endif
 	emu_close(&emu); /* flushes the battery save */
 	for (int i = 0; i < MAP_MAX_FRAMES; ++i) {
 		free(mapRes.frames[i]);
@@ -9467,11 +10110,20 @@ static enum GameExit game_run_inner(Config* c, const char* rom, bool fromLibrary
 	free(stillPx);
 	stillPx = NULL;
 	stillValid = false;
+	hud_logo_surface_drop();
 	for (int i = 0; i < nViews; ++i) {
 		SDL_DestroyTexture(gameTex[i]);
+#ifdef COLOR_16_BIT
+		if (gameTex16[i]) SDL_DestroyTexture(gameTex16[i]);
+		gameTex16[i] = NULL;
+#endif
 		SDL_DestroyTexture(mapTex[i]);
-		if (hudTex[i] && !(HUD_TEX_SHARED && i > 0)) SDL_DestroyTexture(hudTex[i]);
+		if (hudTex[i] && (i == 0 || hudTex[i] != hudTex[0])) SDL_DestroyTexture(hudTex[i]);
 		gameTex[i] = mapTex[i] = hudTex[i] = NULL;
+		if (hudOverTex[i]) SDL_DestroyTexture(hudOverTex[i]);
+		if (hudMapTex[i]) SDL_DestroyTexture(hudMapTex[i]);
+		if (hudFlatTex[i]) SDL_DestroyTexture(hudFlatTex[i]);
+		hudOverTex[i] = hudMapTex[i] = hudFlatTex[i] = NULL;
 	}
 	ui_free_image(logoTex);
 	ui_free_image(combatTex);

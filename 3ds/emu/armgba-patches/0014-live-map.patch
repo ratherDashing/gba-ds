@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Thu, 19 Nov 2026 03:00:00 -0500
+Subject: armGBA: a state load drops only the compiled blocks over the work RAM words it changes, when there are few (the hidden copy no longer recompiles everything for every capture)
+
+diff --git a/src/state.c b/src/state.c
+index 19c96ff..58de921 100644
+--- a/src/state.c
++++ b/src/state.c
+@@ -227,22 +227,36 @@ static uint8_t* moved(struct GBA* gba, uint64_t offset) {
+ 	return offset ? (uint8_t*) gba + offset : NULL;
+ }
+ 
+-// Whether compiled code covers a word that the state holds differently, or was compiled for other
+-// wait states.
+-static bool codeChanged(const struct GBA* gba, const struct GBA* saved) {
++// Whether compiled code has to be thrown away because the state differs from the machine: other wait states, or
++// code in video memory. Words of work RAM that compiled code covers and the state holds differently are listed
++// instead, for their blocks alone to go (as a store to them would); a list that doesn't fit throws all away.
++enum { CHANGED_WORDS = 64 };
++struct ChangedWords {
++	uint32_t address[CHANGED_WORDS];
++	int count;
++};
++
++static bool codeChanged(const struct GBA* gba, const struct GBA* saved, struct ChangedWords* changed) {
+ 	if (gba->videoCode || gba->prefetchEnabled != saved->prefetchEnabled || memcmp(gba->waitN16, saved->waitN16, sizeof(gba->waitN16)) ||
+ 	    memcmp(gba->waitS16, saved->waitS16, sizeof(gba->waitS16)) || memcmp(gba->waitN32, saved->waitN32, sizeof(gba->waitN32)) ||
+ 	    memcmp(gba->waitS32, saved->waitS32, sizeof(gba->waitS32))) {
+ 		return true;
+ 	}
++	changed->count = 0;
+ 	for (uint32_t word = 0; word < SIZE_IWRAM / 4; ++word) {
+ 		if (gba->iwramCode[word] && memcmp(&gba->iwram[word * 4], &saved->iwram[word * 4], 4)) {
+-			return true;
++			if (changed->count == CHANGED_WORDS) {
++				return true;
++			}
++			changed->address[changed->count++] = (REGION_IWRAM << 24) + word * 4;
+ 		}
+ 	}
+ 	for (uint32_t word = 0; word < SIZE_EWRAM / 4; ++word) {
+ 		if (gba->ewramCode[word] && memcmp(&gba->ewram[word * 4], &saved->ewram[word * 4], 4)) {
+-			return true;
++			if (changed->count == CHANGED_WORDS) {
++				return true;
++			}
++			changed->address[changed->count++] = (REGION_EWRAM << 24) + word * 4;
+ 		}
+ 	}
+ 	return false;
+@@ -264,7 +278,8 @@ bool gbaLoadState(struct GBA* gba, const void* state, size_t size) {
+ 	if ((saved->romSize != gba->romSize && !gba->cart.multi) || saved->multibootSize != gba->multibootSize) {
+ 		return false;
+ 	}
+-	bool flush = codeChanged(gba, saved);
++	struct ChangedWords changed = { .count = 0 };
++	bool flush = codeChanged(gba, saved, &changed);
+ 	struct GBA* host = malloc(sizeof(*host));
+ 	if (!host) {
+ 		return false;
+@@ -345,6 +360,9 @@ bool gbaLoadState(struct GBA* gba, const void* state, size_t size) {
+ 		memcpy(&gba->rom[GPIO_REGISTERS], header.gpioRegisters, sizeof(header.gpioRegisters));
+ 	}
+ 	jitStateLoaded(gba, flush);
++	for (int i = 0; !flush && i < changed.count; ++i) {
++		jitInvalidate(gba, changed.address[i], 4);
++	}
+ 	cartRestore(gba);
+ 	if (gba->renderThread) {
+ 		renderThreadClone(gba);

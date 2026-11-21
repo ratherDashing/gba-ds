@@ -21,6 +21,8 @@
 
 #include "host.h"
 
+extern u32 __ctru_heap_size;
+
 Result svcLumaControlProcess(Handle process, u32 op, u32 arg2, u32 arg3);
 s32 ctrEnableAllSvcsKernel(void);
 void ctrFlushCachesKernel(void);
@@ -83,8 +85,11 @@ static bool makeExecutable(uint8_t* code, size_t size, bool* protected) {
 		}
 	}
 	Result rc2 = 0;
-	if (R_FAILED(rc)) {
+	/* (the whole process stays RWX once set: in Azahar a second call after a game had run never returned) */
+	static bool processRwx;
+	if (R_FAILED(rc) && !processRwx) {
 		rc2 = svcLumaControlProcess(self, PROCESSOP_SET_MMU_TO_RWX, 0, 0);
+		processRwx = R_SUCCEEDED(rc2);
 	}
 	logLine("jit: svcControlProcessMemory %08lX%s, svcControlProcess(RWX) %08lX%s", (unsigned long) rc, isEmulator() ? " (skipped)" : "",
 	        (unsigned long) rc2, R_FAILED(rc) ? "" : " (not needed)");
@@ -95,7 +100,7 @@ static bool makeExecutable(uint8_t* code, size_t size, bool* protected) {
 	return true;
 }
 
-// The game's code memory: the heap left after its ROM and HEAP_LATER, up to 16 MiB. The other machines run
+// The game's code memory: the heap left after its ROM and HEAP_LATER, up to 16 MiB (24 with plenty to spare). The other machines run
 // the same game for a few hundred frames at a time (a map screen, a title screen): up to 4 MiB
 // each. What the recompiler keeps about each block is about 0.4 bytes for each byte of code.
 enum {
@@ -116,6 +121,10 @@ enum {
 	// to compile it again each time (2026-11-16). 21 still left the heap low once in 2 minutes with
 	// the code memory near full (9 MiB): 22 gives it 8.
 	HEAP_LATER_HIDDEN = 22 << 20,
+	// The game's code memory goes up to MAIN_ROOMY when the heap has this much to spare past its share (Golden Sun 2's code
+	// memory of 16 MiB filled in its heaviest second, and it flushed: 17.8 ms with it, 16.3 with 24 MiB, 2026-11-19)
+	MAIN_ROOMY = 24 << 20,
+	MAIN_SLACK = 8 << 20,
 };
 
 bool jitHostMemoryLow(void) {
@@ -159,14 +168,26 @@ void* jitHostAllocCode(size_t* size) {
 		logLine("jit: %u KiB of the heap free, %u KiB wanted (%s)", (unsigned) (avail >> 10), (unsigned) (*size >> 10), main ? "the game" : "a copy");
 		// The game: what is left once its ROM is loaded and the later machines have theirs. A copy:
 		// half of what there is.
-		size_t const reserve = main ? (hiddenPending ? HEAP_LATER_HIDDEN : HEAP_LATER) + romPending : HEAP_LOW;
+		size_t later = hiddenPending ? HEAP_LATER_HIDDEN : HEAP_LATER;
+		const char* laterMib = getenv("GBADS_ARMGBA_LATER_MIB"); /* (a test: Azahar's heap is half the console's) */
+		if (laterMib && atoi(laterMib) >= 0) later = (size_t) atoi(laterMib) << 20;
+		size_t const reserve = main ? later + romPending : HEAP_LOW;
 		// (5/7: what the recompiler keeps about the code, 0.4 bytes a byte, comes out of the same heap
 		// as the code fills)
 		size_t spare = avail > reserve ? (main ? (avail - reserve) / 7 * 5 : (avail - reserve) / 2) : 0;
 		romPending = 0;
 		hiddenPending = false;
 		spare &= ~(size_t) 0xFFFFF;
-		size_t const most = main ? MAIN_MAX : OTHER_MAX;
+		size_t most = main ? MAIN_MAX : OTHER_MAX;
+		if (main && avail > reserve + MAIN_SLACK && (avail - reserve - MAIN_SLACK) / 7 * 5 >= MAIN_ROOMY) most = MAIN_ROOMY;
+		/* (gba-ds.cfg armgba_code_mib: the game's code memory up to this many MiB, 4 to 24: armGBA's own frontend takes up to 24) */
+		const char* wanted = getenv("GBADS_ARMGBA_CODE_MIB");
+		if (main && wanted && atoi(wanted) >= 4 && atoi(wanted) <= 24) most = (size_t) atoi(wanted) << 20;
+		/* (armgba_copy_code_mib: the same for the hidden copy and the other machines, 1 to 16; above 4 only on a heap
+		 * of 64 MiB or more, since HEAP_LATER_HIDDEN was tuned with 4 on the 64 MiB mode's smaller heap) */
+		const char* copyWanted = getenv("GBADS_ARMGBA_COPY_CODE_MIB");
+		int const copyMib = copyWanted ? atoi(copyWanted) : 0;
+		if (!main && copyMib >= 1 && copyMib <= 16 && (copyMib <= 4 || __ctru_heap_size >= 64u << 20)) most = (size_t) copyMib << 20;
 		size_t const least = main ? MAIN_MIN : OTHER_MIN;
 		if (spare > *size) {
 			spare = *size;
@@ -178,13 +199,17 @@ void* jitHostAllocCode(size_t* size) {
 			spare = least;
 		}
 		for (; spare >= least; spare -= 1 << 20) {
-			uint8_t* code = memalign(0x1000, spare);
+			/* (on a smaller heap the top block crashed in the game's code memory at under 1 MiB free) */
+			uint8_t* code = main && __ctru_heap_size >= 64u << 20 ? host_top_alloc_code(spare) : NULL;
+			if (!code) {
+				code = memalign(0x1000, spare);
+			}
 			if (!code) {
 				continue;
 			}
 			bool protected = false;
 			if (!makeExecutable(code, spare, &protected)) {
-				free(code);
+				host_rom_free(code);
 				break;
 			}
 			buffers[slot].code = code;
@@ -208,7 +233,7 @@ static void release(int i) {
 		Result rc = svcControlProcessMemory(self, (u32) buffers[i].code, 0, buffers[i].size, MEMOP_PROT, MEMPERM_READ | MEMPERM_WRITE);
 		logLine("jit: code memory back to read-write: %08lX", (unsigned long) rc);
 	}
-	free(buffers[i].code);
+	host_rom_free(buffers[i].code);
 	memset(&buffers[i], 0, sizeof(buffers[i]));
 }
 
@@ -256,14 +281,15 @@ bool renderThreadHostCreate(pthread_t* thread, void* (*function)(void*), void* a
 	return true;
 }
 
-// A second render worker (render_workers = 2, the default; armGBA asks every time): on the fourth
-// core, at the game thread's priority, a step above the hidden copy's thread there. Each worker
-// then draws every other line.
+// A second render worker (gba-ds.cfg render_workers = 2; armgba_render_workers sets it for
+// one run): on the fourth core, at the game thread's priority, a step above the hidden copy's thread
+// there. Each worker then draws every other line.
 bool renderThreadHostCreateSecond(pthread_t* thread, void* (*function)(void*), void* argument) {
 	renderThreadSecond = false;
 	// (armGBA asks on the 3DS whatever it was started with: the setting is GBA DS's, emu.h)
 	extern int emuRenderWorkers;
-	if (renderThreadCore != 2 || emuRenderWorkers != 2) {
+	const char* workers = getenv("GBADS_ARMGBA_RENDER_WORKERS");
+	if (renderThreadCore != 2 || (workers ? atoi(workers) : emuRenderWorkers) < 2) {
 		return false;
 	}
 	s32 priority = 0x30;
@@ -295,7 +321,24 @@ bool audioThreadHostCreate(pthread_t* thread, void* (*function)(void*), void* ar
 	return true;
 }
 
+// What the cache calls took (gba-ds.cfg armgba_stats turns the counting on).
+uint64_t jitFlushTicks;
+uint32_t jitFlushCalls;
+bool jitStatsOn;
+
+static void flush_code(void* start, void* end);
 void jitHostFlushCode(void* start, void* end) {
+	if (!jitStatsOn) {
+		flush_code(start, end);
+		return;
+	}
+	uint64_t const began = svcGetSystemTick();
+	flush_code(start, end);
+	jitFlushTicks += svcGetSystemTick() - began;
+	++jitFlushCalls;
+}
+
+static void flush_code(void* start, void* end) {
 	u32 const from = (u32) start & ~31u;
 	u32 const to = ((u32) end + 31) & ~31u;
 	if (isEmulator()) {
@@ -312,6 +355,19 @@ void jitHostFlushCode(void* start, void* end) {
 		ctrFlushRangeKernel();
 		LightLock_Unlock(&lock);
 	}
+}
+
+int host_core_now(void) {
+	return isEmulator() ? 0 : (int) svcGetProcessorID(); /* (Azahar answers with a pointer) */
+}
+
+bool host_icache_invalidate(void) {
+	const char* on = getenv("GBADS_ARMGBA_ICACHE");
+	if (isEmulator() || (on && atoi(on) == 0)) {
+		return false;
+	}
+	ctrInvalidateICacheKernel();
+	return true;
 }
 
 uint64_t renderThreadHostTicks(void) {

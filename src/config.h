@@ -57,8 +57,30 @@ typedef struct Config {
 	int rewindSeconds; /* how far back */
 	bool fastForward;  /* hold R2 to fast-forward */
 	bool matchDisplay; /* run at the display's refresh rate (if close to the GBA's) instead of 59.73 Hz */
+	bool threadedVideo; /* threaded_video: mGBA draws the picture on a thread of its own (the 3DS's default, on a New 3DS) */
+	char idleLoops[8];  /* idle_loops: remove | detect | ignore | known (see emu_idle_loops); armGBA ignores it */
+	bool hudLayers;     /* hud_layers: the HUD's second screen is a backdrop with its pieces put on it by the GPU (the 3DS's default) */
 	bool showLogo;     /* the game's logo on the second screen when it has nothing else (off: blank) */
 	int mapInterval;   /* frames between periodic map refreshes */
+	int captureThrottle; /* capture_throttle: up to this many times map_interval while frames run over budget (0: off) */
+	/* the 3DS's cores (3ds/ctr/host.c); -1: as built in */
+	int captureCore;   /* capture_core: the hidden copy's thread */
+	int aheadCore;     /* ahead_core: frame_buffer's thread */
+	int sideCore;      /* side_core: the pad thread, logos, files and the rest */
+	int videoCore;     /* video_core: mGBA's drawing thread (needs the patched libmgba) */
+	bool asyncUpload;  /* async_upload: the 3DS queues a picture's copy to its texture instead of waiting for it (default on) */
+	int rawPicture;    /* raw_picture: the 3DS's render worker's picture is copied to its texture as it is (no byte swap, no flush on the game thread) and the GPU puts the channels right when it draws (1: the buffers' rows 256 words apart, one transfer; 2: rows of 240, two passes) */
+	bool rawCheck;     /* raw_check: a test: each raw picture drawn offscreen both ways, the two compared (the 3DS) */
+	bool gpuTwin;      /* gpu_twin: the 3DS's render worker also writes the picture in the GPU's byte order, so the game thread swaps and flushes nothing */
+	bool twinCheck;    /* twin_check: a test: each twin compared with its picture before it is used (the 3DS) */
+	bool texCheck;     /* tex_check: a test: each picture's texture read back once the GPU is done and compared with the picture (the 3DS) */
+	bool cpuTile;      /* cpu_tile: the 3DS tiles a whole 240x160 picture itself, not by the GPU's copy engine */
+	int videoWake;     /* video_wake: mGBA's drawing thread is woken every N+1 lines, N = 0, 1, 3, 7, 15, 31 or 63 (the patched libmgba) */
+	int core1Limit;    /* core1_limit: the percent of the system core given to a thread on core 1 */
+	bool coreProbe;    /* core_probe: how much CPU each core gives a thread, in the log at start */
+	int capturePriority; /* capture_priority: the hidden copy's thread this many steps below the other app threads (3DS; 0: as built) */
+	int captureDuty;   /* capture_duty: a capture under way at most 1/N of the time: the next waits N times as long as the last took (0: off) */
+	bool linesFirst;   /* lines_first: the log and bench line writer ahead of the hidden copy's thread (3DS) */
 	bool abSwap;       /* GBA A on the bottom face button instead of the right one */
 	char hotkey[16];   /* home | select | start | l3 (older names: guide = home, back = select) */
 	char hotkeyBtn[HK_COUNT][8]; /* each hotkey action's button (hotkey_quit ...), or none */
@@ -127,6 +149,10 @@ typedef struct Config {
 	char loadState[512];
 	int quitAfter;     /* UI ticks */
 	char inputScript[512];
+	char bench[512];     /* bench: a test bench's jobs file (bench.c) */
+	int benchCheck;      /* bench_check: a bench job logs checksums of the picture and memory every N frames (0: off) */
+	/* the armGBA core's own switches (armgba_save, armgba_stats...): config_apply_core_env hands them to the core */
+	char armgba[16][12];
 } Config;
 
 void config_defaults(Config* c);
@@ -183,6 +209,11 @@ int config_load_game_file(Config* c, const char* path);
 bool config_key_per_game(const char* key);
 /* Parses --key=value / --flag arguments and an optional ROM path. Returns false on error. */
 bool config_parse_args(Config* c, int argc, char** argv);
+/* One gba-ds.cfg option by its name (the bench's per-job options); false if there's no such option. */
+bool config_set(Config* c, const char* key, const char* val);
+/* Hands the armgba_* switches to the armGBA core (its environment), the ones this config doesn't have back to off; a game's
+ * start calls it, so a bench job's options (which come back with the config) don't outlast the job. */
+void config_apply_core_env(const Config* c);
 void config_usage(const char* argv0);
 
 #endif

@@ -1,0 +1,302 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Thu, 19 Nov 2026 18:00:00 -0500
+Subject: armGBA: careful copies and unlinked exits share their stub code, and a careful copy is made even in a frame that has used up its compile time
+
+
+diff --git a/src/cpu/a32/backend.c b/src/cpu/a32/backend.c
+index 92a4960..1f2ded8 100644
+--- a/src/cpu/a32/backend.c
++++ b/src/cpu/a32/backend.c
+@@ -222,8 +222,15 @@ static void emitExit(struct Jit* jit, struct Emitter* e) {
+ 	aPop(e, 0x9FF0);
+ }
+ 
+-// The shared tail of the exit stubs of unlinked branches; r0 holds the link.
++// The shared tail of the exit stubs of unlinked branches. A stub is a BL to this and two words: the link and
++// the prefetch head to store first (0: none), which lr points at.
+ static void emitExitLink(struct Jit* jit, struct Emitter* e) {
++	aLdr(e, R0, LR, 0);
++	aLdr(e, R1, LR, 4);
++	aDpI(e, C_AL, D_CMP, true, 0, R1, 0);
++	uint8_t* noHead = aB(e, C_EQ, NULL);
++	strF(e, R1, OFF(prefetcher.head));
++	patchHere(e, noHead);
+ 	aLdr(e, R1, R0, offsetof(struct Link, targetKey));
+ 	strF(e, R1, OFF(exitPc));
+ 	strF(e, R0, OFF(exitLink));
+@@ -974,6 +981,123 @@ static uint8_t* emitMemRoutine(struct Jit* jit, struct Emitter* e, int kind, boo
+ 	return start;
+ }
+ 
++// A careful copy's stubs share two routines, each reached by a BL at the stub's entry: the BL's return
++// address is the stub's "b resume", with the stub's constants in the words after it. Control
++// comes back to that branch when the events inside the instruction ran after it; the rest leaves
++// as the stub's own code once did.
++enum {
++	// In a stub's flags word, over the instruction's kind (the helper's third argument).
++	STUB_PRECHARGED = 0x100,
++	STUB_HEAD = 0x200,
++	// Where each word of a stub's constants is, from the return address.
++	STUB_PC = 4,
++	STUB_COST = 8,
++	STUB_BLOCK = 12,
++	STUB_FLAGS = 16,
++	STUB_ENTRY = 20,
++	STUB_KEY = 24,
++	STUB_HEAD_AT = 28,
++	// The deferred stub's: the instruction after, the block, the flags and the prefetch head.
++	DEFER_PC = 4,
++	DEFER_BLOCK = 8,
++	DEFER_FLAGS = 12,
++	DEFER_HEAD_AT = 16,
++};
++
++static void emitCarefulStub(struct Jit* jit, struct Emitter* e) {
++	// The stub's address (lr) stays on the stack across the C calls.
++	aPush(e, (1 << R0) | (1 << LR));
++	aLdr(e, R3, LR, STUB_FLAGS);
++	aDpI(e, C_AL, D_TST, true, 0, R3, STUB_HEAD);
++	uint8_t* noHead = aB(e, C_EQ, NULL);
++	aLdr(e, R1, LR, STUB_HEAD_AT);
++	strF(e, R1, OFF(prefetcher.head));
++	patchHere(e, noHead);
++	aDpI(e, C_AL, D_TST, true, 0, R3, STUB_PRECHARGED);
++	uint8_t* toStep = aB(e, C_NE, NULL);
++	aBl(e, jit->spillCyclesRoutine);
++	aLdr(e, R3, SP, 4);
++	aMov(e, R0, R_GBA);
++	aLdr(e, R1, R3, STUB_COST);
++	aLdr(e, R2, R3, STUB_FLAGS);
++	aDpI(e, C_AL, D_AND, false, R2, R2, 0xFF);
++	aLdr(e, R3, R3, STUB_BLOCK);
++	callAbs(e, jitHelperCareful);
++	aBl(e, jit->reloadCyclesRoutine);
++	aLdr(e, R3, SP, 4);
++	aDpI(e, C_AL, D_CMP, true, 0, R0, CAREFUL_RUN);
++	uint8_t* run = aB(e, C_EQ, NULL);
++	aDpI(e, C_AL, D_CMP, true, 0, R0, CAREFUL_LEAVE);
++	uint8_t* leaveHere = aB(e, C_EQ, NULL);
++	patchHere(e, toStep);
++	// The exact CPU runs the instruction; compiled code continues after it, here if the copy is still there.
++	aBl(e, jit->spillRoutine);
++	aLdr(e, R3, SP, 4);
++	aMov(e, R0, R_GBA);
++	aLdr(e, R1, R3, STUB_PC);
++	callAbs(e, jitHelperStepOne);
++	aBl(e, jit->reloadRoutine);
++	aLdr(e, R3, SP, 4);
++	aDpI(e, C_AL, D_CMN, true, 0, R0, 1);
++	uint8_t* leave = aB(e, C_EQ, NULL);
++	aLdr(e, R1, R3, STUB_ENTRY);
++	aDpI(e, C_AL, D_CMP, true, 0, R1, 0);
++	uint8_t* last = aB(e, C_EQ, NULL);
++	aLdr(e, R2, R3, STUB_KEY);
++	aDpR(e, C_AL, D_CMP, true, 0, R0, R2, S_LSL, 0);
++	uint8_t* elsewhere = aB(e, C_NE, NULL);
++	aLdr(e, R2, R3, STUB_BLOCK);
++	aLdrb(e, R2, R2, (int32_t) offsetof(struct Block, valid));
++	aDpI(e, C_AL, D_CMP, true, 0, R2, 0);
++	uint8_t* gone = aB(e, C_EQ, NULL);
++	aDpI(e, C_AL, D_ADD, false, SP, SP, 8);
++	aBx(e, R1);
++	patchHere(e, last);
++	patchHere(e, elsewhere);
++	patchHere(e, gone);
++	aDpI(e, C_AL, D_ADD, false, SP, SP, 8);
++	aB(e, C_AL, jit->dispatchKey);
++	patchHere(e, leave);
++	strFImm(e, OFF(exitReason), EXIT_EXACT, 4, LR);
++	aB(e, C_AL, jit->exitRoutine);
++	// Leaves between instructions, for the run loop.
++	patchHere(e, leaveHere);
++	aLdr(e, R1, R3, STUB_PC);
++	strF(e, R1, OFF(exitPc));
++	strFImm(e, OFF(exitReason), EXIT_LOOKUP, 4, R1);
++	aB(e, C_AL, jit->exitRoutine);
++	patchHere(e, run);
++	aPop(e, (1 << R0) | (1 << LR));
++	aBx(e, LR);
++}
++
++// The events inside the instruction just done.
++static void emitDeferredStub(struct Jit* jit, struct Emitter* e) {
++	aPush(e, (1 << R0) | (1 << LR));
++	aLdr(e, R3, LR, DEFER_FLAGS);
++	aDpI(e, C_AL, D_TST, true, 0, R3, STUB_HEAD);
++	uint8_t* noHead = aB(e, C_EQ, NULL);
++	aLdr(e, R1, LR, DEFER_HEAD_AT);
++	strF(e, R1, OFF(prefetcher.head));
++	patchHere(e, noHead);
++	aBl(e, jit->spillCyclesRoutine);
++	aLdr(e, R3, SP, 4);
++	aMov(e, R0, R_GBA);
++	aLdr(e, R1, R3, DEFER_BLOCK);
++	callAbs(e, jitHelperDeferred);
++	aBl(e, jit->reloadCyclesRoutine);
++	aLdr(e, R3, SP, 4);
++	aDpI(e, C_AL, D_CMP, true, 0, R0, 0);
++	uint8_t* run = aB(e, C_EQ, NULL);
++	aLdr(e, R1, R3, DEFER_PC);
++	strF(e, R1, OFF(exitPc));
++	strFImm(e, OFF(exitReason), EXIT_LOOKUP, 4, R1);
++	aB(e, C_AL, jit->exitRoutine);
++	patchHere(e, run);
++	aPop(e, (1 << R0) | (1 << LR));
++	aBx(e, LR);
++}
++
+ // Emits everything shared: the entry and exit, the dispatchers, and the memory routines. They are
+ // emitted once and sit before the first block. Shifts by a register need no routine here: the
+ // host's follow ARM's rules.
+@@ -1009,6 +1133,10 @@ bool backendInit(struct Jit* jit) {
+ 	jit->multiplyCarryRoutine = e.p;
+ 	emitPreserveCall(&e, jitMultiplyCarry);
+ 	aBx(&e, LR);
++	jit->carefulStubRoutine = e.p;
++	emitCarefulStub(jit, &e);
++	jit->deferredStubRoutine = e.p;
++	emitDeferredStub(jit, &e);
+ 	// For ARMGBA_PERFMAP.
+ 	static const char* const kinds[8] = { "load32", "load16", "load8", "loadS8", "loadS16", "store32", "store16", "store8" };
+ 	jitNameCode(jit->spillRoutine, jit->reloadRoutine, "spill");
+@@ -2996,54 +3124,17 @@ static bool compileInStretch(struct Jit* jit, struct Block* block, struct Inst*
+ 			link->from = block;
+ 			continue;
+ 		}
+-		// Events inside the instruction run after it, or the exact CPU runs it.
+-		storeHead(&c, stub->pc + 2 * c.width);
+-		uint8_t* leaveHere = NULL;
+-		if (!block->precharged) {
+-			aBl(e, jit->spillCyclesRoutine);
+-			aMov(e, R0, R_GBA);
+-			aMovI(e, R1, stub->cost);
+-			aMovI(e, R2, stub->deferrable);
+-			aMovI(e, R3, (uint32_t) (uintptr_t) block);
+-			callAbs(e, jitHelperCareful);
+-			aBl(e, jit->reloadCyclesRoutine);
+-			aDpI(e, C_AL, D_CMP, true, 0, R0, CAREFUL_RUN);
+-			aB(e, C_EQ, stub->resume);
+-			aDpI(e, C_AL, D_CMP, true, 0, R0, CAREFUL_LEAVE);
+-			leaveHere = aB(e, C_EQ, NULL);
+-		}
+-		// The exact CPU runs the instruction an event falls in; compiled code continues after it,
+-		// here if the copy is still there.
+-		aBl(e, jit->spillRoutine);
+-		aMov(e, R0, R_GBA);
+-		aMovI(e, R1, stub->pc);
+-		callAbs(e, jitHelperStepOne);
+-		aBl(e, jit->reloadRoutine);
+-		aDpI(e, C_AL, D_CMN, true, 0, R0, 1);
+-		uint8_t* leave = aB(e, C_EQ, NULL);
+-		if (stub->index + 1 < count) {
+-			aMovI(e, R1, blockKey(stub->pc + c.width, c.thumb));
+-			aDpR(e, C_AL, D_CMP, true, 0, R0, R1, S_LSL, 0);
+-			uint8_t* elsewhere = aB(e, C_NE, NULL);
+-			aMovI(e, R1, (uint32_t) (uintptr_t) &block->valid);
+-			aLdrb(e, R1, R1, 0);
+-			aDpI(e, C_AL, D_CMP, true, 0, R1, 0);
+-			uint8_t* gone = aB(e, C_EQ, NULL);
+-			aB(e, C_AL, block->entries[stub->index + 1]);
+-			patchHere(e, elsewhere);
+-			patchHere(e, gone);
+-		}
+-		aB(e, C_AL, jit->dispatchKey);
+-		patchHere(e, leave);
+-		storeConst(&c, OFF(exitReason), EXIT_EXACT);
+-		aB(e, C_AL, jit->exitRoutine);
+-		if (leaveHere) {
+-			// Leaves between instructions, for the run loop.
+-			patchHere(e, leaveHere);
+-			storeConst(&c, OFF(exitPc), stub->pc);
+-			storeConst(&c, OFF(exitReason), EXIT_LOOKUP);
+-			aB(e, C_AL, jit->exitRoutine);
+-		}
++		// Events inside the instruction run after it, or the exact CPU runs it (carefulStubRoutine).
++		aBl(e, jit->carefulStubRoutine);
++		aB(e, C_AL, stub->resume);
++		bool const next = stub->index + 1 < count;
++		emit32(e, stub->pc);
++		emit32(e, (uint32_t) stub->cost);
++		emit32(e, (uint32_t) (uintptr_t) block);
++		emit32(e, stub->deferrable | (block->precharged ? STUB_PRECHARGED : 0) | (c.prefetch ? STUB_HEAD : 0));
++		emit32(e, next ? (uint32_t) (uintptr_t) block->entries[stub->index + 1] : 0);
++		emit32(e, next ? blockKey(stub->pc + c.width, c.thumb) : 0);
++		emit32(e, stub->pc + 2 * c.width);
+ 	}
+ 	for (int i = 0; i < c.missCount; ++i) {
+ 		// What emitMissTerms does for an access that stopped the buffer, then the next
+@@ -3061,21 +3152,16 @@ static bool compileInStretch(struct Jit* jit, struct Block* block, struct Inst*
+ 		aB(e, C_AL, miss->resume);
+ 	}
+ 	for (int i = 0; i < c.deferredCount; ++i) {
+-		// The events inside the instruction just done.
++		// The events inside the instruction just done (deferredStubRoutine).
+ 		int index = c.deferred[i].index;
+ 		uint32_t next = c.insts[0].address + (index + 1) * c.width;
+ 		patchHere(e, c.deferred[i].site);
+-		storeHead(&c, next + 2 * c.width);
+-		aBl(e, jit->spillCyclesRoutine);
+-		aMov(e, R0, R_GBA);
+-		aMovI(e, R1, (uint32_t) (uintptr_t) block);
+-		callAbs(e, jitHelperDeferred);
+-		aBl(e, jit->reloadCyclesRoutine);
+-		aDpI(e, C_AL, D_CMP, true, 0, R0, 0);
+-		aB(e, C_EQ, block->entries[index + 1]);
+-		storeConst(&c, OFF(exitPc), next);
+-		storeConst(&c, OFF(exitReason), EXIT_LOOKUP);
+-		aB(e, C_AL, jit->exitRoutine);
++		aBl(e, jit->deferredStubRoutine);
++		aB(e, C_AL, block->entries[index + 1]);
++		emit32(e, next);
++		emit32(e, (uint32_t) (uintptr_t) block);
++		emit32(e, c.prefetch ? STUB_HEAD : 0);
++		emit32(e, next + 2 * c.width);
+ 	}
+ 	block->outCount = c.linkCount;
+ 	block->out = jitAlloc(c.jit, c.linkCount * sizeof(*block->out));
+@@ -3084,11 +3170,9 @@ static bool compileInStretch(struct Jit* jit, struct Block* block, struct Inst*
+ 		struct Link* link = &block->out[i];
+ 		link->site = c.linkSites[i];
+ 		link->stub = e->p;
+-		if (inCartridge(link->targetKey >> 24)) {
+-			storeHead(&c, (link->targetKey & ~1u) + 2 * c.width);
+-		}
+-		aMovI(e, R0, (uint32_t) (uintptr_t) link);
+-		aB(e, C_AL, jit->exitLinkRoutine);
++		aBl(e, jit->exitLinkRoutine);
++		emit32(e, (uint32_t) (uintptr_t) link);
++		emit32(e, c.prefetch && inCartridge(link->targetKey >> 24) ? (link->targetKey & ~1u) + 2 * c.width : 0);
+ 	}
+ 	if (e->p > e->end) {
+ 		forgetTiny(&c);
+diff --git a/src/cpu/jit-internal.h b/src/cpu/jit-internal.h
+index 8300077..df53d84 100644
+--- a/src/cpu/jit-internal.h
++++ b/src/cpu/jit-internal.h
+@@ -430,6 +430,9 @@ struct Jit {
+ 	uint8_t* dispatchKey;
+ 	uint8_t* shiftRoutines[4];
+ 	uint8_t* multiplyCarryRoutine;
++	// What the stubs of a careful copy share (backend.c), for backends that use them.
++	uint8_t* carefulStubRoutine;
++	uint8_t* deferredStubRoutine;
+ 	// The shared tail of the exit stubs, for backends that use one.
+ 	uint8_t* exitLinkRoutine;
+ 	// load32, load16, load8, loadS8, loadS16, store32, store16, store8
+diff --git a/src/cpu/jit.c b/src/cpu/jit.c
+index 2d8bfd6..0daa5af 100644
+--- a/src/cpu/jit.c
++++ b/src/cpu/jit.c
+@@ -2337,9 +2337,8 @@ void jitRunLoop(struct GBA* gba) {
+ 				// Mario Kart's code memory, and the recompiler threw everything away when that ran out
+ 				// (2026-11-09). Until an event has fallen in a block a few times, the exact CPU steps
+ 				// to the event instead, as when there's no room for one.
+-				// Nor is one compiled in a frame that has used up its time for compiling, or once careful
+-				// copies have taken their share of the code memory (CAREFUL_SHARE).
+-				bool const earned = link->from->twin || (link->from->checkFires >= CAREFUL_AFTER && !compileBusy(jit) && !carefulFull(jit));
++				// Nor is one once careful copies have taken their share of the code memory (CAREFUL_SHARE).
++				bool const earned = link->from->twin || (link->from->checkFires >= CAREFUL_AFTER && !carefulFull(jit));
+ 				if (!earned) {
+ 					struct Block* from = link->from;
+ 					if (gba->video.frameCounter - from->firesFrom > CAREFUL_FRAMES) {

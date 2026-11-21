@@ -1,0 +1,10 @@
+# The profile's training run (pgo-train.py): eight games, none of them in the benchmark's standard stretches.
+# Syntax: project-notes/tools/bench_jobs.py's docstring. Frames from power-on.
+advance-wars:0-5000
+golden-sun:0-4500
+super-mario-advance:0-4460
+tony-hawks-pro-skater-2:0-5000
+wario-land-4:0-4500
+f-zero-maximum-velocity:0-3500
+mario-and-luigi-superstar-saga:0-3500
+sonic-advance-2:0-3000

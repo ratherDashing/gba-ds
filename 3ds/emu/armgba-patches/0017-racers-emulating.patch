@@ -1,0 +1,277 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Fri, 20 Nov 2026 13:00:00 -0500
+Subject: armGBA: a flag-setting multiply's carry that only the next check's way out can read is worked out there (armgba_lazy_carry), and a return into a block's middle carries on in its careful copy instead of stepping the rest (armgba_mid_careful)
+
+
+diff --git a/src/cpu/a32/backend.c b/src/cpu/a32/backend.c
+index 1f2ded8..1f2a4d3 100644
+--- a/src/cpu/a32/backend.c
++++ b/src/cpu/a32/backend.c
+@@ -1193,6 +1193,9 @@ struct Stub {
+ 	// The cycles its check compares, and where its cold code starts.
+ 	int checked;
+ 	uint8_t* code;
++	// One more than the kind of the multiply just before whose carry only this check's way out reads
++	// (lazyCarry), or 0.
++	uint8_t carry;
+ };
+ 
+ struct Compiler {
+@@ -1217,6 +1220,8 @@ struct Compiler {
+ 	int Ncyc;
+ 	int32_t penaltyRow;
+ 	bool careful;
++	// The multiply carry the next check's cold code works out (Stub.carry).
++	uint8_t carryNext;
+ 	// Where a waiting loop's way back out of the block goes, or 0, and the loads it makes through
+ 	// registers it doesn't change, which must be from RAM, DISPSTAT or VCOUNT for the loop to be
+ 	// skipped.
+@@ -1272,6 +1277,7 @@ struct Compiler {
+ 	struct {
+ 		uint8_t* site;
+ 		int index;
++		uint8_t carry;
+ 	} deferred[MAX_BLOCK_INSTS];
+ 	int deferredCount;
+ 	// A conditional branch can need two; a rewritten word's forms count as instructions.
+@@ -1596,7 +1602,8 @@ static void emitCheck(struct Compiler* c, int index, int ahead) {
+ 	}
+ 	cmnCycles(e, c->pending + ahead);
+ 	struct Stub* stub = &c->stubs[c->stubCount++];
+-	*stub = (struct Stub) { .pc = c->insts[0].address + index * c->width, .pending = c->pending, .index = index, .checked = c->pending + ahead };
++	*stub = (struct Stub) { .pc = c->insts[0].address + index * c->width, .pending = c->pending, .index = index, .checked = c->pending + ahead, .carry = c->carryNext };
++	c->carryNext = 0;
+ 	stub->site = aB(e, C_GE, NULL);
+ }
+ 
+@@ -1929,6 +1936,18 @@ static void emitMultiplyFlags(struct Compiler* c, int kind, int lo, int hi, bool
+ 	canonical(c);
+ }
+ 
++// Whether only the way out at the next instruction's check (a multiply's time depends on its operands)
++// can read the carry: the code that goes on sets C first, so that check's cold code works it out.
++static bool carryLazy(const struct Compiler* c, const struct Inst* in) {
++	int next = c->cur + 1;
++	// A rewritten word holding a form not seen yet leaves the block before running, C unset.
++	if (!c->jit->lazyCarry || in->poly || in->cond != COND_AL || next >= c->count || !c->checkpoint[next] || c->insts[next].poly) {
++		return false;
++	}
++	const struct Inst* after = &c->insts[next];
++	return !((flagReads(after) | (c->liveAfter[next] & ~flagWrites(after))) & F_C);
++}
++
+ // Compiles MUL and MLA. The cycle count depends on the multiplier's value, so it is worked out at
+ // run time.
+ static void emitMul(struct Compiler* c, const struct Inst* in) {
+@@ -1944,6 +1963,7 @@ static void emitMul(struct Compiler* c, const struct Inst* in) {
+ 	emitMulWait(c, in, multiplier, true, in->accumulate ? 1 : 0);
+ 	uint8_t live = in->setFlags ? c->liveAfter[c->cur] : 0;
+ 	bool carry = live & F_C;
++	bool lazy = carry && carryLazy(c, in);
+ 	if (carry) {
+ 		storeScratch(c, 0, multiplicand, in);
+ 		storeScratch(c, 1, multiplier, in);
+@@ -1965,8 +1985,9 @@ static void emitMul(struct Compiler* c, const struct Inst* in) {
+ 		storeGuest(c, in->rd, R0);
+ 	}
+ 	if (live & (F_N | F_Z | F_C)) {
+-		emitMultiplyFlags(c, 0, -1, dst, carry);
++		emitMultiplyFlags(c, 0, -1, dst, carry && !lazy);
+ 	}
++	c->carryNext = lazy ? 1 : 0;
+ }
+ 
+ // Compiles the 64-bit multiplies.
+@@ -1980,6 +2001,7 @@ static void emitMulLong(struct Compiler* c, const struct Inst* in) {
+ 	emitMulWait(c, in, in->rs, in->signedMul, in->accumulate ? 2 : 1);
+ 	uint8_t live = in->setFlags ? c->liveAfter[c->cur] : 0;
+ 	bool carry = live & F_C;
++	bool lazy = carry && carryLazy(c, in);
+ 	if (carry) {
+ 		storeScratch(c, 0, in->rm, in);
+ 		storeScratch(c, 1, in->rs, in);
+@@ -2002,8 +2024,9 @@ static void emitMulLong(struct Compiler* c, const struct Inst* in) {
+ 	storeGuest(c, in->rd, R0);
+ 	storeGuest(c, in->rdHi, R2);
+ 	if (live & (F_N | F_Z | F_C)) {
+-		emitMultiplyFlags(c, in->signedMul ? 2 : 1, R0, R2, carry);
++		emitMultiplyFlags(c, in->signedMul ? 2 : 1, R0, R2, carry && !lazy);
+ 	}
++	c->carryNext = lazy ? (in->signedMul ? 3 : 2) : 0;
+ }
+ 
+ // A word access through the stack pointer, which points into IWRAM: inline when it lands there
+@@ -2892,6 +2915,7 @@ static void emitInst(struct Compiler* c, int index) {
+ 			ldrbF(&c->e, R3, OFF(jitDeferred));
+ 			aDpI(&c->e, C_AL, D_CMP, true, 0, R3, 0);
+ 			c->deferred[c->deferredCount].site = aB(&c->e, C_NE, NULL);
++			c->deferred[c->deferredCount].carry = c->carryNext;
+ 			c->deferred[c->deferredCount++].index = index;
+ 		}
+ 	}
+@@ -3006,6 +3030,15 @@ static void emitIdleHead(struct Compiler* c) {
+ 	patchHere(e, same);
+ }
+ 
++// On a way out after a multiply whose carry was left (carryLazy): works it out into r9 from the
++// operands in jitScratch. The routine keeps r0, r2 and r3.
++static void emitLazyCarry(struct Jit* jit, struct Emitter* e, int carry) {
++	aMovI(e, R1, carry - 1);
++	aBl(e, jit->multiplyCarryRoutine);
++	aDpI(e, C_AL, D_BIC, false, R_FLAGS, R_FLAGS, 0x20000000);
++	aDpR(e, C_AL, D_ORR, false, R_FLAGS, R_FLAGS, R1, S_LSL, 29);
++}
++
+ // Compiles a block into the current stretch: the analysis, then each instruction, then the cold code
+ // the instructions left for the end (slow paths, exits and stubs). Returns false, having written
+ // nothing outside the free space there, if its code didn't fit.
+@@ -3110,6 +3143,9 @@ static bool compileInStretch(struct Jit* jit, struct Block* block, struct Inst*
+ 		struct Stub* stub = &c.stubs[i];
+ 		patchHere(e, stub->site);
+ 		stub->code = e->p;
++		if (stub->carry) {
++			emitLazyCarry(jit, e, stub->carry);
++		}
+ 		if (stub->pending) {
+ 			aAddI(e, R_CYC, R_CYC, stub->pending, R12);
+ 		}
+@@ -3156,6 +3192,9 @@ static bool compileInStretch(struct Jit* jit, struct Block* block, struct Inst*
+ 		int index = c.deferred[i].index;
+ 		uint32_t next = c.insts[0].address + (index + 1) * c.width;
+ 		patchHere(e, c.deferred[i].site);
++		if (c.deferred[i].carry) {
++			emitLazyCarry(jit, e, c.deferred[i].carry);
++		}
+ 		aBl(e, jit->deferredStubRoutine);
+ 		aB(e, C_AL, block->entries[index + 1]);
+ 		emit32(e, next);
+diff --git a/src/cpu/jit-internal.h b/src/cpu/jit-internal.h
+index df53d84..bdb71f1 100644
+--- a/src/cpu/jit-internal.h
++++ b/src/cpu/jit-internal.h
+@@ -472,6 +472,12 @@ struct Jit {
+ 	uint8_t midAfter;
+ 	// jitSetDeferMore(false): which events may run after an instruction as before (DEFER_YES for every instruction).
+ 	bool deferOld;
++	// jitSetLazyCarry: a multiply's carry that only the next check's way out reads is worked out
++	// there (the a32 backend).
++	bool lazyCarry;
++	// jitSetMidCareful: a return into a block's middle carries on in its careful copy (1), made for it
++	// once enough returns have come (2), not where they keep coming (3).
++	uint8_t midCareful;
+ 	uint32_t midCompiled;
+ 	bool coldThumb;
+ 	int coldLeft;
+diff --git a/src/cpu/jit.c b/src/cpu/jit.c
+index 0daa5af..a8af0bf 100644
+--- a/src/cpu/jit.c
++++ b/src/cpu/jit.c
+@@ -160,10 +160,10 @@ static struct Block* findBlock(struct Jit* jit, uint32_t key) {
+ 
+ // A valid block (not a careful copy) whose instructions run through pc, other than one starting
+ // there.
+-static const struct Block* blockWithin(struct Jit* jit, uint32_t pc, bool thumb) {
++static struct Block* blockWithin(struct Jit* jit, uint32_t pc, bool thumb) {
+ 	uint32_t const width = thumb ? 2 : 4;
+ 	for (uint32_t back = 1; back < MAX_BLOCK_INSTS && back * width <= pc; ++back) {
+-		const struct Block* block = findBlock(jit, blockKey(pc - back * width, thumb));
++		struct Block* block = findBlock(jit, blockKey(pc - back * width, thumb));
+ 		if (block && block->valid && !block->careful && block->end > pc) {
+ 			return block;
+ 		}
+@@ -661,6 +661,18 @@ void jitSetDeferMore(struct GBA* gba, bool on) {
+ 	}
+ }
+ 
++void jitSetLazyCarry(struct GBA* gba, bool on) {
++	if (gba->jit) {
++		gba->jit->lazyCarry = on;
++	}
++}
++
++void jitSetMidCareful(struct GBA* gba, int level) {
++	if (gba->jit) {
++		gba->jit->midCareful = (uint8_t) (level < 0 ? 0 : level > 3 ? 3 : level);
++	}
++}
++
+ size_t jitCodeUsed(struct GBA* gba, size_t* size) {
+ 	struct Jit* jit = gba->jit;
+ 	if (size) {
+@@ -1596,6 +1608,34 @@ static struct Block* twinOf(struct GBA* gba, struct Block* block) {
+ 	return block->twin;
+ }
+ 
++// Where a return into the middle of a block (not at one of its starts) carries on in its careful
++// copy, which can be entered before any of its instructions; NULL to step the rest of the block.
++static void* midCareful(struct GBA* gba, struct Block* within, uint32_t pc, bool thumb) {
++	struct Jit* jit = gba->jit;
++	int const index = (int) ((pc - within->pc) / (thumb ? 2u : 4u));
++	if (!within->twin && jit->midCareful >= 2 && !jit->flushRequested && !jit->waitsChanged) {
++		// The return is an event that fell inside the block, so it earns the copy as those do.
++		if (gba->video.frameCounter - within->firesFrom > CAREFUL_FRAMES) {
++			within->checkFires = 0;
++			within->firesFrom = gba->video.frameCounter;
++		}
++		if (within->checkFires < CAREFUL_AFTER) {
++			++within->checkFires;
++		} else if (!carefulFull(jit)) {
++			uint64_t flushes = jit->flushes;
++			twinOf(gba, within);
++			if (flushes != jit->flushes) {
++				return NULL;
++			}
++		}
++	}
++	struct Block* twin = within->twin;
++	if (!twin || !twin->valid || !within->valid || index >= twin->count) {
++		return NULL;
++	}
++	return twin->entries[index];
++}
++
+ // Patches a block's exit to jump straight to its target, now that the target exists.
+ static void linkExit(struct Jit* jit, struct Link* link, struct Block* target) {
+ 	if (!link->from->valid || link->to || !target->valid || link->formMiss) {
+@@ -2229,11 +2269,19 @@ void jitRunLoop(struct GBA* gba) {
+ 			jit->irqReturn = ~0u;
+ 		}
+ 		if (!entry && mid && !gba->traceFile && !findBlock(jit, key)) {
+-			const struct Block* within = blockWithin(jit, pc, thumb);
+-			if (within) {
++			struct Block* within = blockWithin(jit, pc, thumb);
++			uint8_t* seen = &jit->seenCount[lookupHash(key)];
++			// At 3 a place returned to often still gets a block of its own, which runs it faster than the copy.
++			bool const often = jit->midCareful >= 3 && jit->midAfter && *seen >= jit->midAfter;
++			if (within && jit->midCareful && !often) {
++				entry = midCareful(gba, within, pc, thumb);
++				if (entry && jit->midCareful >= 3 && jit->midAfter) {
++					++*seen;
++				}
++			}
++			if (within && !entry) {
+ 				// A place that keeps being returned to, as an interrupt returns to the same instruction line
+ 				// after line, gets a block of its own; the rest, whose events fall all over, are stepped.
+-				uint8_t* seen = &jit->seenCount[lookupHash(key)];
+ 				if (!jit->midAfter || *seen < jit->midAfter || jit->midCompiled >= jit->codeSize >> MID_BLOCK_SHIFT || compileBusy(jit)) {
+ 					if (jit->midAfter && *seen < jit->midAfter) {
+ 						++*seen;
+diff --git a/src/cpu/jit.h b/src/cpu/jit.h
+index fe20759..0a7388a 100644
+--- a/src/cpu/jit.h
++++ b/src/cpu/jit.h
+@@ -38,6 +38,13 @@ void jitSetCompileAfter(int times);
+ void jitSetCompileBudget(struct GBA*, uint64_t ticks);
+ // false: a careful copy lets only events that start no DMA run after an instruction, as it did before it let more.
+ void jitSetDeferMore(struct GBA*, bool on);
++// Blocks compiled from now on leave a multiply's carry to the next check's way out when nothing
++// else reads it (the a32 backend; the others ignore it). Off at first.
++void jitSetLazyCarry(struct GBA*, bool on);
++// A return into a block's middle carries on in its careful copy instead of stepping the rest: 1 where
++// it has one, 2 also making one as an event inside it would, 3 as 2 except that a place returned to
++// again and again gets a block of its own, as at 0; 0 (at first) steps.
++void jitSetMidCareful(struct GBA*, int level);
+ // The code memory compiled code takes so far, and (size) all there is: for a frontend that empties it
+ // (jitFlush) at a moment of its choosing, before it fills at one of the game's.
+ size_t jitCodeUsed(struct GBA*, size_t* size);
