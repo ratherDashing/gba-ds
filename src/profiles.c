@@ -11,6 +11,24 @@
 #include <stdio.h>
 #include <time.h>
 
+/* The hidden copy's scratch states (0.8 MiB each on armGBA) are made at its first capture, mid-game, and given back with the game
+ * (profile_live_end): kept, one sits above the heap's peak and holds malloc's break there for the rest of the run. */
+enum { SCRATCH_COMPOSE = 0, SCRATCH_COMPOSE2, SCRATCH_DBZ, SCRATCH_DBZ2, SCRATCH_TO, SCRATCH_N };
+static struct {
+	uint8_t* p;
+	size_t cap;
+} scratch[SCRATCH_N];
+
+static uint8_t* scratch_state(Emu* s, int slot) {
+	size_t n = emu_state_size(s);
+	if (n > scratch[slot].cap) {
+		free(scratch[slot].p);
+		scratch[slot].p = malloc(n);
+		scratch[slot].cap = scratch[slot].p ? n : 0;
+	}
+	return scratch[slot].p;
+}
+
 /* Values below were found with tools/harness + tools/ramdiff.py against the
  * USA releases. Each profile describes how to bring up the in-game map and
  * how to tell, from memory and from the picture, that it is really showing. */
@@ -119,8 +137,12 @@ static int gbw_game(Emu* s) {
 	return v == GBW_IRQ1 ? 1 : v == GBW_IRQ2 ? 2 : 0;
 }
 
+/* Advance Wars (USA) Rev 1 (26fd0fc9): the same RAM, its code and data moved (the battle map's routine, the unit intel's) */
+static const AwRegion awRev1 = { AW_ARMY, AW_CURSOR, AW_UNITS, AW_MENU_ROW, AW_MINIMAP_OPEN, 1, { { 4, 4, 0xFFE7C6 }, { 200, 100, 0xFFE7C6 } }, 124, { 0x03000ED0, 0x082E4148 }, 0x030036AC, 876, 0x0801FA95, 0, 537 };
+
 static const AwRegion* aw_r(Emu* s) {
 	if (!strncmp(s->gameCode, "BGWJ", 4)) return &awRegions[gbw_game(s) == 1 ? 2 : 3];
+	if (!strncmp(s->gameCode, "AWRE", 4) && emu_read8(s, 0x080000BC) == 1) return &awRev1; /* (the header's version byte) */
 	return &awRegions[(s->gameCode[2] == '2' ? 1 : 0) + (s->gameCode[3] == 'P' ? 4 : 0)];
 }
 
@@ -145,6 +167,11 @@ static void aw_run(Emu* s, uint32_t keys, int n) {
 		if (i < n - 2) emu_frame_blind(s, keys);
 		else emu_frame(s, keys);
 	}
+}
+
+/* ... none drawn: for frames whose picture nobody looks at before the state is loaded again */
+static void aw_run_blind(Emu* s, uint32_t keys, int n) {
+	for (int i = 0; i < n; ++i) emu_frame_blind(s, keys);
 }
 
 static void aw_tap(Emu* s, uint32_t keys, int n) {
@@ -184,7 +211,7 @@ static bool aw_back(Emu* s) {
 
 /* pixel (x, y) of the screen is about this colour (0xRRGGBB) */
 static bool aw_px(Emu* s, int x, int y, uint32_t rgb) {
-	uint32_t c = s->fb[y * GBA_W + x];
+	uint32_t c = emu_pixel(s, x, y);
 	int d[3] = { (int) (c & 0xFF) - (int) (rgb >> 16), (int) ((c >> 8) & 0xFF) - (int) ((rgb >> 8) & 0xFF),
 	             (int) ((c >> 16) & 0xFF) - (int) (rgb & 0xFF) };
 	for (int i = 0; i < 3; ++i) {
@@ -220,11 +247,11 @@ static bool aw_settle(Emu* s, bool (*up)(Emu*), int limit) {
 		}
 		if (have) {
 			int d = 0;
-			for (int i = 0; i < GBA_W * GBA_H && d <= 64; ++i) d += prev[i] != s->fb[i];
+			for (int i = 0; i < GBA_W * GBA_H && d <= 64; ++i) d += prev[i] != emu_fb(s)[i];
 			stable = d <= 64 ? stable + 1 : 0;
 			if (stable >= 3) return true;
 		}
-		memcpy(prev, s->fb, sizeof(prev));
+		memcpy(prev, emu_fb(s), sizeof(prev));
 		have = true;
 	}
 	return false;
@@ -254,14 +281,14 @@ static bool aw_minimap(Emu* s, const void* state, void* tmp, uint32_t* mm, int* 
 	emu_layers(s, 0);
 	emu_state_load(s, tmp);
 	emu_frame(s, 0);
-	memcpy(none, s->fb, sizeof(none));
+	memcpy(none, emu_fb(s), sizeof(none));
 	emu_layers(s, 0x01);
 	emu_state_load(s, tmp);
 	emu_frame(s, 0);
 	int x0 = GBA_W, y0 = GBA_H, x1 = -1, y1 = -1;
 	for (int y = 0; y < GBA_H; ++y) {
 		for (int x = 0; x < GBA_W; ++x) {
-			if (s->fb[y * GBA_W + x] == none[y * GBA_W + x]) continue;
+			if (emu_fb(s)[y * GBA_W + x] == none[y * GBA_W + x]) continue;
 			if (x < x0) x0 = x;
 			if (x > x1) x1 = x;
 			if (y < y0) y0 = y;
@@ -274,14 +301,14 @@ static bool aw_minimap(Emu* s, const void* state, void* tmp, uint32_t* mm, int* 
 	if (ok) {
 		int filled = 0;
 		for (int y = y0; y <= y1; ++y) {
-			for (int x = x0; x <= x1; ++x) filled += s->fb[y * GBA_W + x] != none[y * GBA_W + x];
+			for (int x = x0; x <= x1; ++x) filled += emu_fb(s)[y * GBA_W + x] != none[y * GBA_W + x];
 		}
 		ok = filled * 100 >= (x1 - x0 + 1) * (y1 - y0 + 1) * 97;
 	}
 	if (ok) {
 		*mw = x1 - x0 + 1;
 		*mh = y1 - y0 + 1;
-		for (int y = 0; y < *mh; ++y) memcpy(&mm[y * *mw], &s->fb[(y0 + y) * GBA_W + x0], *mw * sizeof(uint32_t));
+		for (int y = 0; y < *mh; ++y) memcpy(&mm[y * *mw], &emu_fb(s)[(y0 + y) * GBA_W + x0], *mw * sizeof(uint32_t));
 	}
 	emu_mark_backdrop(s, false);
 	emu_layers(s, 0x1F);
@@ -323,19 +350,19 @@ static void aw_clean(Emu* s, void* tmp, uint32_t* pan, uint32_t* bg2) {
 	 * panel's own icons in palette 1 are 960 and up) */
 	const SpriteRule rules[3] = { { -512, -256, 511, 255, 0, 1023, 3, 0, 0 }, AW_WEATHER, { -512, -256, 511, 255, ct, ct + 60, 0, 1u << 1, 0 } };
 	if (!emu_state_save(s, tmp)) {
-		memcpy(pan, s->fb, GBA_W * GBA_H * sizeof(uint32_t));
+		memcpy(pan, emu_fb(s), GBA_W * GBA_H * sizeof(uint32_t));
 		return;
 	}
 	emu_mark_backdrop(s, true); /* (the panel's text the backdrop's black is still the panel's) */
 	emu_layers(s, 0);
 	emu_state_load(s, tmp);
 	emu_frame(s, 0);
-	memcpy(none, s->fb, sizeof(none));
+	memcpy(none, emu_fb(s), sizeof(none));
 	if (bg2) {
 		emu_layers(s, 0x04);
 		emu_state_load(s, tmp);
 		emu_frame(s, 0);
-		for (int i = 0; i < GBA_W * GBA_H; ++i) bg2[i] = s->fb[i] == none[i] ? AW_BG : s->fb[i];
+		for (int i = 0; i < GBA_W * GBA_H; ++i) bg2[i] = emu_fb(s)[i] == none[i] ? AW_BG : emu_fb(s)[i];
 	}
 	emu_layers(s, 0x15);
 	/* (and the unit intel's label, INTEL / SPEC, over its panel: AW-1's
@@ -345,7 +372,7 @@ static void aw_clean(Emu* s, void* tmp, uint32_t* pan, uint32_t* bg2) {
 	emu_hide_sprites(s, hide, lt ? 4 : 3);
 	emu_state_load(s, tmp);
 	emu_frame(s, 0);
-	for (int i = 0; i < GBA_W * GBA_H; ++i) pan[i] = s->fb[i] == none[i] ? AW_BG : s->fb[i];
+	for (int i = 0; i < GBA_W * GBA_H; ++i) pan[i] = emu_fb(s)[i] == none[i] ? AW_BG : emu_fb(s)[i];
 	emu_mark_backdrop(s, false);
 	emu_hide_sprites(s, &rules[1], 2);
 	emu_layers(s, 0x1F);
@@ -749,9 +776,9 @@ static bool sn_settle(Emu* s, int max) {
 	int still = 0;
 	for (int f = 0; f < max; ++f) {
 		emu_frame(s, 0);
-		still = f && !memcmp(prev, s->fb, sizeof(prev)) && !sn_dark(s->fb) ? still + 1 : 0;
+		still = f && !memcmp(prev, emu_fb(s), sizeof(prev)) && !sn_dark(emu_fb(s)) ? still + 1 : 0;
 		if (still >= 3) return true;
-		memcpy(prev, s->fb, sizeof(prev));
+		memcpy(prev, emu_fb(s), sizeof(prev));
 	}
 	return false;
 }
@@ -777,13 +804,13 @@ static const char* sn_compose(Emu* s, const void* state, uint32_t* const* out, i
 		if (!sn_wait(s, 0, 60)) return "map button did nothing";
 	}
 	aw_run(s, 0, 20); /* (past its fade-in) */
-	memcpy(place, &s->fb[SN_PLACE_Y * GBA_W], sizeof(place));
+	memcpy(place, &emu_fb(s)[SN_PLACE_Y * GBA_W], sizeof(place));
 	for (int i = 0; i < 10 && emu_read8(s, SN_MENU_ROW) != 5; ++i) aw_tap(s, K_DOWN, 1);
 	if (emu_read8(s, SN_MENU_ROW) != 5) return "Status not reached in the menu";
 	aw_tap(s, K_A, 1);
 	if (!sn_wait(s, 4, 90)) return "the Status didn't open";
 	aw_run(s, 0, 40); /* (past its fade-in) */
-	memcpy(first, s->fb, sizeof(first));
+	memcpy(first, emu_fb(s), sizeof(first));
 	sn_page(first, place, out[0], w, h);
 	/* the next characters: R, until the first is back (one character: R
 	 * changes nothing) */
@@ -794,15 +821,15 @@ static const char* sn_compose(Emu* s, const void* state, uint32_t* const* out, i
 		aw_tap(s, K_R, 1);
 		aw_run(s, 0, 30); /* (the page sliding out, the dark between: not drawn) */
 		if (!sn_settle(s, 90)) break;
-		if (!memcmp(first, s->fb, sizeof(first))) break; /* round to the first again */
-		if (!memcmp(last, s->fb, sizeof(last))) {
+		if (!memcmp(first, emu_fb(s), sizeof(first))) break; /* round to the first again */
+		if (!memcmp(last, emu_fb(s), sizeof(last))) {
 			/* (R not taken yet, just after a page slid in: again; one
 			 * character, R never changes anything) */
 			++tries;
 			continue;
 		}
-		memcpy(last, s->fb, sizeof(last));
-		sn_page(s->fb, place, out[n], w, h);
+		memcpy(last, emu_fb(s), sizeof(last));
+		sn_page(emu_fb(s), place, out[n], w, h);
 		++n, tries = 0;
 	}
 	*nOut = n;
@@ -881,19 +908,19 @@ static const char* sn2_compose(Emu* s, const void* state, uint32_t* const* out, 
 	if (!sn2_status(s)) return "the Status didn't open";
 	if (!sn_settle(s, 120)) return "the Status didn't settle";
 	int cw = w < GBA_W ? w : GBA_W;
-	memcpy(last, s->fb, sizeof(last));
+	memcpy(last, emu_fb(s), sizeof(last));
 	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[0][y * w], &last[y * GBA_W], (size_t) cw * 4);
 	int n = 1;
 	for (int tries = 0; n < max && tries < 3;) {
 		aw_tap(s, K_R, 1);
 		aw_run(s, 0, 10);
 		if (!sn_settle(s, 120)) break;
-		if (!memcmp(last, s->fb, sizeof(last))) {
+		if (!memcmp(last, emu_fb(s), sizeof(last))) {
 			/* (R not taken yet, or the last character) */
 			++tries;
 			continue;
 		}
-		memcpy(last, s->fb, sizeof(last));
+		memcpy(last, emu_fb(s), sizeof(last));
 		for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[n][y * w], &last[y * GBA_W], (size_t) cw * 4);
 		++n, tries = 0;
 	}
@@ -1075,7 +1102,7 @@ static void ft_menu_row(Emu* s, int* orange, int* white) {
 	*orange = *white = 0;
 	for (int y = 128; y < 144; ++y) {
 		for (int x = 180; x < 236; ++x) {
-			uint32_t c = s->fb[y * GBA_W + x];
+			uint32_t c = emu_fb(s)[y * GBA_W + x];
 			int r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
 			if (r > 200 && g > 60 && g < 170 && b < 90) ++*orange;
 			else if (r > 220 && g > 220 && b > 220) ++*white;
@@ -1112,7 +1139,7 @@ static void ft_take_checker(Emu* s) {
 		emu_layers(s, 0x01);
 		emu_state_load(s, t);
 		emu_frame(s, 0);
-		memcpy(ftChecker, s->fb, sizeof(ftChecker));
+		memcpy(ftChecker, emu_fb(s), sizeof(ftChecker));
 		int other = 0;
 		for (int i = 1; i < GBA_W * GBA_H; ++i) other += ftChecker[i] != ftChecker[0];
 		ftCheckerOk = other > GBA_W * GBA_H / 8; /* (a pattern, not a blank) */
@@ -1167,11 +1194,11 @@ static bool ft_status(Emu* s, const void* state, uint32_t page[2][GBA_W * GBA_H]
 		if (!ft_bg0(s, FT_STATUS_CNT)) return false;
 	}
 	aw_run(s, 0, 40); /* (past its fade-in) */
-	memcpy(page[0], s->fb, sizeof(page[0]));
+	memcpy(page[0], emu_fb(s), sizeof(page[0]));
 	ft_take_checker(s);
 	aw_tap(s, K_RIGHT, 1);
 	aw_run(s, 0, 30);
-	memcpy(page[1], s->fb, sizeof(page[1]));
+	memcpy(page[1], emu_fb(s), sizeof(page[1]));
 	return ft_bg0(s, FT_STATUS_CNT);
 }
 
@@ -1188,12 +1215,12 @@ static bool ft_cut(Emu* s, void* tmp, uint32_t* out, uint32_t* bg3, int* ow, int
 	emu_layers(s, 0);
 	emu_state_load(s, tmp);
 	emu_frame(s, 0);
-	memcpy(none, s->fb, sizeof(none));
+	memcpy(none, emu_fb(s), sizeof(none));
 	if (bg3) {
 		emu_layers(s, 0x08);
 		emu_state_load(s, tmp);
 		emu_frame(s, 0);
-		memcpy(only3, s->fb, sizeof(only3));
+		memcpy(only3, emu_fb(s), sizeof(only3));
 	}
 	emu_layers(s, bg3 ? 0x04 : 0x0C);
 	emu_state_load(s, tmp);
@@ -1202,7 +1229,7 @@ static bool ft_cut(Emu* s, void* tmp, uint32_t* out, uint32_t* bg3, int* ow, int
 	for (int y = 0; y < GBA_H; ++y) {
 		for (int x = 0; x < GBA_W; ++x) {
 			int i = y * GBA_W + x;
-			if (s->fb[i] == none[i] && (!bg3 || only3[i] == none[i])) continue;
+			if (emu_fb(s)[i] == none[i] && (!bg3 || only3[i] == none[i])) continue;
 			x0 = x < x0 ? x : x0, x1 = x > x1 ? x : x1, y0 = y < y0 ? y : y0, y1 = y > y1 ? y : y1;
 		}
 	}
@@ -1213,7 +1240,7 @@ static bool ft_cut(Emu* s, void* tmp, uint32_t* out, uint32_t* bg3, int* ow, int
 		for (int y = 0; y < h; ++y) {
 			for (int x = 0; x < w; ++x) {
 				int i = (y0 + y) * GBA_W + x0 + x;
-				uint32_t c = s->fb[i];
+				uint32_t c = emu_fb(s)[i];
 				out[y * w + x] = c == none[i] ? FT_HOLE : c | 0xFF000000;
 				if (bg3) bg3[y * w + x] = only3[i] == none[i] ? FT_HOLE : only3[i] | 0xFF000000;
 			}
@@ -1273,7 +1300,7 @@ static bool ft_system(Emu* s, const void* state, void* tmp, int row, uint32_t* o
 		int orange = 0;
 		for (int y = 48 + row * 16; y < 64 + row * 16; ++y) {
 			for (int x = 170; x < 236; ++x) {
-				uint32_t c = s->fb[y * GBA_W + x];
+				uint32_t c = emu_fb(s)[y * GBA_W + x];
 				int r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
 				if (r > 200 && g > 60 && g < 170 && b < 90) ++orange;
 			}
@@ -1917,7 +1944,7 @@ static const char* fe_compose(Emu* s, const void* state, uint32_t* const* out, i
 						aw_tap(s, K_RIGHT, 1);
 						aw_run(s, 0, 24);
 					}
-					memcpy(fresh[pages], s->fb, sizeof(fresh[pages]));
+					memcpy(fresh[pages], emu_fb(s), sizeof(fresh[pages]));
 				}
 			}
 			/* kept for this cursor and these units only when R opened a
@@ -1985,7 +2012,7 @@ static const SomRegion* som_r(Emu* e) {
 static bool som_probes(Emu* e, const Probe* p, int n, int need, int tol) {
 	int hit = 0;
 	for (int i = 0; i < n; ++i) {
-		uint32_t c = e->fb[p[i].y * GBA_W + p[i].x];
+		uint32_t c = emu_pixel(e, p[i].x, p[i].y);
 		int d[3] = { (int) (c & 0xFF) - (int) (p[i].rgb >> 16), (int) ((c >> 8) & 0xFF) - (int) ((p[i].rgb >> 8) & 0xFF),
 		             (int) ((c >> 16) & 0xFF) - (int) (p[i].rgb & 0xFF) };
 		hit += abs(d[0]) <= tol && abs(d[1]) <= tol && abs(d[2]) <= tol;
@@ -2038,7 +2065,7 @@ static const char* som_compose(Emu* s, const void* state, uint32_t* out, int w, 
 		up = aw_settle(s, som_status_up, 90);
 	}
 	if (!up) return "the Status screen did not open";
-	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &s->fb[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
+	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &emu_fb(s)[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
 	return NULL;
 }
 
@@ -2064,14 +2091,7 @@ static bool dbz_pause_up(Emu* s) {
 	return emu_io16(s, 0x00) == DBZ_PAUSE_DISP && emu_io16(s, 0x08) == DBZ_PAUSE_BG0;
 }
 static const char* dbz_compose(Emu* s, const void* state, uint32_t* out, int w, int h) {
-	static uint8_t* st;
-	static size_t stSize;
-	size_t sz = emu_state_size(s);
-	if (sz > stSize) {
-		free(st);
-		st = malloc(sz);
-		stSize = st ? sz : 0;
-	}
+	uint8_t* st = scratch_state(s, SCRATCH_DBZ);
 	if (!st) return "no memory";
 	if (!emu_state_load(s, state)) return "state load failed";
 	if (emu_io16(s, 0x00) != DBZ_FIELD_DISP) return "not walking about";
@@ -2079,14 +2099,14 @@ static const char* dbz_compose(Emu* s, const void* state, uint32_t* out, int w, 
 	emu_frame(s, 0);
 	aw_run(s, K_START, 3);
 	if (!aw_settle(s, dbz_pause_up, 90)) return "the pause menu did not open";
-	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &s->fb[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
+	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &emu_fb(s)[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
 	/* the options panel again without its text and cursor */
 	if (!emu_state_save(s, st)) return "state save failed";
 	emu_layers(s, 0x0C);
 	emu_state_load(s, st);
 	emu_frame(s, 0);
 	for (int y = DBZ_PANEL_Y0; y <= DBZ_PANEL_Y1 && y < h; ++y)
-		for (int x = DBZ_PANEL_X0; x <= DBZ_PANEL_X1 && x < w; ++x) out[y * w + x] = s->fb[y * GBA_W + x];
+		for (int x = DBZ_PANEL_X0; x <= DBZ_PANEL_X1 && x < w; ++x) out[y * w + x] = emu_fb(s)[y * GBA_W + x];
 	emu_layers(s, 0x1F);
 	emu_state_load(s, st);
 	return NULL;
@@ -2154,21 +2174,14 @@ static bool dbz2_line(uint32_t c) {
 	return r > 150 && g > 60 && b < 100; /* (orange, yellow) */
 }
 static const char* dbz2_status_prompts(Emu* s, uint32_t* out, int w, int h) {
-	static uint8_t* st;
-	static size_t stSize;
 	static uint32_t noBg1[GBA_W * GBA_H];
-	size_t sz = emu_state_size(s);
-	if (sz > stSize) {
-		free(st);
-		st = malloc(sz);
-		stSize = st ? sz : 0;
-	}
+	uint8_t* st = scratch_state(s, SCRATCH_DBZ2);
 	if (!st) return "no memory";
 	if (!emu_state_save(s, st)) return "state save failed";
 	emu_layers(s, 0x0C);
 	emu_state_load(s, st);
 	emu_frame(s, 0);
-	memcpy(noBg1, s->fb, sizeof(noBg1));
+	memcpy(noBg1, emu_fb(s), sizeof(noBg1));
 	emu_layers(s, 0x08);
 	emu_state_load(s, st);
 	emu_frame(s, 0);
@@ -2184,10 +2197,10 @@ static const char* dbz2_status_prompts(Emu* s, uint32_t* out, int w, int h) {
 			int cut = 140;
 			for (int y = 124; y < GBA_H && y < h; ++y)
 				if (dbz2_line(out[y * w + x])) cut = y + 2; /* (its dark edge below) */
-			for (int y = cut; y < GBA_H && y < h; ++y) out[y * w + x] = s->fb[y * GBA_W + x];
+			for (int y = cut; y < GBA_H && y < h; ++y) out[y * w + x] = emu_fb(s)[y * GBA_W + x];
 			/* (the icons' tops, over the line's ends: their greys) */
 			for (int y = 124; y < cut && y < h; ++y)
-				if (dbz2_grey(out[y * w + x])) out[y * w + x] = s->fb[y * GBA_W + x];
+				if (dbz2_grey(out[y * w + x])) out[y * w + x] = emu_fb(s)[y * GBA_W + x];
 		}
 	}
 	/* the orange line where the L and R icons covered it: its four rows
@@ -2237,7 +2250,7 @@ static const char* dbz2_compose(Emu* s, const void* state, uint32_t* out, int w,
 		aw_run(s, K_START, 3);
 		if (!aw_settle(s, dbz2_pause_up, 90)) return "neither the map nor the pause menu opened";
 	}
-	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &s->fb[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
+	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &emu_fb(s)[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
 	/* without the prompts that don't apply here (DBZ2-8) */
 	if (map) dbz2_map_prompts(out, w, h);
 	else return dbz2_status_prompts(s, out, w, h);
@@ -2296,11 +2309,11 @@ static const char* bf_compose(Emu* s, const void* state, uint32_t* out, int w, i
 	 * the last map dimmed (BF-8, dimWhenUnavailable) */
 	bool any = false;
 	for (int i = 0; i < GBA_W * GBA_H && !any; ++i) {
-		uint32_t c = s->fb[i];
+		uint32_t c = emu_fb(s)[i];
 		any = (c & 0xFF) > 100 || ((c >> 16) & 0xFF) > 100;
 	}
 	if (!any) return "map button did nothing";
-	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &s->fb[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
+	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &emu_fb(s)[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
 	bf_map_prompts(out, w, h);
 	return NULL;
 }
@@ -2368,10 +2381,10 @@ static bool ml_settle(Emu* s, int max) {
 	for (int f = 0; f < max; ++f) {
 		emu_frame(s, 0);
 		int d = 0;
-		for (int i = 0; i < GBA_W * GBA_H && d <= 200; ++i) d += prev[i] != s->fb[i];
+		for (int i = 0; i < GBA_W * GBA_H && d <= 200; ++i) d += prev[i] != emu_fb(s)[i];
 		still = f && d <= 200 ? still + 1 : 0;
 		if (still >= 8) return true;
-		memcpy(prev, s->fb, sizeof(prev));
+		memcpy(prev, emu_fb(s), sizeof(prev));
 	}
 	return false;
 }
@@ -2421,7 +2434,7 @@ static const char* khc_compose(Emu* s, const void* state, uint32_t* out, int w, 
 	aw_run(s, 0, 90); /* (its rooms all in) */
 	if (emu_cancelled(s)) return "called off";
 	if (!khc_map_up(s)) return "the World Map closed";
-	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &s->fb[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
+	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &emu_fb(s)[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
 	return NULL;
 }
 
@@ -2521,12 +2534,12 @@ static bool eds_named(const EdsRelease* r, Emu* e) {
 	int white = 0, green = 0;
 	if (!r->jp) {
 		for (int y = 151; y < 159; ++y)
-			for (int x = 2; x < 120; ++x) white += (e->fb[y * GBA_W + x] & 0xFFFFFF) == 0xFFFFFF;
+			for (int x = 2; x < 120; ++x) white += (emu_pixel(e, x, y) & 0xFFFFFF) == 0xFFFFFF;
 		return white >= 12;
 	}
 	for (int y = 152; y < 160; ++y)
 		for (int x = 0; x < GBA_W; ++x) {
-			uint32_t c = e->fb[y * GBA_W + x] & 0xFFFFFF;
+			uint32_t c = emu_pixel(e, x, y) & 0xFFFFFF;
 			white += c == 0xFFFFFF;
 			green += c == 0x00FF00;
 		}
@@ -2630,9 +2643,9 @@ static bool eds_wait_view(const EdsRelease* r, Emu* s, int max) {
 			still = 0;
 			continue;
 		}
-		still = still && !memcmp(prev, s->fb, sizeof(prev)) ? still + 1 : 1;
+		still = still && !memcmp(prev, emu_fb(s), sizeof(prev)) ? still + 1 : 1;
 		if (still >= 3) return true;
-		memcpy(prev, s->fb, sizeof(prev));
+		memcpy(prev, emu_fb(s), sizeof(prev));
 	}
 	return false;
 }
@@ -2671,7 +2684,7 @@ static bool eds_target_commands(const EdsRelease* r, Emu* s, const void* state) 
 	if (side != 1 || zone != 0 || col > 4) return false;
 	/* the name in the info bar, to check the same card's reached */
 	static uint32_t bar[8 * 118];
-	for (int y = 0; y < 8; ++y) memcpy(&bar[y * 118], &s->fb[(151 + y) * GBA_W + 2], 118 * sizeof(uint32_t));
+	for (int y = 0; y < 8; ++y) memcpy(&bar[y * 118], &emu_fb(s)[(151 + y) * GBA_W + 2], 118 * sizeof(uint32_t));
 	aw_tap(s, K_B, 1);
 	eds_settle(s);
 	if (!(emu_read8(s, 0x0201D7B8) & 0x08) || emu_read8(s, 0x0201D7D4) != 0 || emu_read8(s, 0x0201D7D8) != 0) return false;
@@ -2686,7 +2699,7 @@ static bool eds_target_commands(const EdsRelease* r, Emu* s, const void* state) 
 	}
 	if (emu_read8(s, 0x0201D7DC) != col || emu_read8(s, 0x0201D7D4) != 1 || !eds_named(r, s)) return false;
 	for (int y = 0; y < 8; ++y)
-		if (memcmp(&bar[y * 118], &s->fb[(151 + y) * GBA_W + 2], 118 * sizeof(uint32_t))) return false;
+		if (memcmp(&bar[y * 118], &emu_fb(s)[(151 + y) * GBA_W + 2], 118 * sizeof(uint32_t))) return false;
 	aw_tap(s, K_A, 1);
 	return eds_wait_commands(r, s, 20);
 }
@@ -2737,7 +2750,7 @@ static const char* eds_compose_for(const EdsRelease* r, Emu* s, const void* stat
 	}
 	if (!eds_view(r, s) && !eds_wait_view(r, s, 60)) return "Card View didn't open";
 	if (emu_cancelled(s)) return "called off";
-	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &s->fb[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
+	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &emu_fb(s)[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
 	return NULL;
 }
 static const char* eds_compose(Emu* s, const void* state, uint32_t* out, int w, int h) {
@@ -2798,7 +2811,7 @@ static bool wct_view(Emu* s) {
 static bool wct_named(Emu* e) {
 	int white = 0;
 	for (int y = 151; y < 159; ++y)
-		for (int x = 2; x < 120; ++x) white += (e->fb[y * GBA_W + x] & 0xFFFFFF) == 0xFFFFFF;
+		for (int x = 2; x < 120; ++x) white += (emu_pixel(e, x, y) & 0xFFFFFF) == 0xFFFFFF;
 	return white >= 12;
 }
 /* in a duel: both players' life points (0 out of a duel for the one that
@@ -2977,7 +2990,7 @@ static bool um6_named(Emu* e) {
 	int n = 0;
 	for (int y = 146; y < 160; ++y)
 		for (int x = 0; x < GBA_W; ++x) {
-			uint32_t c = e->fb[y * GBA_W + x] & 0xFFFFFF;
+			uint32_t c = emu_pixel(e, x, y) & 0xFFFFFF;
 			n += c == 0xFF0000 || c == 0x0000FF; /* (the fb is ABGR: red and blue swap, both are counted) */
 		}
 	return n >= 20;
@@ -3149,7 +3162,7 @@ static uint32_t dmk_virt(Emu* e, uint32_t addr) {
 			/* the cursor's slot and the name bar's pixels (the card under it) */
 			uint32_t h = 2166136261u;
 			for (int y = 128; y < 140; ++y)
-				for (int x = 8; x < 232; x += 2) h = (h ^ (e->fb[y * GBA_W + x] & 0xFFFFFF)) * 16777619u;
+				for (int x = 8; x < 232; x += 2) h = (h ^ (emu_pixel(e, x, y) & 0xFFFFFF)) * 16777619u;
 			k |= (emu_read8(e, 0x0300145A) << 16) | (h & 0xFFFF);
 		}
 		return k;
@@ -3237,7 +3250,7 @@ static bool yw_view(Emu* s) {
 static bool yw_named(Emu* e) {
 	int white = 0;
 	for (int y = 151; y < 159; ++y)
-		for (int x = 2; x < 120; ++x) white += (e->fb[y * GBA_W + x] & 0xFFFFFF) == 0xFFFFFF;
+		for (int x = 2; x < 120; ++x) white += (emu_pixel(e, x, y) & 0xFFFFFF) == 0xFFFFFF;
 	return white >= 12;
 }
 /* the duel's state byte: 8 through the opponent's whole turn (YWC-8) */
@@ -3265,7 +3278,7 @@ static uint32_t yw_virt_for(const YwRelease* r, Emu* e, uint32_t addr) {
 		if (sc == YW_FIELD) {
 			uint32_t h = 2166136261u;
 			for (int y = 151; y < 159; ++y)
-				for (int x = 2; x < 120; ++x) h = (h ^ (e->fb[y * GBA_W + x] & 0xFFFFFF)) * 16777619u;
+				for (int x = 2; x < 120; ++x) h = (h ^ (emu_pixel(e, x, y) & 0xFFFFFF)) * 16777619u;
 			h = (h ^ emu_read8(e, r->state)) * 16777619u; /* a capture again once the state settles */
 			k |= (h & 0x0FFFFFFF);
 		} else if (sc == YW_LIST) k |= emu_read8(e, r->list);
@@ -3430,7 +3443,7 @@ static bool zl_map_up(Emu* s) {
 	return som_probes(s, zlMap, 8, 7, 8);
 }
 static void zl_copy(Emu* s, uint32_t* out, int w, int h) {
-	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &s->fb[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
+	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &emu_fb(s)[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
 }
 /* (0xRRGGBB to the frame buffer's bytes R, G, B) */
 static uint32_t zl_px(uint32_t rgb) {
@@ -3498,7 +3511,7 @@ static const char* zl_message(Emu* s, uint32_t* out, int w, int h) {
 	for (int y = 0; ok && y < ZL_MSG_H; ++y) {
 		if (y0 + y < 0 || y0 + y >= h) continue;
 		for (int x = 0; x < GBA_W; ++x)
-			if (x0 + x >= 0 && x0 + x < w) out[(y0 + y) * w + x0 + x] = s->fb[(ZL_MSG_Y + y) * GBA_W + x] | 0xFF000000;
+			if (x0 + x >= 0 && x0 + x < w) out[(y0 + y) * w + x0 + x] = emu_fb(s)[(ZL_MSG_Y + y) * GBA_W + x] | 0xFF000000;
 	}
 	emu_layers(s, 0x1F);
 	emu_state_load(s, st);
@@ -3607,7 +3620,7 @@ static void ml_no_prompts(Emu* s, uint32_t* out, int w, int h) {
 	static uint16_t saved[32 * 32];
 	for (int i = 0; i < 32 * 32; ++i) saved[i] = emu_read16(s, map + i * 2), emu_write16(s, map + i * 2, 0);
 	emu_frame(s, 0);
-	memcpy(bare, s->fb, sizeof(bare));
+	memcpy(bare, emu_fb(s), sizeof(bare));
 	for (int i = 0; i < 32 * 32; ++i) emu_write16(s, map + i * 2, saved[i]);
 	/* the glass's colours, from its left edge (dark, -, highlight, light,
 	 * medium; b a step in from row 52's) */
@@ -3650,19 +3663,19 @@ static const char* ml_compose(Emu* s, const void* state, uint32_t* const* out, i
 	if (!ml_settle(s, 150)) return "Bros. Info didn't settle";
 	if (!ml_bros_info(s)) return "not Bros. Info";
 	if (!luigi) {
-		ml_page(s->fb, out[0], w, h);
+		ml_page(emu_fb(s), out[0], w, h);
 		ml_no_prompts(s, out[0], w, h);
 		return NULL;
 	}
 	/* Luigi in front: R (the portrait turns round), until the page changes */
 	static uint32_t first[GBA_W * GBA_H];
-	memcpy(first, s->fb, sizeof(first));
+	memcpy(first, emu_fb(s), sizeof(first));
 	for (int tries = 0; tries < 3; ++tries) {
 		aw_tap(s, K_R, 1);
 		aw_run(s, 0, 20); /* (the turn: 12 frames) */
 		if (!ml_settle(s, 150) || !ml_bros_info(s)) break;
-		if (memcmp(first, s->fb, sizeof(first))) {
-			ml_page(s->fb, out[0], w, h);
+		if (memcmp(first, emu_fb(s), sizeof(first))) {
+			ml_page(emu_fb(s), out[0], w, h);
 			ml_no_prompts(s, out[0], w, h);
 			return NULL;
 		}
@@ -3901,7 +3914,7 @@ static const char* hm_compose(Emu* s, const void* state, uint32_t* out, int w, i
 	bool up = hm_map_up(s);
 	emu_hide_sprites(s, NULL, 0);
 	if (!up) return "the map went away";
-	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &s->fb[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
+	for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[y * w], &emu_fb(s)[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
 	return NULL;
 }
 
@@ -4048,7 +4061,7 @@ static const char* gs_compose(Emu* s, const void* state, uint32_t* const* out, i
 		for (int i = 0; i < who && i < 8; ++i) aw_run(s, K_R, 6), aw_run(s, 0, 16);
 		aw_run(s, 0, 10);
 		if (emu_cancelled(s)) return "called off";
-		for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[0][y * w], &s->fb[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
+		for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[0][y * w], &emu_fb(s)[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
 		gs_no_help(out[0], w);
 		*nOut = 1;
 		return NULL;
@@ -4081,11 +4094,11 @@ static const char* gs_compose(Emu* s, const void* state, uint32_t* const* out, i
 			 * ran on to the most there can be; another member's differs
 			 * by thousands) */
 			int diff = 0;
-			for (int i = 40 * GBA_W; i < GBA_W * GBA_H; ++i) diff += (s->fb[i] & 0xFFFFFF) != (page[0][i] & 0xFFFFFF);
+			for (int i = 40 * GBA_W; i < GBA_W * GBA_H; ++i) diff += (emu_fb(s)[i] & 0xFFFFFF) != (page[0][i] & 0xFFFFFF);
 			if (diff < 100) break;
 		}
 		if (emu_cancelled(s)) return "called off";
-		memcpy(page[n], s->fb, sizeof(page[n]));
+		memcpy(page[n], emu_fb(s), sizeof(page[n]));
 	}
 	*nOut = n;
 	for (int k = 0; k < n; ++k) {
@@ -4231,7 +4244,7 @@ static const char* gs2_compose(Emu* s, const void* state, uint32_t* const* out, 
 		aw_run(s, 0, 10);
 		if (emu_cancelled(s)) return "called off";
 		if (emu_read8(s, a->bstat) != 1) return "the battle's Status closed";
-		for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[0][y * w], &s->fb[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
+		for (int y = 0; y < h && y < GBA_H; ++y) memcpy(&out[0][y * w], &emu_fb(s)[y * GBA_W], (w < GBA_W ? w : GBA_W) * sizeof(uint32_t));
 		gs_no_help(out[0], w);
 		gs2_black_corners(out[0], w, false);
 		*nOut = 1;
@@ -4262,11 +4275,11 @@ static const char* gs2_compose(Emu* s, const void* state, uint32_t* const* out, 
 			/* round to the first again: the stats panel as on the first
 			 * page, but for a few pixels (as in Golden Sun) */
 			int diff = 0;
-			for (int i = 40 * GBA_W; i < GBA_W * GBA_H; ++i) diff += (s->fb[i] & 0xFFFFFF) != (page[0][i] & 0xFFFFFF);
+			for (int i = 40 * GBA_W; i < GBA_W * GBA_H; ++i) diff += (emu_fb(s)[i] & 0xFFFFFF) != (page[0][i] & 0xFFFFFF);
 			if (diff < 100) break;
 		}
 		if (emu_cancelled(s)) return "called off";
-		memcpy(page[n], s->fb, sizeof(page[n]));
+		memcpy(page[n], emu_fb(s), sizeof(page[n]));
 	}
 	*nOut = n;
 	for (int k = 0; k < n; ++k) {
@@ -4454,19 +4467,16 @@ static bool to_bbox(const uint32_t* fb, uint32_t c, int x0, int y0, int x1, int 
  * the prompt at the bottom right has no box); then BG2 and BG3 drawn,
  * into out. */
 static bool to_cut_boxes(Emu* s, uint32_t* out, int r[2][4]) {
-	static uint8_t* tmp;
-	static size_t tmpSize;
-	size_t sz = emu_state_size(s);
-	if (sz > tmpSize) free(tmp), tmp = malloc(sz), tmpSize = tmp ? sz : 0;
+	uint8_t* tmp = scratch_state(s, SCRATCH_TO);
 	if (!tmp || !emu_state_save(s, tmp)) return false;
 	emu_layers(s, 0x08);
 	emu_state_load(s, tmp);
 	emu_frame(s, 0);
-	bool ok = to_bbox(s->fb, 0x181810, 0, 0, GBA_W - 1, 79, r[0]) && to_bbox(s->fb, 0x181810, 0, 100, 119, GBA_H - 1, r[1]); /* (XBGR) */
+	bool ok = to_bbox(emu_fb(s), 0x181810, 0, 0, GBA_W - 1, 79, r[0]) && to_bbox(emu_fb(s), 0x181810, 0, 100, 119, GBA_H - 1, r[1]); /* (XBGR) */
 	emu_layers(s, 0x0C);
 	emu_state_load(s, tmp);
 	emu_frame(s, 0);
-	if (ok) memcpy(out, s->fb, GBA_W * GBA_H * 4);
+	if (ok) memcpy(out, emu_fb(s), GBA_W * GBA_H * 4);
 	emu_layers(s, 0x1F);
 	emu_state_load(s, tmp);
 	emu_frame(s, 0);
@@ -4481,13 +4491,13 @@ static bool to_cut_boxes(Emu* s, uint32_t* out, int r[2][4]) {
  * where R's menu opens on the field (TO-5): 0, or (just after the enemy's
  * phase, the player's has its banner up for ~4 seconds and moves the
  * cursor to the leader, R doing nothing meanwhile) up to 4.5 seconds on,
- * so the turn's first picture comes with it (TO-13). -1: not there. */
-static int to_field_ready(Emu* s, const void* state) {
-	if (!emu_state_load(s, state)) return -1;
-	emu_frame(s, 0);
+ * so the turn's first picture comes with it (TO-13). -1: not there.
+ * From the state's first frame, where to_compose_ leaves the copy; every
+ * caller loads the state again after, so none of these frames is drawn. */
+static int to_field_ready(Emu* s) {
 	bool enemy = emu_read8(s, TO_PHASE(s)) & 0x80;
-	aw_run(s, K_R, 6);
-	aw_run(s, 0, 34);
+	aw_run_blind(s, K_R, 6);
+	aw_run_blind(s, 0, 34);
 	if (emu_read8(s, TO_MENU_UP(s)) == 2) return 0;
 	if (enemy || !toAfterEnemy) return -1;
 	/* (one run on, R every 40 frames, until its menu opens: the guests'
@@ -4495,8 +4505,8 @@ static int to_field_ready(Emu* s, const void* state) {
 	 * restart for each) */
 	for (int extra = 40; extra <= 280; extra += 40) {
 		if (emu_cancelled(s) || (emu_read8(s, TO_PHASE(s)) & 0x80)) return -1;
-		aw_run(s, K_R, 6);
-		aw_run(s, 0, 34);
+		aw_run_blind(s, K_R, 6);
+		aw_run_blind(s, 0, 34);
 		if (emu_read8(s, TO_MENU_UP(s)) == 2) return extra;
 	}
 	return -1;
@@ -4615,7 +4625,7 @@ static const char* to_world_map(Emu* s, uint32_t* page, int* nOut) {
 	/* (the world map itself under the HELP box too: the opening's
 	 * birthdate question, before the world map, has a box of its shape) */
 	if (!som_probes(s, toWorldMap, 12, 10, 8)) return "not the world map";
-	if (!to_help_up(s->fb)) {
+	if (!to_help_up(emu_fb(s))) {
 		if (emu_read8(s, TO_WM_HOVER) == 0xFF) {
 			uint16_t oam[512];
 			emu_oam_read(s, oam);
@@ -4636,15 +4646,15 @@ static const char* to_world_map(Emu* s, uint32_t* page, int* nOut) {
 			if (emu_read8(s, TO_WM_HOVER) == 0xFF) return "the flag's location wasn't found";
 		}
 		aw_run(s, K_SELECT, 6);
-		for (int f = 0; f < 60 && !to_help_up(s->fb); ++f) emu_frame(s, 0);
+		for (int f = 0; f < 60 && !to_help_up(emu_fb(s)); ++f) emu_frame(s, 0);
 		aw_run(s, 0, 10);
-		if (!to_help_up(s->fb)) return "no HELP box";
+		if (!to_help_up(emu_fb(s))) return "no HELP box";
 	}
 	if (emu_cancelled(s)) return "called off";
 	memset(page, 0, GBA_W * GBA_H * 4);
 	int h = TO_HELP_Y1 - TO_HELP_Y0 + 1, y0 = (GBA_H - h) / 2;
 	for (int y = 0; y < h; ++y)
-		memcpy(&page[(y0 + y) * GBA_W + TO_HELP_X0], &s->fb[(TO_HELP_Y0 + y) * GBA_W + TO_HELP_X0], (TO_HELP_X1 - TO_HELP_X0 + 1) * 4);
+		memcpy(&page[(y0 + y) * GBA_W + TO_HELP_X0], &emu_fb(s)[(TO_HELP_Y0 + y) * GBA_W + TO_HELP_X0], (TO_HELP_X1 - TO_HELP_X0 + 1) * 4);
 	*nOut = 1;
 	return NULL;
 }
@@ -4662,9 +4672,9 @@ static const char* to_detail_pages(Emu* s, uint32_t (*page)[GBA_W * GBA_H], int 
 			aw_run(s, keys[n], 4);
 			aw_run(s, 0, n == 2 ? 50 : 20);
 		}
-		if (!to_details_up(s->fb) && n < 2) return "the details closed";
+		if (!to_details_up(emu_fb(s)) && n < 2) return "the details closed";
 		if (emu_cancelled(s)) return "called off";
-		memcpy(page[n], s->fb, sizeof(page[n]));
+		memcpy(page[n], emu_fb(s), sizeof(page[n]));
 	}
 	*nOut = n;
 	return NULL;
@@ -4674,17 +4684,17 @@ static const char* to_detail_pages(Emu* s, uint32_t (*page)[GBA_W * GBA_H], int 
  * then a fade of 6 */
 static bool to_wait_details(Emu* s) {
 	bool up = false;
-	for (int f = 0; f < 90 && !(up = to_details_up(s->fb)); ++f) emu_frame(s, 0);
+	for (int f = 0; f < 90 && !(up = to_details_up(emu_fb(s))); ++f) emu_frame(s, 0);
 	if (!up) return false;
 	aw_run(s, 0, 16);
-	return to_details_up(s->fb);
+	return to_details_up(emu_fb(s));
 }
 
 /* Organize (TO-11): the details of the unit the roster's cursor is on (A).
  * Opened in the game: back (B) to the roster and in again, so they start
  * on the first page. */
 static const char* to_organize(Emu* s, uint32_t (*page)[GBA_W * GBA_H], int max, int* nOut) {
-	if (to_details_up(s->fb)) {
+	if (to_details_up(emu_fb(s))) {
 		aw_run(s, K_B, 6);
 		if (!to_wait_list(s, 90)) return "the roster didn't come back";
 		aw_run(s, 0, 10);
@@ -4726,10 +4736,10 @@ static const char* to_compose_(Emu* s, const void* state, uint32_t* const* out, 
 		int n = 0;
 		/* (the roster between two of its pages, or a screen on its way:
 		 * a moment for it, rather than the logo, TO-12) */
-		for (int f = 0; f < 30 && !to_list_up(s) && !to_details_up(s->fb) &&
+		for (int f = 0; f < 30 && !to_list_up(s) && !to_details_up(emu_fb(s)) &&
 		                som_probes(s, toWorldMap, 12, 10, 8) == false; ++f)
 			emu_frame(s, 0);
-		const char* err = to_list_up(s) || to_details_up(s->fb) ? to_organize(s, page, max, &n) : to_world_map(s, page[0], &n);
+		const char* err = to_list_up(s) || to_details_up(emu_fb(s)) ? to_organize(s, page, max, &n) : to_world_map(s, page[0], &n);
 		if (err) return err;
 		*nOut = n;
 		for (int k = 0; k < n; ++k) {
@@ -4744,18 +4754,18 @@ static const char* to_compose_(Emu* s, const void* state, uint32_t* const* out, 
 	 * BLDCNT darkening, 0x00FF): B there wouldn't open the details yet. The
 	 * last pictures stay; the next refresh takes them (TO-5). */
 	if ((emu_io16(s, 0x50) & 0xC0) >= 0x80) return "the field is fading in";
-	/* (the box comes 2 frames after the darkening ends: 4 more) */
-	aw_run(s, 0, 4);
 	int n = 0;
 	const char* err;
-	int extra = to_field_ready(s, state);
+	int extra = to_field_ready(s);
 	if (extra < 0) return "R's menu didn't open";
 	if (!to_field_back(s, state, extra)) return "state load failed";
 	/* (the unit on the cursor's square: 0 while a screen closes, until the
 	 * field is back; R's menu opened on it, so a few frames on it is) */
-	for (int f = 0; f < 40 && !to_on_unit(s); ++f) emu_frame(s, 0);
+	int waited = 0;
+	for (; waited < 40 && !to_on_unit(s); ++waited) emu_frame_blind(s, 0);
 	bool onUnit = to_on_unit(s);
-	if (!to_field_back(s, state, extra)) return "state load failed";
+	/* (with no frame waited the copy is where loading again would put it; to_aims loads it itself) */
+	if (onUnit && waited && !to_field_back(s, state, extra)) return "state load failed";
 	if (!onUnit) {
 		/* an empty square: the battle's conditions (TO-9) */
 		err = to_aims(s, state, extra, page[0], &n);
@@ -5066,6 +5076,10 @@ static const MmbnNet* mmbn_net(const Emu* e) {
 }
 static const MmbnNet* mmbnN = &mmbnNet[0]; /* the live game's, set as a map is asked for */
 #define MMBN_SETTLE 4           /* frames from setting him down to the screen drawn */
+#define MMBN_Z 3                /* the view's pixel: the mean of MMBN_Z x MMBN_Z of the map's */
+#define MMBN_PAD (MMBN_Z - 1)   /* the map has this many blank pixels before its first row and column: where the first windows start */
+/* the map's pixel (x, y), from -MMBN_PAD */
+#define MMBN_PX(m, x, y) ((m)->px[(size_t) ((y) + MMBN_PAD) * ((m)->w + MMBN_PAD) + (x) + MMBN_PAD])
 typedef struct {
 	uint16_t area;
 	bool done, failed, early; /* early: the camera wasn't following him yet */
@@ -5141,16 +5155,16 @@ static void mmbn_head(Emu* e, uint16_t area, uint32_t pos, MmbnMap* m, uint32_t 
 	int top = -1, wid[16] = { 0 };
 	for (int r = fy - 48; r < fy && top < 0; ++r)
 		for (int c = fx - 12; c < fx + 12; ++c)
-			if ((e->fb[r * GBA_W + c] & 0xFFFFFF) != magenta) top = r;
+			if ((emu_fb(e)[r * GBA_W + c] & 0xFFFFFF) != magenta) top = r;
 	if (top < 0) return;
 	int h = 0, widest = 0;
 	for (; h < 16 && top + h < fy; ++h) {
-		for (int c = fx - 12; c < fx + 12; ++c) wid[h] += (e->fb[(top + h) * GBA_W + c] & 0xFFFFFF) != magenta;
+		for (int c = fx - 12; c < fx + 12; ++c) wid[h] += (emu_fb(e)[(top + h) * GBA_W + c] & 0xFFFFFF) != magenta;
 		if (wid[h] > widest) widest = wid[h];
 		/* (the chin: narrower than the widest, and the next row wider) */
 		if (h > 4 && wid[h] < widest && h + 1 < 16) {
 			int next = 0;
-			for (int c = fx - 12; c < fx + 12; ++c) next += (e->fb[(top + h + 1) * GBA_W + c] & 0xFFFFFF) != magenta;
+			for (int c = fx - 12; c < fx + 12; ++c) next += (emu_fb(e)[(top + h + 1) * GBA_W + c] & 0xFFFFFF) != magenta;
 			if (next > wid[h]) {
 				++h;
 				break;
@@ -5159,10 +5173,80 @@ static void mmbn_head(Emu* e, uint16_t area, uint32_t pos, MmbnMap* m, uint32_t 
 	}
 	for (int r = 0; r < h; ++r)
 		for (int c = 0; c < 24; ++c) {
-			uint32_t px = e->fb[(top + r) * GBA_W + fx - 12 + c] & 0xFFFFFF;
+			uint32_t px = emu_fb(e)[(top + r) * GBA_W + fx - 12 + c] & 0xFFFFFF;
 			m->head[r * 24 + c] = px == magenta ? 0 : px | 0xFF000000;
 		}
 	m->headW = 24, m->headH = h, m->headDown = fy - top;
+}
+
+static int mmbn_floor_z(int v) {
+	return v >= 0 ? v / MMBN_Z : -((MMBN_Z - 1 - v) / MMBN_Z);
+}
+
+/* A finished row holds its windows grouped by the start's x modulo Z, each group in order of x: the group's first start (0, then
+ * -2, -1: the first from -MMBN_PAD up) and where it begins. */
+static int mmbn_group(int w, int a, int* first) {
+	int begin = 0;
+	for (int g = 0; g < a; ++g) begin += (w - 1 - (g ? g - MMBN_Z : 0)) / MMBN_Z + 1;
+	*first = a ? a - MMBN_Z : 0;
+	return begin;
+}
+
+/* The means a view needs, made once the map is done, over the map itself: the Z x Z window starting at each pixel (what is off the
+ * map counts as 0), row after row (a window only reads pixels not yet written over), each row put in the order above. */
+static bool mmbn_means(MmbnMap* m) {
+	const int w = m->w, h = m->h, stride = w + 2 * MMBN_Z;
+	/* a row's channels packed 21 bits apart (a window's sums fit), then its sums over Z pixels: the last Z rows' */
+	uint64_t* line = calloc((size_t) (1 + MMBN_Z) * stride, sizeof(uint64_t));
+	if (!line) return false;
+	uint64_t* row[MMBN_Z];
+	for (int k = 0; k < MMBN_Z; ++k) row[k] = line + (size_t) (1 + k) * stride;
+	int first[MMBN_Z], begin[MMBN_Z];
+	for (int a = 0; a < MMBN_Z; ++a) begin[a] = mmbn_group(w, a, &first[a]);
+	const unsigned n = MMBN_Z * MMBN_Z;
+	for (int y = -MMBN_PAD; y < h; ++y) {
+		int r = y + MMBN_PAD; /* (this row joins the rows kept, the oldest leaves) */
+		memset(line, 0, (size_t) stride * sizeof(uint64_t));
+		for (int x = 0; r < h && x < w; ++x) {
+			uint32_t c = MMBN_PX(m, x, r);
+			line[x + MMBN_PAD] = (c & 0xFF) | (uint64_t) (c >> 8 & 0xFF) << 21 | (uint64_t) (c >> 16 & 0xFF) << 42;
+		}
+		uint64_t* sum = row[r % MMBN_Z];
+		for (int x = 0; x < w + MMBN_PAD; ++x) {
+			sum[x] = 0;
+			for (int k = 0; k < MMBN_Z; ++k) sum[x] += line[x + k];
+		}
+		uint32_t* dst = &MMBN_PX(m, -MMBN_PAD, y);
+		for (int x = -MMBN_PAD; x < w; ++x) {
+			uint64_t t = 0;
+			for (int k = 0; k < MMBN_Z; ++k) t += row[k][x + MMBN_PAD];
+			int a = (x + MMBN_Z) % MMBN_Z;
+			dst[begin[a] + (x - first[a]) / MMBN_Z] =
+			    0xFF000000 | (uint32_t) (t >> 42) / n << 16 | (uint32_t) (t >> 21 & 0x1FFFFF) / n << 8 | (uint32_t) (t & 0x1FFFFF) / n;
+		}
+	}
+	free(line);
+	return true;
+}
+
+/* The view for the windows starting at (left + Z x, top + Z y): runs of the rows' groups, black where a window is off the map. */
+static void mmbn_view(const MmbnMap* m, int left, int top, uint32_t* out) {
+	int first, begin = mmbn_group(m->w, left - MMBN_Z * mmbn_floor_z(left), &first);
+	/* the columns whose windows touch the map: starting from -MMBN_PAD up to its last pixel */
+	int x0 = -mmbn_floor_z(left + MMBN_PAD), x1 = mmbn_floor_z(m->w - 1 - left) + 1;
+	x0 = x0 < 0 ? 0 : x0 > GBA_W ? GBA_W : x0;
+	x1 = x1 < x0 ? x0 : x1 > GBA_W ? GBA_W : x1;
+	for (int oy = 0; oy < GBA_H; ++oy) {
+		uint32_t* dst = out + oy * GBA_W;
+		int py = top + oy * MMBN_Z;
+		if (py < -MMBN_PAD || py >= m->h) {
+			for (int ox = 0; ox < GBA_W; ++ox) dst[ox] = 0xFF000000;
+			continue;
+		}
+		for (int ox = 0; ox < x0; ++ox) dst[ox] = 0xFF000000;
+		if (x1 > x0) memcpy(dst + x0, &MMBN_PX(m, -MMBN_PAD, py) + begin + (left + MMBN_Z * x0 - first) / MMBN_Z, (size_t) (x1 - x0) * sizeof(uint32_t));
+		for (int ox = x1; ox < GBA_W; ++ox) dst[ox] = 0xFF000000;
+	}
 }
 
 static void* mmbn_worker(void* arg) {
@@ -5182,7 +5266,7 @@ static void* mmbn_worker(void* arg) {
 	int W = m->w, H = m->h, X0 = m->x0, Y0 = m->y0, cx, cy;
 	/* the copy's magenta, as its renderer puts it out */
 	if (!mmbn_look(e, area, pos, X0 + W / 2, Y0 + H / 2, 0, &cx, &cy) && (why = "he can't be set down")) goto out;
-	uint32_t magenta = e->fb[0] & 0xFFFFFF;
+	uint32_t magenta = emu_fb(e)[0] & 0xFFFFFF;
 	/* (arriving on a warp pad, he steps off it by himself, the camera
 	 * following that, not where he's set down: tried again later) */
 	int hz = (int32_t) emu_read32(e, pos + 8) >> 16; /* (his height, if the floor there lifts him) */
@@ -5197,7 +5281,7 @@ static void* mmbn_worker(void* arg) {
 		for (int k = 0; k < 9 && !mmbnStop; ++k) {
 			if (!mmbn_look(e, area, pos, X0 + W * (1 + k % 3) / 4, Y0 + H * (1 + k / 3) / 4, 1u << L, &cx, &cy)) continue;
 			for (int i = 0; i < GBA_W * GBA_H; ++i) {
-				if ((e->fb[i] & 0xFFFFFF) == magenta) ++clear;
+				if ((emu_fb(e)[i] & 0xFFFFFF) == magenta) ++clear;
 				else ++drawn;
 			}
 		}
@@ -5214,7 +5298,7 @@ static void* mmbn_worker(void* arg) {
 					bool need = false;
 					for (int y = ty - GBA_H / 2; y < ty + GBA_H / 2 && !need; y += 4)
 						for (int x = tx - GBA_W / 2; x < tx + GBA_W / 2 && !need; x += 4)
-							need = x >= X0 && y >= Y0 && x < X0 + W && y < Y0 + H && !m->px[(size_t) (y - Y0) * W + x - X0];
+							need = x >= X0 && y >= Y0 && x < X0 + W && y < Y0 + H && !MMBN_PX(m, x - X0, y - Y0);
 					if (!need) continue;
 					tx += 24, ty += 16;
 				}
@@ -5230,9 +5314,9 @@ static void* mmbn_worker(void* arg) {
 					for (int sx = 0; sx < GBA_W; ++sx) {
 						int qx = cx - GBA_W / 2 + sx - X0;
 						if (qx < 0 || qx >= W) continue;
-						uint32_t c = e->fb[sy * GBA_W + sx] & 0xFFFFFF;
+						uint32_t c = emu_fb(e)[sy * GBA_W + sx] & 0xFFFFFF;
 						/* (transparent: black, but marked seen) */
-						m->px[(size_t) py * W + qx] = c == magenta ? 0xFE000000 : c | 0xFF000000;
+						MMBN_PX(m, qx, py) = c == magenta ? 0xFE000000 : c | 0xFF000000;
 					}
 				}
 			}
@@ -5242,7 +5326,7 @@ static void* mmbn_worker(void* arg) {
 		m->ex0 = W, m->ey0 = H, m->ex1 = m->ey1 = 0;
 		for (int y = 0; y < H; ++y)
 			for (int x = 0; x < W; ++x)
-				if (m->px[(size_t) y * W + x] >> 24 == 0xFF) {
+				if (MMBN_PX(m, x, y) >> 24 == 0xFF) {
 					if (x < m->ex0) m->ex0 = x;
 					if (x >= m->ex1) m->ex1 = x + 1;
 					if (y < m->ey0) m->ey0 = y;
@@ -5250,7 +5334,8 @@ static void* mmbn_worker(void* arg) {
 				}
 		if (m->ex1 <= m->ex0) m->ex0 = 0, m->ey0 = 0, m->ex1 = W, m->ey1 = H;
 		mmbn_head(e, area, pos, m, magenta);
-		m->done = true;
+		if (!mmbn_means(m) && (why = "no memory for its view")) goto out;
+		__atomic_store_n(&m->done, true, __ATOMIC_RELEASE); /* (the view reads the means once it sees this) */
 		struct timespec t1;
 		clock_gettime(CLOCK_MONOTONIC, &t1);
 		fprintf(stderr, "%s: area %04X mapped (%dx%d, layers %X, %ld ms)\n", N->title, area, W, H, layers,
@@ -5258,7 +5343,8 @@ static void* mmbn_worker(void* arg) {
 	}
 out:
 	if (why) {
-		m->done = m->failed = true;
+		m->failed = true;
+		__atomic_store_n(&m->done, true, __ATOMIC_RELEASE);
 		/* (always logged: why the second screen keeps the logo on the net) */
 		fprintf(stderr, "%s: area %04X not mapped: %s\n", N->title, m->area, why);
 	}
@@ -5299,7 +5385,7 @@ static const uint32_t* mmbn_live_view(Emu* live, const char* rom) {
 		if (tw < 30 || th < 20) return NULL;
 		m->area = area;
 		m->w = tw * 8, m->h = th * 8, m->x0 = -tw * 4, m->y0 = -th * 4;
-		if (!(m->px = calloc((size_t) m->w * m->h, 4))) {
+		if (!(m->px = calloc((size_t) (m->w + MMBN_PAD) * (m->h + MMBN_PAD), 4))) {
 			memset(m, 0, sizeof(*m));
 			return NULL;
 		}
@@ -5329,12 +5415,12 @@ static const uint32_t* mmbn_live_view(Emu* live, const char* rom) {
 		}
 		return NULL;
 	}
-	if (m->failed || !m->done) return NULL; /* (the logo meanwhile: it's quick) */
+	if (!__atomic_load_n(&m->done, __ATOMIC_ACQUIRE) || m->failed) return NULL; /* (the logo meanwhile: it's quick) */
 	/* a third of the size: each pixel the mean of 3x3 of the picture's,
 	 * centred on MegaMan (his screen position: x + y, (y - x) / 2 - z), but
 	 * kept within the area's edges; an area smaller than the screen in
 	 * its middle */
-	enum { Z = 3 };
+	enum { Z = MMBN_Z };
 	int camx = (int16_t) emu_read16(live, N->cam + 4), camy = (int16_t) emu_read16(live, N->cam + 6);
 	uint32_t pos = emu_read32(live, N->cam + 0x10);
 	if (pos >= 0x02000000 && pos < 0x02040000) {
@@ -5349,22 +5435,7 @@ static const uint32_t* mmbn_live_view(Emu* live, const char* rom) {
 	if (m->ey1 - m->ey0 <= GBA_H * Z) top = (m->ey0 + m->ey1) / 2 - GBA_H * Z / 2;
 	else if (top < m->ey0) top = m->ey0;
 	else if (top > m->ey1 - GBA_H * Z) top = m->ey1 - GBA_H * Z;
-	for (int oy = 0; oy < GBA_H; ++oy) {
-		int py = top + oy * Z;
-		for (int ox = 0; ox < GBA_W; ++ox) {
-			int qx = left + ox * Z;
-			unsigned r = 0, g = 0, b = 0;
-			for (int dy = 0; dy < Z; ++dy) {
-				if (py + dy < 0 || py + dy >= m->h) continue;
-				for (int dx = 0; dx < Z; ++dx) {
-					if (qx + dx < 0 || qx + dx >= m->w) continue;
-					uint32_t c = m->px[(size_t) (py + dy) * m->w + qx + dx];
-					r += c & 0xFF, g += (c >> 8) & 0xFF, b += (c >> 16) & 0xFF;
-				}
-			}
-			out[oy * GBA_W + ox] = 0xFF000000 | (b / (Z * Z)) << 16 | (g / (Z * Z)) << 8 | r / (Z * Z);
-		}
-	}
+	mmbn_view(m, left, top, out);
 	/* his head where he stands, at the game's size: centred on where his
 	 * sprite, at a third, would be */
 	if (m->headH) {
@@ -5378,21 +5449,32 @@ static const uint32_t* mmbn_live_view(Emu* live, const char* rom) {
 	return out;
 }
 
+static void bgd_live_end(void);
+
+/* The game's over: the map's worker stopped, and its copy of the game (a whole machine and a share of the ROM) and
+ * its state closed, which kept about 20 MiB of the heap for the rest of the run. */
+void profile_live_end(void) {
+	mmbnStop = true;
+	if (mmbnThread) pthread_join(mmbnThread, NULL), mmbnThread = 0;
+	if (mmbnEmuOpen) emu_close(&mmbnEmu), mmbnEmuOpen = false;
+	free(mmbnJob);
+	mmbnJob = NULL;
+	mmbnJobSize = 0;
+	free(mmbnMap.px);
+	memset(&mmbnMap, 0, sizeof(mmbnMap));
+	mmbnBusy = false;
+	for (int i = 0; i < SCRATCH_N; ++i) free(scratch[i].p);
+	memset(scratch, 0, sizeof(scratch));
+	bgd_live_end();
+}
+
 /* A state of the hidden copy's for a composer that takes the picture apart and
  * puts the copy back: as large as the emulator's states (armGBA's are larger
  * than mGBA's; a fixed buffer of mGBA's size failed every capture there, or
  * was written past). Two (slot 0 and 1); composers run one at a time, on the
  * capture's thread. */
 static uint8_t* compose_state(Emu* s, int slot) {
-	static uint8_t* buf[2];
-	static size_t cap[2];
-	size_t n = emu_state_size(s);
-	if (n > cap[slot]) {
-		free(buf[slot]);
-		buf[slot] = malloc(n);
-		cap[slot] = buf[slot] ? n : 0;
-	}
-	return buf[slot];
+	return scratch_state(s, SCRATCH_COMPOSE + slot);
 }
 
 static const char* mmbn_compose(Emu* s, const void* state, uint32_t* out, int w, int h) {
@@ -5418,7 +5500,7 @@ static const char* mmbn_compose(Emu* s, const void* state, uint32_t* out, int w,
 	emu_state_load(s, tmp); /* (the layers take effect as the display registers are loaded) */
 	emu_frame(s, 0);
 	static uint32_t money[32 * GBA_W];
-	memcpy(money, s->fb, sizeof(money));
+	memcpy(money, emu_fb(s), sizeof(money));
 	emu_layers(s, 0x1F);
 	emu_state_load(s, tmp); /* every layer back on */
 	if (emu_cancelled(s)) return "called off";
@@ -5442,13 +5524,13 @@ static const char* mmbn_compose(Emu* s, const void* state, uint32_t* out, int w,
 	/* the panel, then the cursor arrow (BG2, left of the armor and the
 	 * stats) from a frame drawn without BG2 there: the panel's grid (BG1) */
 	static uint32_t panel[MMBN_PANEL_ROWS * GBA_W];
-	memcpy(panel, s->fb, sizeof(panel));
+	memcpy(panel, emu_fb(s), sizeof(panel));
 	if (!emu_state_save(s, tmp)) return "state save failed";
 	emu_layers(s, 0x1B);
 	emu_state_load(s, tmp);
 	emu_frame(s, 0);
 	for (int y = 20; y < MMBN_PANEL_ROWS; ++y) {
-		for (int x = 112; x <= 139; ++x) panel[y * GBA_W + x] = s->fb[y * GBA_W + x];
+		for (int x = 112; x <= 139; ++x) panel[y * GBA_W + x] = emu_fb(s)[y * GBA_W + x];
 	}
 	emu_layers(s, 0x1F);
 	emu_state_load(s, tmp); /* every layer back on */
@@ -5543,7 +5625,7 @@ static const char* mmbn2_compose(Emu* s, const void* state, uint32_t* out, int w
 	emu_state_load(s, tmp); /* (the layers take effect as the display registers are loaded) */
 	emu_frame(s, 0);
 	static uint32_t box[MMBN2_BOX_H * GBA_W];
-	memcpy(box, s->fb, sizeof(box));
+	memcpy(box, emu_fb(s), sizeof(box));
 	emu_layers(s, 0x1F);
 	emu_state_load(s, tmp); /* every layer back on */
 	if (emu_cancelled(s)) return "called off";
@@ -5571,15 +5653,15 @@ static const char* mmbn2_compose(Emu* s, const void* state, uint32_t* out, int w
 	 * without sprites there (MegaMan's are left of it) */
 	static uint32_t panel[MMBN_PANEL_ROWS * GBA_W];
 	uint8_t* tmp2 = compose_state(s, 1);
-	memcpy(panel, s->fb, sizeof(panel));
+	memcpy(panel, emu_fb(s), sizeof(panel));
 	if (!emu_state_save(s, tmp)) return "state save failed";
 	int dark[2] = { 0, 0 };
 	for (int i = 0; i < MMBN_PANEL_ROWS * GBA_W; ++i) dark[0] += (panel[i] & 0xFFFFFF) == MMBN2_LIGHT;
 	aw_run(s, 0, 8);
 	if (emu_cancelled(s)) return "called off";
-	for (int i = 0; i < MMBN_PANEL_ROWS * GBA_W; ++i) dark[1] += (s->fb[i] & 0xFFFFFF) == MMBN2_LIGHT;
+	for (int i = 0; i < MMBN_PANEL_ROWS * GBA_W; ++i) dark[1] += (emu_fb(s)[i] & 0xFFFFFF) == MMBN2_LIGHT;
 	if (dark[1] > dark[0] && mmbn2_megaman_up(s) && som_probes(s, mmbn2Panel, 8, 8, 8)) {
-		memcpy(panel, s->fb, sizeof(panel));
+		memcpy(panel, emu_fb(s), sizeof(panel));
 		if (!tmp2 || !emu_state_save(s, tmp2)) return "state save failed";
 		memcpy(tmp, tmp2, emu_state_size(s));
 	}
@@ -5587,7 +5669,7 @@ static const char* mmbn2_compose(Emu* s, const void* state, uint32_t* out, int w
 	emu_state_load(s, tmp);
 	emu_frame(s, 0);
 	for (int y = MMBN2_CURSOR_Y0; y < MMBN_PANEL_ROWS; ++y)
-		for (int x = MMBN2_CURSOR_X0; x <= MMBN2_CURSOR_X1; ++x) panel[y * GBA_W + x] = s->fb[y * GBA_W + x];
+		for (int x = MMBN2_CURSOR_X0; x <= MMBN2_CURSOR_X1; ++x) panel[y * GBA_W + x] = emu_fb(s)[y * GBA_W + x];
 	emu_layers(s, 0x1F);
 	emu_state_load(s, tmp); /* every layer back on */
 	/* the frame: edge, money, panel, edge, centred top to bottom */
@@ -5698,7 +5780,7 @@ static const char* hpa_compose(Emu* s, const void* state, uint32_t* out, int w, 
 	if (emu_cancelled(s)) return "called off";
 	if (!som_probes(s, hpaTask, 6, 6, 8)) return "no task box";
 	static uint32_t task[HPA_TASK_H * GBA_W];
-	memcpy(task, &s->fb[HPA_TASK_Y * GBA_W], sizeof(task));
+	memcpy(task, &emu_fb(s)[HPA_TASK_Y * GBA_W], sizeof(task));
 	/* Status/Equip, the menu's first line */
 	for (int i = 0; i < 8 && emu_read8(s, HPA_CURSOR + HPA_J(s)) != 0; ++i) hpa_tap(s, K_UP);
 	if (emu_read8(s, HPA_CURSOR + HPA_J(s)) != 0) return "Status/Equip not reached in the menu";
@@ -5713,7 +5795,7 @@ static const char* hpa_compose(Emu* s, const void* state, uint32_t* out, int w, 
 	emu_layers(s, 0x0F);
 	emu_state_load(s, tmp); /* (the layers take effect as the display registers are loaded) */
 	emu_frame(s, 0);
-	memcpy(out, &s->fb[HPA_SUM_Y * GBA_W], HPA_SUM_H * GBA_W * sizeof(uint32_t));
+	memcpy(out, &emu_fb(s)[HPA_SUM_Y * GBA_W], HPA_SUM_H * GBA_W * sizeof(uint32_t));
 	emu_layers(s, 0x1F);
 	emu_state_load(s, tmp); /* every layer back on */
 	memcpy(&out[HPA_SUM_H * GBA_W], task, sizeof(task));
@@ -5875,12 +5957,12 @@ static const char* sm3_status_page(Emu* s, uint32_t* out, int w, int h) {
 	 * moment) */
 	static uint32_t bg3[GBA_W * GBA_H], whole[GBA_W * GBA_H], moved[GBA_W * GBA_H];
 	emu_frame(s, 0);
-	memcpy(whole, s->fb, sizeof(whole));
+	memcpy(whole, emu_fb(s), sizeof(whole));
 	uint16_t cc = emu_read16(s, SM3_CURSOR_PAL);
 	emu_layers(s, 0x08);
 	emu_state_load(s, st);
 	emu_frame(s, 0);
-	memcpy(bg3, s->fb, sizeof(bg3));
+	memcpy(bg3, emu_fb(s), sizeof(bg3));
 	emu_layers(s, 0x1F);
 	uint32_t r = cc & 31, g = (cc >> 5) & 31, b = (cc >> 10) & 31;
 	uint32_t rgb = ((r << 3 | r >> 2) << 16) | ((g << 3 | g >> 2) << 8) | (b << 3 | b >> 2);
@@ -5926,7 +6008,7 @@ static const char* sm3_status_page(Emu* s, uint32_t* out, int w, int h) {
 		emu_layers(s, 0x08);
 		emu_state_load(s, st2);
 		emu_frame(s, 0);
-		memcpy(moved, s->fb, sizeof(moved));
+		memcpy(moved, emu_fb(s), sizeof(moved));
 		emu_layers(s, 0x1F);
 		free(st2);
 		/* where it went: the other slot whose ring differs (its colour
@@ -6001,7 +6083,7 @@ static const char* sm3_score_page(Emu* s, uint32_t* out, int w, int h) {
 		memcpy(out, lastPage, sizeof(lastPage));
 		return NULL;
 	}
-	if (!sm3_bar(s->fb)) {
+	if (!sm3_bar(emu_fb(s))) {
 		sm3_tap(s, K_UP, 2);
 		for (int i = 0; i < 8 && emu_read8(s, SM3_TAB) != SM3_TAB_SCORE; ++i) sm3_tap(s, K_RIGHT, 1);
 		if (emu_read8(s, SM3_TAB) != SM3_TAB_SCORE) return "map button did nothing";
@@ -6010,7 +6092,7 @@ static const char* sm3_score_page(Emu* s, uint32_t* out, int w, int h) {
 		while (f < 480 && still < 3) {
 			aw_run(s, 0, 4);
 			f += 4;
-			still = sm3_bar(s->fb) ? still + 1 : 0;
+			still = sm3_bar(emu_fb(s)) ? still + 1 : 0;
 		}
 		if (still < 3) return "the score page never came up";
 	}
@@ -6026,8 +6108,8 @@ static const char* sm3_score_page(Emu* s, uint32_t* out, int w, int h) {
 	for (int f = 0; f < 64; ++f) {
 		emu_state_save(s, st);
 		emu_frame(s, 0);
-		if (!sm3_bar(s->fb)) break;
-		int g = sm3_green(s->fb);
+		if (!sm3_bar(emu_fb(s))) break;
+		int g = sm3_green(emu_fb(s));
 		if (g > bestGreen) bestGreen = g, memcpy(best, st, n);
 	}
 	if (bestGreen < 0) {
@@ -6042,11 +6124,11 @@ static const char* sm3_score_page(Emu* s, uint32_t* out, int w, int h) {
 	emu_layers(s, 0x1F);
 	free(st);
 	free(best);
-	uint32_t panel = s->fb[SM3_PANEL_AT_Y * GBA_W + SM3_PANEL_AT_X];
+	uint32_t panel = emu_fb(s)[SM3_PANEL_AT_Y * GBA_W + SM3_PANEL_AT_X];
 	for (int y = 0; y < h && y < GBA_H; ++y) {
 		for (int x = 0; x < w && x < GBA_W; ++x) {
 			bool box = x >= SM3_BOX_X0 && x <= SM3_BOX_X1 && y >= SM3_BOX_Y0 && y <= SM3_BOX_Y1;
-			out[y * w + x] = box ? panel : s->fb[y * GBA_W + x];
+			out[y * w + x] = box ? panel : emu_fb(s)[y * GBA_W + x];
 		}
 	}
 	if (cw && !emu_cancelled(s)) {
@@ -6139,9 +6221,9 @@ static bool er_settle(Emu* s, int need, int max) {
 	int still = 0;
 	for (int f = 0; f < max; ++f) {
 		emu_frame(s, 0);
-		still = f && !memcmp(prev, s->fb, sizeof(prev)) && !sn_dark(s->fb) ? still + 1 : 0;
+		still = f && !memcmp(prev, emu_fb(s), sizeof(prev)) && !sn_dark(emu_fb(s)) ? still + 1 : 0;
 		if (still >= need) return true;
-		memcpy(prev, s->fb, sizeof(prev));
+		memcpy(prev, emu_fb(s), sizeof(prev));
 	}
 	return false;
 }
@@ -6186,7 +6268,7 @@ static const char* er_compose(Emu* s, const void* state, uint32_t* out, int w, i
 	if (map) {
 		if (!er_settle(s, 4, 120)) return "the map didn't settle";
 		if (emu_cancelled(s)) return "called off";
-		er_put(s->fb, out, w, h, 0, GBA_H);
+		er_put(emu_fb(s), out, w, h, 0, GBA_H);
 		return NULL;
 	}
 	/* no map here: the Party screen (ER-1), opened afresh so the first
@@ -6208,15 +6290,15 @@ static const char* er_compose(Emu* s, const void* state, uint32_t* out, int w, i
 	 * until DOWN changes nothing (fewer in the party: the empty slot stays
 	 * as drawn) */
 	static uint32_t last[GBA_W * GBA_H];
-	memcpy(last, s->fb, sizeof(last));
-	er_put(s->fb, out, w, h, 0, GBA_H);
+	memcpy(last, emu_fb(s), sizeof(last));
+	er_put(emu_fb(s), out, w, h, 0, GBA_H);
 	for (int k = 1; k * ER_CARD < GBA_H; ++k) {
 		er_press(s, K_DOWN);
 		if (!er_settle(s, 12, 60)) return "the Party screen didn't settle";
 		if (!er_on(s, ER_PARTY)) return "the Party screen closed";
-		if (!memcmp(last, s->fb, sizeof(last))) break;
-		memcpy(last, s->fb, sizeof(last));
-		er_put(s->fb, out, w, h, k * ER_CARD, (k + 1) * ER_CARD);
+		if (!memcmp(last, emu_fb(s), sizeof(last))) break;
+		memcpy(last, emu_fb(s), sizeof(last));
+		er_put(emu_fb(s), out, w, h, k * ER_CARD, (k + 1) * ER_CARD);
 	}
 	if (emu_cancelled(s)) return "called off";
 	return NULL;
@@ -6324,9 +6406,9 @@ static bool m3_settle(Emu* s) {
 	memset(last, 0, sizeof(last));
 	for (int f = 0; f < 120 && still < 3; ++f) {
 		aw_run(s, 0, 4);
-		bool lit = (s->fb[140 * GBA_W + 3] & 0xFFFFFF) == 0xFFFFFF;
-		still = lit && !memcmp(last, s->fb, sizeof(last)) ? still + 1 : 0;
-		memcpy(last, s->fb, sizeof(last));
+		bool lit = (emu_fb(s)[140 * GBA_W + 3] & 0xFFFFFF) == 0xFFFFFF;
+		still = lit && !memcmp(last, emu_fb(s), sizeof(last)) ? still + 1 : 0;
+		memcpy(last, emu_fb(s), sizeof(last));
 	}
 	return still >= 3;
 }
@@ -6387,7 +6469,7 @@ static const char* m3_compose(Emu* s, const void* state, uint32_t* const* out, i
 			emu_frame(s, 0);
 			if (n > best) {
 				best = n;
-				memcpy(page[0], s->fb, sizeof(page[0]));
+				memcpy(page[0], emu_fb(s), sizeof(page[0]));
 			}
 		}
 		if (emu_cancelled(s)) return "called off";
@@ -6422,7 +6504,7 @@ static const char* m3_compose(Emu* s, const void* state, uint32_t* const* out, i
 			if (emu_read8(s, M3_WHO) == first) break; /* (round to the first again) */
 		}
 		if (emu_cancelled(s)) return "called off";
-		memcpy(page[n], s->fb, sizeof(page[n]));
+		memcpy(page[n], emu_fb(s), sizeof(page[n]));
 	}
 	*nOut = n;
 	for (int k = 0; k < n; ++k) {
@@ -7804,7 +7886,8 @@ typedef struct {
 	bool done, failed;
 	int x0, y0, w, h;         /* the area's top left (camera coordinates) and size */
 	int ex0, ey0, ex1, ey1;   /* what's drawn on it: its edges (ex1 / ey1 past them) */
-	uint32_t* px;             /* 0: nothing there */
+	int vw;                   /* done: px's rows' length (bgd_means) */
+	uint32_t* px;             /* 0: nothing there; the picture while it's made, then bgd_means's pixels */
 } BgdMap;
 static BgdMap bgdMap;
 static pthread_t bgdThread;
@@ -7835,6 +7918,51 @@ static bool bgd_go(Emu* e, int x, int y, uint16_t hp) {
 		emu_frame_blind(e, 0);
 	}
 	return false;
+}
+
+/* where the view starts along one axis: around the hero (cam) within the area's edges, or an area no longer than it in its middle */
+static int bgd_view_start(int e0, int e1, int cam, int span) {
+	if (e1 - e0 <= span) return (e0 + e1) / 2 - span / 2;
+	int v = cam - span / 2;
+	return v < e0 ? e0 : v > e1 - span ? e1 - span : v;
+}
+
+/* The picture replaced by its 4x4 means as the view shows them, so a frame copies pixels instead of adding up 614,400 (22 ms on the
+ * 3DS). An axis the area doesn't fill has the view's own, as the view never moves along it; the rest is made in the picture's memory. */
+static bool bgd_means(BgdMap* m) {
+	enum { Z = BGD_Z, SX = GBA_W * BGD_Z, SY = GBA_H * BGD_Z };
+	bool fx = m->ex1 - m->ex0 <= SX, fy = m->ey1 - m->ey0 <= SY;
+	int nx = fx ? GBA_W : m->ex1 - m->ex0 - (Z - 1), ny = fy ? GBA_H : m->ey1 - m->ey0 - (Z - 1);
+	int x0 = fx ? bgd_view_start(m->ex0, m->ex1, 0, SX) : m->ex0, y0 = fy ? bgd_view_start(m->ey0, m->ey1, 0, SY) : m->ey0;
+	int dx = fx ? Z : 1, dy = fy ? Z : 1, cols = dx * (nx - 1) + Z;
+	/* (red and blue, then green, in 16 bits each so that 16 pixels' sums don't carry) */
+	uint32_t* rb = calloc((size_t) cols * 2, 4);
+	uint32_t* g = rb ? rb + cols : NULL;
+	uint32_t* to = fx || fy ? malloc((size_t) nx * ny * 4) : m->px;
+	if (!rb || !to) {
+		free(rb);
+		if (to != m->px) free(to);
+		return false;
+	}
+	int c0 = x0 < 0 ? -x0 : 0, c1 = m->w - x0 < cols ? m->w - x0 : cols;
+	for (int j = 0; j < ny; ++j) {
+		memset(rb, 0, (size_t) cols * 8);
+		for (int k = 0, y = y0 + dy * j; k < Z; ++k, ++y) {
+			if (y < 0 || y >= m->h) continue;
+			const uint32_t* row = m->px + (size_t) y * m->w + x0;
+			for (int c = c0; c < c1; ++c) rb[c] += row[c] & 0x00FF00FF, g[c] += row[c] >> 8 & 0xFF;
+		}
+		/* (made in the picture's memory, a row of means lies behind the rows still to be read) */
+		for (int i = 0; i < nx; ++i) {
+			const uint32_t *r = rb + dx * i, *q = g + dx * i;
+			uint32_t a = r[0] + r[1] + r[2] + r[3], b = q[0] + q[1] + q[2] + q[3];
+			to[(size_t) j * nx + i] = 0xFF000000 | (a >> 4 & 0x00FF00FF) | (b >> 4) << 8;
+		}
+	}
+	free(rb);
+	if (to != m->px) free(m->px), m->px = to;
+	m->vw = nx;
+	return true;
 }
 
 static void* bgd_worker(void* arg) {
@@ -7879,7 +8007,7 @@ static void* bgd_worker(void* arg) {
 				if (py < 0 || py >= m->h) continue;
 				for (int c = 0; c < GBA_W; ++c) {
 					int qx = cx - m->x0 + c;
-					if (qx >= 0 && qx < m->w) m->px[(size_t) py * m->w + qx] = e->fb[r * GBA_W + c] & 0xFFFFFF;
+					if (qx >= 0 && qx < m->w) m->px[(size_t) py * m->w + qx] = emu_fb(e)[r * GBA_W + c] & 0xFFFFFF;
 				}
 			}
 			emu_layers(e, 0x1F);
@@ -7901,7 +8029,8 @@ static void* bgd_worker(void* arg) {
 					if (y >= m->ey1) m->ey1 = y + 1;
 				}
 		if (m->ex1 <= m->ex0 && (why = "nothing drawn")) goto out;
-		m->done = true;
+		if (!bgd_means(m) && (why = "out of memory")) goto out;
+		__atomic_store_n(&m->done, true, __ATOMIC_RELEASE); /* (the view reads px and vw once it sees this) */
 		struct timespec t1;
 		clock_gettime(CLOCK_MONOTONIC, &t1);
 		fprintf(stderr, "Baldur's Gate: Dark Alliance: area mapped (%dx%d, %d screens%s, %ld ms)\n", m->w, m->h, stops,
@@ -7910,11 +8039,26 @@ static void* bgd_worker(void* arg) {
 out:
 	free(st);
 	if (why) {
-		m->done = m->failed = true;
+		m->failed = true;
+		__atomic_store_n(&m->done, true, __ATOMIC_RELEASE);
 		fprintf(stderr, "Baldur's Gate: Dark Alliance: area not mapped: %s\n", why);
 	}
 	bgdBusy = false;
 	return NULL;
+}
+
+/* The game's over: as MMBN's (profile_live_end). Kept, the copy held about 19 MiB of the heap and the ROM, and no
+ * 32 MiB game could start after Baldur's Gate in the same run (2026-11-25). */
+static void bgd_live_end(void) {
+	bgdStop = true;
+	if (bgdThread) pthread_join(bgdThread, NULL), bgdThread = 0;
+	if (bgdEmuOpen) emu_close(&bgdEmu), bgdEmuOpen = false;
+	free(bgdJob);
+	bgdJob = NULL;
+	bgdJobSize = 0;
+	free(bgdMap.px);
+	memset(&bgdMap, 0, sizeof(bgdMap));
+	bgdBusy = false;
 }
 
 /* the map dropped (called off first if it's still being made: false until it's stopped) */
@@ -7972,6 +8116,34 @@ static const uint32_t* bgd_x(Emu* e) {
 	return x;
 }
 
+/* the view from left, top, out of bgd_means's pixels (every fourth along an axis the area fills) */
+static void bgd_view(const BgdMap* m, int left, int top, uint32_t* out) {
+	enum { Z = BGD_Z };
+	bool fx = m->ex1 - m->ex0 <= GBA_W * Z, fy = m->ey1 - m->ey0 <= GBA_H * Z;
+	for (int oy = 0; oy < GBA_H; ++oy) {
+		const uint32_t* row = m->px + (size_t) (fy ? oy : top - m->ey0 + oy * Z) * m->vw;
+		if (fx) {
+			memcpy(out + oy * GBA_W, row, GBA_W * 4);
+			continue;
+		}
+		row += left - m->ex0;
+		for (int ox = 0; ox < GBA_W; ++ox) out[oy * GBA_W + ox] = row[ox * Z];
+	}
+}
+
+/* the map around his feet (camx, camy) at a quarter of its size, a red X (x, BGD-11) at the game's size where he is */
+static void bgd_compose(const BgdMap* m, int camx, int camy, const uint32_t* x, uint32_t* out) {
+	enum { Z = BGD_Z };
+	int left = bgd_view_start(m->ex0, m->ex1, camx, GBA_W * Z), top = bgd_view_start(m->ey0, m->ey1, camy, GBA_H * Z);
+	bgd_view(m, left, top, out);
+	int hx = (camx - left) / Z - 8, hy = (camy - top) / Z - 8;
+	for (int r = 0; r < 16; ++r) {
+		if (hy + r < 0 || hy + r >= GBA_H) continue;
+		for (int c = 0; c < 16; ++c)
+			if (x[r * 16 + c] && hx + c >= 0 && hx + c < GBA_W) out[(hy + r) * GBA_W + hx + c] = x[r * 16 + c];
+	}
+}
+
 /* the area's map, at a quarter of its size around the hero, a red X where he
  * is (BGD-10, BGD-11); a new area's map made beside the game */
 static const uint32_t* bgd_live_view(Emu* live, const char* rom) {
@@ -8017,44 +8189,9 @@ static const uint32_t* bgd_live_view(Emu* live, const char* rom) {
 		/* in exact runs (the tests), and with no threads, made here */
 		if (getenv("GBADS_SYNC") || pthread_create(&bgdThread, NULL, bgd_worker, NULL)) bgdThread = 0, bgd_worker(NULL);
 	}
-	if (m->failed || !m->done) return NULL; /* (the logo meanwhile) */
-	/* a quarter of the size: each pixel the mean of 4x4 of the picture's,
-	 * centred on his feet, kept within the area's edges; an area smaller
-	 * than the screen in its middle */
-	enum { Z = BGD_Z };
+	if (!__atomic_load_n(&m->done, __ATOMIC_ACQUIRE) || m->failed) return NULL; /* (the logo meanwhile) */
 	int camx = (int32_t) emu_read32(live, BGD_HEROX) / 256 - m->x0, camy = (int32_t) emu_read32(live, BGD_HEROY) / 256 - m->y0;
-	int left = camx - GBA_W * Z / 2, top = camy - GBA_H * Z / 2;
-	if (m->ex1 - m->ex0 <= GBA_W * Z) left = (m->ex0 + m->ex1) / 2 - GBA_W * Z / 2;
-	else if (left < m->ex0) left = m->ex0;
-	else if (left > m->ex1 - GBA_W * Z) left = m->ex1 - GBA_W * Z;
-	if (m->ey1 - m->ey0 <= GBA_H * Z) top = (m->ey0 + m->ey1) / 2 - GBA_H * Z / 2;
-	else if (top < m->ey0) top = m->ey0;
-	else if (top > m->ey1 - GBA_H * Z) top = m->ey1 - GBA_H * Z;
-	for (int oy = 0; oy < GBA_H; ++oy) {
-		int py = top + oy * Z;
-		for (int ox = 0; ox < GBA_W; ++ox) {
-			int qx = left + ox * Z;
-			unsigned r = 0, g = 0, b = 0;
-			for (int dy = 0; dy < Z; ++dy) {
-				if (py + dy < 0 || py + dy >= m->h) continue;
-				for (int dx = 0; dx < Z; ++dx) {
-					if (qx + dx < 0 || qx + dx >= m->w) continue;
-					uint32_t px = m->px[(size_t) (py + dy) * m->w + qx + dx];
-					r += px & 0xFF, g += (px >> 8) & 0xFF, b += (px >> 16) & 0xFF;
-				}
-			}
-			out[oy * GBA_W + ox] = 0xFF000000 | (b / (Z * Z)) << 16 | (g / (Z * Z)) << 8 | r / (Z * Z);
-		}
-	}
-	/* X marks the spot: the red X of an unusable quick slot, at the game's
-	 * size, its middle where his feet are (BGD-11) */
-	const uint32_t* x = bgd_x(live);
-	int hx = (camx - left) / Z - 8, hy = (camy - top) / Z - 8;
-	for (int r = 0; r < 16; ++r) {
-		if (hy + r < 0 || hy + r >= GBA_H) continue;
-		for (int c = 0; c < 16; ++c)
-			if (x[r * 16 + c] && hx + c >= 0 && hx + c < GBA_W) out[(hy + r) * GBA_W + hx + c] = x[r * 16 + c];
-	}
+	bgd_compose(m, camx, camy, bgd_x(live), out);
 	return out;
 }
 
@@ -8147,11 +8284,11 @@ static const char* mvdk_compose(Emu* s, const void* state, uint32_t* out, int w,
 	emu_layers(s, 0x10);
 	emu_state_load(s, paused);
 	emu_frame(s, 0);
-	memcpy(spr, s->fb, GBA_W * GBA_H * 4);
+	memcpy(spr, emu_fb(s), GBA_W * GBA_H * 4);
 	emu_layers(s, 0);
 	emu_state_load(s, paused);
 	emu_frame(s, 0);
-	memcpy(back, s->fb, GBA_W * GBA_H * 4);
+	memcpy(back, emu_fb(s), GBA_W * GBA_H * 4);
 	emu_mark_backdrop(s, false);
 	emu_layers(s, 0x1F);
 	emu_hide_sprites(s, NULL, 0);

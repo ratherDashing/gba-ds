@@ -1,0 +1,157 @@
+diff --git a/include/mgba/internal/gba/memory.h b/include/mgba/internal/gba/memory.h
+index 0aad91261..fdad19e9d 100644
+--- a/include/mgba/internal/gba/memory.h
++++ b/include/mgba/internal/gba/memory.h
+@@ -128,6 +128,7 @@ struct GBAMemory {
+ 	struct GBADMA dma[4];
+ 	struct mTimingEvent dmaEvent;
+ 	int activeDMA;
++	uint32_t dmaUpdates;
+ 
+ 	uint32_t agbPrintBase;
+ 	uint16_t agbPrintProtect;
+diff --git a/src/core/timing.c b/src/core/timing.c
+index cebd61995..4e04e2e19 100644
+--- a/src/core/timing.c
++++ b/src/core/timing.c
+@@ -106,10 +106,9 @@ int32_t mTimingTick(struct mTiming* timing, int32_t cycles) {
+ #ifdef ENABLE_DEBUGGERS
+ 	timing->globalCycles += cycles;
+ #endif
+-	uint32_t masterCycles = timing->masterCycles;
+ 	while (timing->root) {
+ 		struct mTimingEvent* next = timing->root;
+-		int32_t nextWhen = next->when - masterCycles;
++		int32_t nextWhen = next->when - timing->masterCycles;
+ 		if (nextWhen > 0) {
+ 			return nextWhen;
+ 		}
+diff --git a/src/gba/dma.c b/src/gba/dma.c
+index da2a800ba..0a3536521 100644
+--- a/src/gba/dma.c
++++ b/src/gba/dma.c
+@@ -196,43 +196,92 @@ void GBADMARunDisplayStart(struct GBA* gba, int32_t cycles) {
+ 	}
+ }
+ 
++/* While nothing else is due first, the next unit runs from here, as the event loop would, minus the list work. If
++ * something in a unit called GBADMAUpdate (dmaUpdates changed), the event is rescheduled the usual way. */
+ void _dmaEvent(struct mTiming* timing, void* context, uint32_t cyclesLate) {
+-	UNUSED(timing);
+-	UNUSED(cyclesLate);
+ 	struct GBA* gba = context;
+ 	struct GBAMemory* memory = &gba->memory;
+-	struct GBADMA* dma = &memory->dma[memory->activeDMA];
+-	if (dma->nextCount == dma->count) {
+-		dma->when = mTimingCurrentTime(&gba->timing);
+-	}
+-	if (dma->nextCount & 0xFFFFF) {
++	for (;;) {
++		struct GBADMA* dma = &memory->dma[memory->activeDMA];
++		if (dma->nextCount == dma->count) {
++			dma->when = mTimingCurrentTime(&gba->timing);
++		}
++		if (!(dma->nextCount & 0xFFFFF)) {
++			dma->nextCount = 0;
++			bool noRepeat = !GBADMARegisterIsRepeat(dma->reg);
++			noRepeat |= GBADMARegisterGetTiming(dma->reg) == GBA_DMA_TIMING_NOW;
++			noRepeat |= memory->activeDMA == 3 && GBADMARegisterGetTiming(dma->reg) == GBA_DMA_TIMING_CUSTOM && gba->video.vcount == GBA_VIDEO_VERTICAL_PIXELS + 1;
++			if (noRepeat) {
++				dma->reg = GBADMARegisterClearEnable(dma->reg);
++
++				// Clear the enable bit in memory
++				memory->io[(GBA_REG_DMA0CNT_HI + memory->activeDMA * (GBA_REG_DMA1CNT_HI - GBA_REG_DMA0CNT_HI)) >> 1] &= 0x7FE0;
++			} else {
++				GBADMAReload(gba, memory->activeDMA);
++			}
++			if (GBADMARegisterGetDestControl(dma->reg) == GBA_DMA_INCREMENT_RELOAD) {
++				dma->nextDest = dma->dest;
++			}
++			if (GBADMARegisterIsDoIRQ(dma->reg)) {
++				GBARaiseIRQ(gba, GBA_IRQ_DMA0 + memory->activeDMA, cyclesLate);
++			}
++			GBADMAUpdate(gba);
++			return;
++		}
++
++		uint32_t updates = memory->dmaUpdates;
+ 		GBADMAService(gba, memory->activeDMA, dma);
+-	} else {
+-		dma->nextCount = 0;
+-		bool noRepeat = !GBADMARegisterIsRepeat(dma->reg);
+-		noRepeat |= GBADMARegisterGetTiming(dma->reg) == GBA_DMA_TIMING_NOW;
+-		noRepeat |= memory->activeDMA == 3 && GBADMARegisterGetTiming(dma->reg) == GBA_DMA_TIMING_CUSTOM && gba->video.vcount == GBA_VIDEO_VERTICAL_PIXELS + 1;
+-		if (noRepeat) {
+-			dma->reg = GBADMARegisterClearEnable(dma->reg);
+-
+-			// Clear the enable bit in memory
+-			memory->io[(GBA_REG_DMA0CNT_HI + memory->activeDMA * (GBA_REG_DMA1CNT_HI - GBA_REG_DMA0CNT_HI)) >> 1] &= 0x7FE0;
+-		} else {
+-			GBADMAReload(gba, memory->activeDMA);
++		if (updates != memory->dmaUpdates) {
++			GBADMAUpdate(gba);
++			return;
+ 		}
+-		if (GBADMARegisterGetDestControl(dma->reg) == GBA_DMA_INCREMENT_RELOAD) {
+-			dma->nextDest = dma->dest;
++
++		// (GBADMAUpdate, minus the deschedule)
++		uint32_t currentTime = mTimingCurrentTime(&gba->timing);
++		int32_t leastTime = INT_MAX;
++		int i;
++		memory->activeDMA = -1;
++		for (i = 0; i < 4; ++i) {
++			struct GBADMA* other = &memory->dma[i];
++			if (GBADMARegisterIsEnable(other->reg) && other->nextCount) {
++				int32_t time = other->when - currentTime;
++				if (memory->activeDMA == -1 || time < leastTime) {
++					leastTime = time;
++					memory->activeDMA = i;
++				}
++			}
+ 		}
+-		if (GBADMARegisterIsDoIRQ(dma->reg)) {
+-			GBARaiseIRQ(gba, GBA_IRQ_DMA0 + memory->activeDMA, cyclesLate);
++		if (memory->activeDMA < 0) {
++			gba->cpuBlocked = false;
++			return;
++		}
++		gba->dmaPC = gba->cpu->gprs[ARM_PC];
++		int32_t until = memory->dma[memory->activeDMA].when - currentTime;
++		int32_t relative = until + *timing->relativeCycles;
++		struct mTimingEvent* next = timing->root;
++		if (gba->earlyExit || timing->reroot ||
++		    (next && ((int32_t) (next->when - timing->masterCycles) < relative ||
++		              ((int32_t) (next->when - timing->masterCycles) == relative && next->priority <= memory->dmaEvent.priority)))) {
++			mTimingSchedule(&gba->timing, &memory->dmaEvent, until);
++			return;
++		}
++		memory->dmaEvent.when = relative + timing->masterCycles;
++		if (relative < *timing->nextEvent) {
++			*timing->nextEvent = relative;
++		}
++		if (until > 0) {
++			timing->masterCycles += until;
++			cyclesLate = 0;
++		} else {
++			cyclesLate = -until;
+ 		}
+-		GBADMAUpdate(gba);
+ 	}
+ }
+ 
+ void GBADMAUpdate(struct GBA* gba) {
+ 	int i;
+ 	struct GBAMemory* memory = &gba->memory;
++	++memory->dmaUpdates;
+ 	uint32_t currentTime = mTimingCurrentTime(&gba->timing);
+ 	int32_t leastTime = INT_MAX;
+ 	memory->activeDMA = -1;
+@@ -354,7 +403,6 @@ void GBADMAService(struct GBA* gba, int number, struct GBADMA* info) {
+ 			info->when += 2;
+ 		}
+ 	}
+-	GBADMAUpdate(gba);
+ }
+ 
+ void GBADMARecalculateCycles(struct GBA* gba) {

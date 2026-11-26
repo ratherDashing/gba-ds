@@ -1,0 +1,18 @@
+diff --git a/src/util/memory.c b/src/util/memory.c
+index 89646d3bc..059761c3e 100644
+--- a/src/util/memory.c
++++ b/src/util/memory.c
+@@ -5,6 +5,8 @@
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ #include <mgba-util/memory.h>
+ 
++#ifndef __3DS__
++/* (on the 3DS, GBA DS's 3ds/ctr/emu_ctr.c has these: large blocks from the top of the heap's range) */
+ void* anonymousMemoryMap(size_t size) {
+ 	return calloc(1, size);
+ }
+@@ -13,3 +15,4 @@ void mappedMemoryFree(void* memory, size_t size) {
+ 	UNUSED(size);
+ 	free(memory);
+ }
++#endif

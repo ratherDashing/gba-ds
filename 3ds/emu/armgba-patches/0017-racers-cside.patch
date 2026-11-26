@@ -1,0 +1,1193 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Fri, 20 Nov 2026 18:00:00 -0500
+Subject: armGBA: with a render thread the machine's own renderer keeps only
+ what is read of it, the render log is written without the ring's checks, a
+ DMA run's register writes to the video are one log entry, and the interrupt
+ controller's changes that only clear a flag don't stop compiled code
+ (gbaCside bits 1, 2, 4 and 16; bit 8, the exact CPU's decode without a call,
+ is gone: armGBA 2.0's table-driven interpreter steps without decoding)
+
+
+diff --git a/src/cpu/arm.c b/src/cpu/arm.c
+index 0df5258..20ddbe7 100644
+--- a/src/cpu/arm.c
++++ b/src/cpu/arm.c
+@@ -209,7 +209,7 @@ uint32_t jitHelperMsrFast(struct GBA* gba, uint32_t value, uint32_t packed) {
+ 		if (cpu->mode != MODE_USER && (mask & PSR_PRIV_MASK)) {
+ 			after = (after & ~PSR_PRIV_MASK) | (value & PSR_PRIV_MASK);
+ 		}
+-		if (((before ^ after) & PSR_T) || ((before & PSR_I) && !(after & PSR_I) && gba->irq.line)) {
++		if (((before ^ after) & PSR_T) || ((before & PSR_I) && !(after & PSR_I) && gbaIrqLine(gba))) {
+ 			return 1;
+ 		}
+ 	}
+diff --git a/src/cpu/jit.c b/src/cpu/jit.c
+index 06374cc..8efd414 100644
+--- a/src/cpu/jit.c
++++ b/src/cpu/jit.c
+@@ -1979,7 +1979,7 @@ static bool romEntryOk(struct GBA* gba, uint32_t pc, bool thumb) {
+ // take, the prefetch holding what memory holds, and the prefetch buffer as compiled for.
+ static bool compiledMayRun(struct GBA* gba, uint32_t pc, bool thumb) {
+ 	struct CPU* cpu = &gba->cpu;
+-	if (gba->dmaRunnable || gba->lastAccessDma || (gba->irq.line && (!cpu->irqMasked || !(cpu->cpsr & PSR_I)))) {
++	if (gba->dmaRunnable || gba->lastAccessDma || (gbaIrqLine(gba) && (!cpu->irqMasked || !(cpu->cpsr & PSR_I)))) {
+ 		return false;
+ 	}
+ 	if (!compilable(gba, pc, thumb) || (inRom(pc) && !romEntryOk(gba, pc, thumb))) {
+@@ -2882,14 +2882,14 @@ uint32_t jitHelperSystem(struct GBA* gba, uint32_t opcode, uint32_t address) {
+ 	if (!writesPc) {
+ 		// Once unmasked, an IRQ comes one instruction later: the mask from before still holds for
+ 		// the next instruction.
+-		if (((before & PSR_I) && !(cpu->cpsr & PSR_I) && gba->irq.line) || ((before ^ cpu->cpsr) & PSR_T)) {
++		if (((before & PSR_I) && !(cpu->cpsr & PSR_I) && gbaIrqLine(gba)) || ((before ^ cpu->cpsr) & PSR_T)) {
+ 			cpu->irqMasked = before & PSR_I;
+ 			return JIT_EXACT;
+ 		}
+ 		return ~0u;
+ 	}
+ 	// After a refill, the IRQ check uses the mask as it is now.
+-	if (gba->irq.line && !cpu->irqMasked) {
++	if (gbaIrqLine(gba) && !cpu->irqMasked) {
+ 		return JIT_EXACT;
+ 	}
+ 	bool thumb = cpu->cpsr & PSR_T;
+@@ -2906,7 +2906,7 @@ uint32_t jitHelperSystem(struct GBA* gba, uint32_t opcode, uint32_t address) {
+ uint32_t jitHelperReturn(struct GBA* gba) {
+ 	struct CPU* cpu = &gba->cpu;
+ 	uint32_t spsr = cpu->spsr;
+-	if (!cpuModeHasSpsr(cpu->cpsr & 0x1F) || (gba->irq.line && !(spsr & PSR_I))) {
++	if (!cpuModeHasSpsr(cpu->cpsr & 0x1F) || (gbaIrqLine(gba) && !(spsr & PSR_I))) {
+ 		return ~0u;
+ 	}
+ 	uint32_t target = cpu->r[15];
+@@ -2922,7 +2922,7 @@ uint32_t jitHelperReturn(struct GBA* gba) {
+ static bool continuable(struct GBA* gba, uint32_t pc, bool thumb) {
+ 	struct CPU* cpu = &gba->cpu;
+ 	int width = thumb ? 2 : 4;
+-	if (gba->dmaRunnable || gba->lastAccessDma || (gba->irq.line && (!cpu->irqMasked || !(cpu->cpsr & PSR_I)))) {
++	if (gba->dmaRunnable || gba->lastAccessDma || (gbaIrqLine(gba) && (!cpu->irqMasked || !(cpu->cpsr & PSR_I)))) {
+ 		return false;
+ 	}
+ 	if (!compilable(gba, pc, thumb) || gba->activeRegion != (int32_t) (pc >> 24)) {
+@@ -2966,11 +2966,11 @@ static bool continuable(struct GBA* gba, uint32_t pc, bool thumb) {
+ }
+ 
+ // Whether compiled code can go on at an instruction boundary in block.
+-static bool boundaryOk(struct GBA* gba, const struct Block* block) {
++static inline __attribute__((always_inline)) bool boundaryOk(struct GBA* gba, const struct Block* block) {
+ 	struct CPU* cpu = &gba->cpu;
+ 	struct Jit* jit = gba->jit;
+ 	return block->valid && !gba->jitLeave && !cpu->halted && !jit->flushRequested && !jit->waitsChanged && !jit->staleValid && gba->video.frameCounter == jit->frame &&
+-	       !gba->returnRequested && !gba->dmaRunnable && !gba->lastAccessDma && !(gba->irq.line && (!cpu->irqMasked || !(cpu->cpsr & PSR_I)));
++	       !gba->returnRequested && !gba->dmaRunnable && !gba->lastAccessDma && !(gbaIrqLine(gba) && (!cpu->irqMasked || !(cpu->cpsr & PSR_I)));
+ }
+ 
+ // Whether an IRQ to take is all that stops compiled code going on at a boundary in block. The exact
+@@ -2980,13 +2980,13 @@ static bool boundaryOk(struct GBA* gba, const struct Block* block) {
+ static bool onlyIrq(struct GBA* gba, const struct Block* block) {
+ 	struct CPU* cpu = &gba->cpu;
+ 	struct Jit* jit = gba->jit;
+-	return gba->irq.line && !(cpu->cpsr & PSR_I) && block->valid && !gba->jitLeave && !cpu->halted && !jit->flushRequested && !jit->waitsChanged && !jit->staleValid &&
++	return gbaIrqLine(gba) && !(cpu->cpsr & PSR_I) && block->valid && !gba->jitLeave && !cpu->halted && !jit->flushRequested && !jit->waitsChanged && !jit->staleValid &&
+ 	       gba->video.frameCounter == jit->frame && !gba->returnRequested && !gba->dmaRunnable && !gba->lastAccessDma;
+ }
+ 
+ // Runs the events due by now at an instruction boundary. Returns false when compiled code has to
+ // leave.
+-static bool runDue(struct GBA* gba, const struct Block* block) {
++static inline __attribute__((always_inline)) bool runDue(struct GBA* gba, const struct Block* block) {
+ 	// At the end of a frame, or when asked to, the run loop returns before anything else runs.
+ 	if (gba->video.frameCounter != gba->jit->frame || gba->returnRequested) {
+ 		return false;
+diff --git a/src/cpu/lean.c b/src/cpu/lean.c
+index bd0c392..b320a43 100644
+--- a/src/cpu/lean.c
++++ b/src/cpu/lean.c
+@@ -1146,7 +1146,7 @@ static inline void leanOne(struct GBA* gba) {
+ 		stepInstruction(gba);
+ 		return;
+ 	}
+-	if (gba->irq.line && !cpu->irqMasked) {
++	if (gbaIrqLine(gba) && !cpu->irqMasked) {
+ 		stepTakeIrq(gba);
+ 	}
+ 	uint32_t const opcode = cpu->prefetch[0];
+diff --git a/src/cpu/step.c b/src/cpu/step.c
+index d6581c1..464888f 100644
+--- a/src/cpu/step.c
++++ b/src/cpu/step.c
+@@ -655,7 +655,7 @@ void stepTrace(struct GBA* gba) {
+ // runs.
+ static void step(struct GBA* gba) {
+ 	struct CPU* cpu = &gba->cpu;
+-	if (gba->irq.line && !cpu->irqMasked) {
++	if (gbaIrqLine(gba) && !cpu->irqMasked) {
+ 		takeIrq(gba);
+ 	}
+ 	if (gba->traceFile) {
+diff --git a/src/gba.c b/src/gba.c
+index 8c66a14..330c553 100644
+--- a/src/gba.c
++++ b/src/gba.c
+@@ -36,6 +36,11 @@ static void freeChange(void* context) {
+ // (timingScheduleCpu): with the CPU Clock away from 100%, an interrupt handler can still acknowledge
+ // IF and let interrupts nest a few instructions later, as on the console, without the one it
+ // acknowledged coming back.
++static void availableChanged(struct GBA* gba, void* context, uint32_t late);
++static void lineChanged(struct GBA* gba, void* context, uint32_t late);
++static void availableLazy(struct GBA* gba, void* context, uint32_t late);
++static void lineLazy(struct GBA* gba, void* context, uint32_t late);
++
+ static void scheduleChange(struct GBA* gba, struct IrqChange* slots, bool value, int32_t cycles, int32_t late) {
+ 	struct IrqChange* change = &slots[0];
+ 	while (change->busy && change < &slots[3]) {
+@@ -44,12 +49,83 @@ static void scheduleChange(struct GBA* gba, struct IrqChange* slots, bool value,
+ 	// With every slot in flight, the newest change takes the last one's place.
+ 	if (change->busy) {
+ 		timingDeschedule(gba, &change->event);
++		if (change->event.lazy) {
++			change->event.lazy = false;
++			change->event.callback = slots == gba->irq.availableChange ? availableChanged : lineChanged;
++			--gba->irq.lazy;
++		}
+ 	}
+ 	change->value = value;
+ 	change->busy = true;
+ 	timingScheduleCpu(gba, &change->event, cycles, late);
+ }
+ 
++// A change that clears its stage's flag as a lazy event (CSIDE_LAZY_IRQ): in the list as any event, but compiled code
++// doesn't stop for it. Out of line, so applyRegisters stays as small as without it.
++static __attribute__((noinline)) void scheduleLazy(struct GBA* gba, struct IrqChange* slots, int32_t cycles, int32_t late) {
++	if (gba->cpu.overclock) {
++		scheduleChange(gba, slots, false, cycles, late);
++		return;
++	}
++	struct IrqChange* change = &slots[0];
++	while (change->busy && change < &slots[3]) {
++		++change;
++	}
++	if (change->busy) {
++		timingDeschedule(gba, &change->event);
++		if (change->event.lazy) {
++			--gba->irq.lazy;
++		}
++	}
++	change->value = false;
++	change->busy = true;
++	change->event.lazy = true;
++	change->event.callback = slots == gba->irq.availableChange ? availableLazy : lineLazy;
++	++gba->irq.lazy;
++	timingScheduleLazy(gba, &change->event, cycles - late);
++}
++
++// Whether the first event in the list is a lazy one that is due (the CPU Clock at 100%: gbaIrqSettle decides otherwise).
++static bool lazyDue(struct GBA* gba) {
++	const struct Event* first = gba->timing.root;
++	return first && first->lazy && (gba->cpu.overclock || (int32_t) (first->when - gba->timing.masterCycles - gba->cpu.cycles) <= 0);
++}
++
++static void settleDue(struct GBA* gba) {
++	if (lazyDue(gba)) {
++		gbaIrqSettle(gba);
++	}
++}
++
++static inline void settle(struct GBA* gba) {
++	if (__builtin_expect(gba->irq.lazy, 0)) {
++		settleDue(gba);
++	}
++}
++
++// Runs the lazy changes that are due, at the front of the list in order, before what they change is looked at: the
++// registers' writes, the CPU's IRQ line, a state. Events run their own in order, and an event's callback looks at
++// what earlier ones left.
++void gbaIrqSettle(struct GBA* gba) {
++	struct Timing* timing = &gba->timing;
++	if (gba->inEvent || timing->reroot) {
++		return;
++	}
++	while (gba->irq.lazy) {
++		struct Event* next = timing->root;
++		if (!next || !next->lazy || (gba->cpu.overclock ? timingUntil(gba, next) : (int32_t) (next->when - timing->masterCycles - gba->cpu.cycles)) > 0) {
++			return;
++		}
++		timing->root = next->next;
++		next->callback(gba, next->context, 0);
++	}
++}
++
++bool gbaIrqLineSettled(struct GBA* gba) {
++	settleDue(gba);
++	return gba->irq.line;
++}
++
+ // The second stage: IE & IF as the halt logic sees it.
+ static void availableChanged(struct GBA* gba, void* context, uint32_t late) {
+ 	(void) late;
+@@ -64,9 +140,26 @@ static void lineChanged(struct GBA* gba, void* context, uint32_t late) {
+ 	gba->irq.line = ((struct IrqChange*) context)->value;
+ }
+ 
++// The same for a lazy change, which gives the event back its usual callback.
++static void availableLazy(struct GBA* gba, void* context, uint32_t late) {
++	struct IrqChange* change = context;
++	change->event.lazy = false;
++	change->event.callback = availableChanged;
++	--gba->irq.lazy;
++	availableChanged(gba, context, late);
++}
++
++static void lineLazy(struct GBA* gba, void* context, uint32_t late) {
++	struct IrqChange* change = context;
++	change->event.lazy = false;
++	change->event.callback = lineChanged;
++	--gba->irq.lazy;
++	lineChanged(gba, context, late);
++}
++
+ // The first stage: the registers take their new values, and the later stages are scheduled if they
+ // change. ahead is how many cycles from now the stage is meant to happen, late how many ago.
+-static void applyRegisters(struct GBA* gba, int32_t ahead, int32_t late) {
++static inline __attribute__((always_inline)) void applyRegisters(struct GBA* gba, int32_t ahead, int32_t late) {
+ 	struct Irq* irq = &gba->irq;
+ 	gbaIrqSync(gba);
+ 	gba->io[IO(REG_IE)] = irq->ie;
+@@ -74,12 +167,20 @@ static void applyRegisters(struct GBA* gba, int32_t ahead, int32_t late) {
+ 	gba->io[IO(REG_IME)] = irq->ime;
+ 	bool available = irq->ie & irq->iflags;
+ 	if (available != irq->available) {
+-		scheduleChange(gba, irq->availableChange, available, 1 + ahead, late);
++		if (!available && (gbaCside & CSIDE_LAZY_IRQ)) {
++			scheduleLazy(gba, irq->availableChange, 1 + ahead, late);
++		} else {
++			scheduleChange(gba, irq->availableChange, available, 1 + ahead, late);
++		}
+ 	}
+ 	bool line = irq->ime && available;
+ 	if (line != irq->lineDriven) {
+ 		irq->lineDriven = line;
+-		scheduleChange(gba, irq->lineChange, line, 2 + ahead, late);
++		if (!line && (gbaCside & CSIDE_LAZY_IRQ)) {
++			scheduleLazy(gba, irq->lineChange, 2 + ahead, late);
++		} else {
++			scheduleChange(gba, irq->lineChange, line, 2 + ahead, late);
++		}
+ 	}
+ }
+ 
+@@ -95,6 +196,7 @@ static void applyIrq(struct GBA* gba, void* context, uint32_t late) {
+ // console's clock, outside events and DMA. An interrupt handler's few writes to these registers
+ // were most of a game's events, each stopping compiled code.
+ static void writeReaches(struct GBA* gba) {
++	settle(gba);
+ 	if (!gba->cpu.overclock && !gba->inEvent && !gba->performingDma) {
+ 		uint32_t const now = timingCurrentTime(gba);
+ 		struct Event* const next = gba->timing.reroot ? gba->timing.reroot : gba->timing.root;
+@@ -125,11 +227,28 @@ static void irqReset(struct GBA* gba) {
+ 	irq->line = false;
+ 	irq->lineDriven = false;
+ 	irq->quietPending = false;
++	irq->lazy = 0;
+ 	irq->ifStable = timingCpuTime(gba) + INT32_MAX;
+ 	for (int i = 0; i < 4; ++i) {
+ 		irq->apply[i].busy = false;
+ 		irq->availableChange[i].busy = false;
+ 		irq->lineChange[i].busy = false;
++		irq->availableChange[i].event.lazy = false;
++		irq->lineChange[i].event.lazy = false;
++		irq->availableChange[i].event.callback = availableChanged;
++		irq->lineChange[i].event.callback = lineChanged;
++	}
++}
++
++// After a state's events are in the list: none is lazy (a state keeps them as plain events), whatever the machine had before.
++void gbaIrqLoaded(struct GBA* gba) {
++	struct Irq* irq = &gba->irq;
++	irq->lazy = 0;
++	for (int i = 0; i < 4; ++i) {
++		irq->availableChange[i].event.lazy = false;
++		irq->lineChange[i].event.lazy = false;
++		irq->availableChange[i].event.callback = availableChanged;
++		irq->lineChange[i].event.callback = lineChanged;
+ 	}
+ }
+ 
+@@ -574,6 +693,7 @@ void gbaIrqQuietChanged(struct GBA* gba, bool wasQuiet, uint32_t late) {
+ // The three interrupt registers. Each write goes through the pipeline's first stage one cycle
+ // later.
+ void gbaWriteIe(struct GBA* gba, uint16_t value) {
++	settle(gba);
+ 	gbaIrqSync(gba);
+ 	bool wasQuiet = gbaQuietHblank(gba);
+ 	uint16_t old = gba->irq.ie;
+@@ -601,6 +721,7 @@ void gbaWriteIe(struct GBA* gba, uint16_t value) {
+ 
+ // Writing a 1 to an IF bit acknowledges that interrupt.
+ void gbaWriteIf(struct GBA* gba, uint16_t value) {
++	settle(gba);
+ 	gbaIrqSync(gba);
+ 	if (value & gba->irq.iflags & TIMER_IRQS) {
+ 		// An acknowledged timer's next request sets its bit again, so its overflows are events again.
+@@ -615,6 +736,7 @@ void gbaWriteIf(struct GBA* gba, uint16_t value) {
+ }
+ 
+ void gbaWriteIme(struct GBA* gba, uint16_t value) {
++	settle(gba);
+ 	gba->irq.ime = value & 1;
+ 	writeReaches(gba);
+ }
+diff --git a/src/gba.h b/src/gba.h
+index 20bc020..2fd1543 100644
+--- a/src/gba.h
++++ b/src/gba.h
+@@ -196,6 +196,9 @@ struct Event {
+ 	unsigned priority;
+ 	// When set, the run loop returns at the instruction boundary after this event.
+ 	bool endsRun;
++	// A change of the interrupt controller that only clears a flag (CSIDE_LAZY_IRQ): it waits in the list as any event does
++	// but compiled code doesn't stop for it; gbaIrqSettle runs it before anything looks at what it changes.
++	bool lazy;
+ 	HOST_POINTER(struct Event* next, next);
+ };
+ 
+@@ -272,6 +275,8 @@ struct Irq {
+ 	// H-blank, which stays an event until then (see gbaWriteIe). In what was padding, so states keep
+ 	// their layout.
+ 	bool quietLater;
++	// How many events of the two later stages' pools are lazy and in the list (zero in a state).
++	uint8_t lazy;
+ 	uint32_t quietFrom;
+ 	// The time until which IF in io stays valid without calling gbaIrqSync.
+ 	uint32_t ifStable;
+@@ -1011,6 +1016,14 @@ enum {
+ };
+ // Whether the events due by time can run late, at the next instruction boundary: for the kinds above.
+ bool timingDeferrable(struct GBA*, int32_t time, int kind);
++void gbaIrqSettle(struct GBA*);
++void gbaIrqLoaded(struct GBA*);
++// The CPU's IRQ line as of now. Lazy changes only clear it, so when it is clear there is nothing to settle.
++bool gbaIrqLineSettled(struct GBA*);
++static inline bool gbaIrqLine(struct GBA* gba) {
++	return gba->irq.line && (__builtin_expect(!gba->irq.lazy, 1) || gbaIrqLineSettled(gba));
++}
++void timingScheduleLazy(struct GBA*, struct Event*, int32_t when);
+ void processEvents(struct GBA*);
+ 
+ // step.c: the exact CPU, used for the instructions around events.
+@@ -1053,6 +1066,39 @@ static inline void videoSync(struct GBA* gba) {
+ 		videoSyncDue(gba);
+ 	}
+ }
++void videoDispcntWritten(struct GBA*);
++// Writes video register address (an offset into the I/O space) into a batch (CSIDE_BATCH), as ioWrite with the machine's
++// copies drawing does, syncing the video first; the CPU's clock is the console's.
++static inline void renderBatchWrite(struct GBA* gba, struct RenderBatch* batch, uint32_t address, uint16_t value) {
++	if ((int32_t) (timingCpuTime(gba) - gba->video.stableUntil) >= 0) {
++		// (what the sync does may log: after what is batched)
++		renderBatchFlush(gba, batch);
++		videoSyncDue(gba);
++	}
++	uint16_t const logged = value;
++	uint16_t kept = 0;
++	if (address == batch->maskedRegister) {
++		kept = value & batch->maskedBits;
++		value &= ~batch->maskedBits;
++	}
++	value &= renderLeanMask[address >> 1];
++	if (address == 0x000) {
++		gba->renderer.dispcnt = value;
++		gba->vramStall = (value & 7) == 2 && (value & 0x0C00) == 0x0C00;
++		videoDispcntWritten(gba);
++	} else if (address == 0x054 && value > 0x10) {
++		value = 0x10;
++	}
++	gba->io[address >> 1] = value | kept;
++	uint32_t count = batch->count;
++	if (count == 2 * RENDER_BATCH_MAX) {
++		renderBatchFlush(gba, batch);
++		count = 0;
++	}
++	batch->words[count] = address << 16 | logged;
++	batch->words[count + 1] = (uint32_t) (timingCpuTime(gba) - gba->video.lineStart);
++	batch->count = count + 2;
++}
+ int videoLine(struct GBA*);
+ void videoHblankDmaArmed(struct GBA*);
+ uint32_t videoNextHblank(struct GBA*, uint32_t from);
+@@ -1175,6 +1221,19 @@ enum {
+ // Whether the sound log is published and read with the fewest barriers (false: a barrier at every
+ // entry, as it was).
+ extern bool threadLogsLean;
++// The ways the emulation thread's own work is made cheaper (gbaCside, a bit mask, each exact): with a
++// render thread, the machine's renderer keeps only what it is read for.
++extern uint32_t gbaCside;
++enum {
++	CSIDE_LEAN_VIDEO = 1,
++	// With 1, the render log's register entries are written without the checks until the ring's end or the workers' progress
++	// needs them, and a 32-bit write to two video registers is one entry.
++	CSIDE_FAST_LOG = 2,
++	// With 1 and 2: the register writes of a DMA run to video registers go in the log as one entry.
++	CSIDE_BATCH = 4,
++	// The interrupt controller's changes that only clear available or line don't stop compiled code (Event.lazy).
++	CSIDE_LAZY_IRQ = 16,
++};
+ // The console whose sound a thread makes, if any, and whether its calls are inside one already
+ // logged whole.
+ extern struct GBA* audioThreaded;
+diff --git a/src/io/io.c b/src/io/io.c
+index 3dfe632..071163e 100644
+--- a/src/io/io.c
++++ b/src/io/io.c
+@@ -103,13 +103,46 @@ static inline bool isVideoRegister(uint32_t address) {
+ 	return address < REG_SOUND1CNT_LO && (address > REG_VCOUNT || address < REG_DISPSTAT);
+ }
+ 
+-static inline void writeVideoRegister(struct GBA* gba, uint32_t address, uint16_t value) {
++// (a function of its own, so ioWrite and ioWrite32 stay as small as they were with the knobs off)
++static __attribute__((noinline)) void writeVideoLean(struct GBA* gba, uint32_t address, uint16_t value) {
++	if (gbaCside & CSIDE_FAST_LOG) {
++		renderWriteVideo(gba, address, value);
++		return;
++	}
++	gba->io[address >> 1] = renderWriteRegisterLean(gba, address, value);
++	renderThreadRegister(gba, address, value);
++}
++
++static inline void writeVideoPlain(struct GBA* gba, uint32_t address, uint16_t value) {
+ 	gba->io[address >> 1] = renderWriteRegister(gba, address, value);
+ 	if (gba->renderThread) {
+ 		renderThreadRegister(gba, address, value);
+ 	}
+ }
+ 
++static inline void writeVideoRegister(struct GBA* gba, uint32_t address, uint16_t value) {
++	if (gba->renderThread && gbaCside & CSIDE_LEAN_VIDEO) {
++		writeVideoLean(gba, address, value);
++		return;
++	}
++	writeVideoPlain(gba, address, value);
++}
++
++// (one entry for both halves where the knobs allow; a function of its own for the same reason)
++static __attribute__((noinline)) void writeVideoRegisters(struct GBA* gba, uint32_t address, uint32_t value) {
++	bool const lean = gbaCside & CSIDE_LEAN_VIDEO;
++	if (lean && gbaCside & CSIDE_FAST_LOG) {
++		renderWriteVideo32(gba, address, value);
++	} else if (lean) {
++		writeVideoLean(gba, address, value & 0xFFFF);
++		writeVideoLean(gba, address | 2, value >> 16);
++	} else {
++		gba->io[address >> 1] = renderWriteRegister(gba, address, value & 0xFFFF);
++		gba->io[(address >> 1) + 1] = renderWriteRegister(gba, address | 2, value >> 16);
++		renderThreadRegister32(gba, address, value);
++	}
++}
++
+ // Handles a 16-bit write to an I/O register at address (an offset into the I/O space). Each case
+ // does what the write does and masks value down to the bits that read back; a case that returns has
+ // stored its own.
+@@ -500,8 +533,12 @@ void ioWrite32(struct GBA* gba, uint32_t address, uint32_t value) {
+ 		if (isVideoRegister(address) && isVideoRegister(address | 2)) {
+ 			// No time passes between the halves, so the second sync would find nothing to do.
+ 			videoSync(gba);
+-			writeVideoRegister(gba, address, value & 0xFFFF);
+-			writeVideoRegister(gba, address | 2, value >> 16);
++			if (gba->renderThread && gbaCside & (CSIDE_LEAN_VIDEO | CSIDE_FAST_LOG)) {
++				writeVideoRegisters(gba, address, value);
++				return;
++			}
++			writeVideoPlain(gba, address, value & 0xFFFF);
++			writeVideoPlain(gba, address | 2, value >> 16);
+ 			return;
+ 		}
+ 		ioWrite(gba, address, value & 0xFFFF);
+diff --git a/src/io/timer.c b/src/io/timer.c
+index 9240df5..a3984ef 100644
+--- a/src/io/timer.c
++++ b/src/io/timer.c
+@@ -307,6 +307,9 @@ static bool writeAtOnce(struct GBA* gba, const struct Timer* written, bool contr
+ 	if (gba->performingDma || gba->cpu.overclock || gba->inEvent || timing->reroot) {
+ 		return false;
+ 	}
++	if (gba->irq.lazy) {
++		gbaIrqSettle(gba);
++	}
+ 	if (timing->root && timingUntil(gba, timing->root) <= 1) {
+ 		return false;
+ 	}
+diff --git a/src/memory.c b/src/memory.c
+index 72f21cc..a64515a 100644
+--- a/src/memory.c
++++ b/src/memory.c
+@@ -438,9 +438,93 @@ int memoryDmaCopy(struct GBA* gba, struct Dma* dma, int count, bool wide, int32_
+ 	return n;
+ }
+ 
++// memoryDmaToIo's loop for CSIDE_LEAN_VIDEO and CSIDE_FAST_LOG, apart so that the loop stays as it was with the knobs off.
++static __attribute__((noinline)) int memoryDmaToIoCopies(struct GBA* gba, struct Dma* dma, int count, bool wide, int32_t sourceStep, int32_t destStep) {
++	struct CPU* cpu = &gba->cpu;
++	const uint8_t* waits = wide ? gba->waitS32 : gba->waitS16;
++	uint32_t s = dma->nextSource;
++	uint32_t d = dma->nextDest;
++	int n = 0;
++	struct RenderBatch batch;
++	bool const batching = gbaCside & CSIDE_BATCH && !cpu->overclock;
++	if (batching) {
++		renderBatchBegin(gba, &batch);
++	}
++	for (; n < count && !gba->dmaReenter; ++n) {
++		if ((s >> 24) < REGION_EWRAM || (s >> 24) > REGION_IWRAM || (d >> 24) != REGION_IO) {
++			break;
++		}
++		cpu->cycles += 1 + waits[s >> 24];
++		if (cpu->cycles >= cpu->nextEvent) {
++			if (batching) {
++				renderBatchFlush(gba, &batch);
++			}
++			processEvents(gba);
++		}
++		uint32_t latch = plainLoad(gba, s, wide);
++		if (!wide) {
++			latch *= 0x10001;
++		}
++		dma->latch = latch;
++		gba->dmaLatch = latch;
++		gba->lastAccessDma = true;
++		cpu->cycles += 1 + waits[REGION_IO];
++		if (cpu->cycles >= cpu->nextEvent) {
++			if (batching) {
++				renderBatchFlush(gba, &batch);
++			}
++			processEvents(gba);
++		}
++		if (wide) {
++			uint32_t const at = d & 0xFFFFFC;
++			if (at < 0x5E && at != 4) {
++				if (batching) {
++					renderBatchWrite(gba, &batch, at, (uint16_t) latch);
++					renderBatchWrite(gba, &batch, at | 2, latch >> 16);
++				} else {
++					videoSync(gba);
++					renderWriteVideo32(gba, at, latch);
++				}
++			} else {
++				if (batching) {
++					renderBatchFlush(gba, &batch);
++				}
++				ioWrite32(gba, at, latch);
++			}
++		} else {
++			uint32_t const at = d & 0xFFFFFE;
++			if (at < 0x60 && (at > 6 || at < 4)) {
++				if (batching) {
++					renderBatchWrite(gba, &batch, at, (uint16_t) (latch >> (8 * (d & 2))));
++				} else {
++					videoSync(gba);
++					renderWriteVideo(gba, at, (uint16_t) (latch >> (8 * (d & 2))));
++				}
++			} else {
++				if (batching) {
++					renderBatchFlush(gba, &batch);
++				}
++				ioWrite(gba, at, (uint16_t) (latch >> (8 * (d & 2))));
++			}
++		}
++		gba->lastAccessDma = true;
++		s += sourceStep;
++		d += destStep;
++	}
++	if (batching) {
++		renderBatchFlush(gba, &batch);
++	}
++	dma->nextSource = s;
++	dma->nextDest = d;
++	return n;
++}
++
+ // Moves up to count DMA units from EWRAM or IWRAM to I/O registers, timed as busDmaRead and busDmaWrite
+ // would. Each unit's cycles are worked out again, as a register can be WAITCNT.
+ int memoryDmaToIo(struct GBA* gba, struct Dma* dma, int count, bool wide, int32_t sourceStep, int32_t destStep) {
++	if (gba->renderThread && (gbaCside & (CSIDE_LEAN_VIDEO | CSIDE_FAST_LOG)) == (CSIDE_LEAN_VIDEO | CSIDE_FAST_LOG)) {
++		return memoryDmaToIoCopies(gba, dma, count, wide, sourceStep, destStep);
++	}
+ 	struct CPU* cpu = &gba->cpu;
+ 	const uint8_t* waits = wide ? gba->waitS32 : gba->waitS16;
+ 	uint32_t s = dma->nextSource;
+diff --git a/src/state.c b/src/state.c
+index 40ce553..0a1b18e 100644
+--- a/src/state.c
++++ b/src/state.c
+@@ -148,6 +148,12 @@ static void leaveOutHost(const struct GBA* gba, struct GBA* saved) {
+ 			}
+ 		}
+ 	}
++	// Lazy changes wait as events in a state, with the flag a load doesn't need.
++	saved->irq.lazy = 0;
++	for (int i = 0; i < 4; ++i) {
++		saved->irq.availableChange[i].event.lazy = false;
++		saved->irq.lineChange[i].event.lazy = false;
++	}
+ 	saved->idleMark = 0;
+ 	saved->idleCycles = 0;
+ 	saved->idleRuns = 0;
+@@ -251,6 +257,7 @@ void statePicturesForget(const struct GBA* gba) {
+ void gbaSaveState(struct GBA* gba, void* state) {
+ 	// With a sound thread, the sound so far is in its copy.
+ 	audioThreadSync(gba);
++	gbaIrqSettle(gba);
+ 	struct StateHeader header = { .magic = STATE_MAGIC, .size = sizeof(struct GBA), .base = 0 };
+ 	struct Event* all[EVENTS];
+ 	events(gba, all);
+@@ -433,6 +440,7 @@ bool gbaLoadState(struct GBA* gba, const void* state, size_t size) {
+ 		all[i]->context = was[i]->context;
+ 		all[i]->next = NULL;
+ 	}
++	gbaIrqLoaded(gba);
+ 	videoEventRestore(gba, header.hblank);
+ 	gba->timing.root = NULL;
+ 	gba->timing.reroot = NULL;
+diff --git a/src/timing.c b/src/timing.c
+index b3ab650..ea0c354 100644
+--- a/src/timing.c
++++ b/src/timing.c
+@@ -122,6 +122,24 @@ void timingSchedule(struct GBA* gba, struct Event* event, int32_t when) {
+ 	*previous = event;
+ }
+ 
++// The same for a lazy event, which compiled code doesn't stop for (CPU clock at 100% only): nextEvent stays as it is.
++void timingScheduleLazy(struct GBA* gba, struct Event* event, int32_t when) {
++	struct Timing* timing = &gba->timing;
++	event->when = when + gba->cpu.cycles + timing->masterCycles;
++	struct Event** previous = timing->reroot ? &timing->reroot : &timing->root;
++	struct Event* next = *previous;
++	while (next) {
++		int32_t after = next->when - event->when;
++		if (after > 0 || (after == 0 && next->priority > event->priority)) {
++			break;
++		}
++		previous = &next->next;
++		next = next->next;
++	}
++	event->next = next;
++	*previous = event;
++}
++
+ // The same, with when on the clock itself.
+ void timingScheduleAbsolute(struct GBA* gba, struct Event* event, int32_t when) {
+ 	timingSchedule(gba, event, when - timingCurrentTime(gba));
+@@ -176,9 +194,17 @@ bool timingIsScheduled(struct GBA* gba, struct Event* event) {
+ 	return false;
+ }
+ 
++// The first event in a list that compiled code stops for.
++static struct Event* firstHard(struct Event* event) {
++	while (event && event->lazy) {
++		event = event->next;
++	}
++	return event;
++}
++
+ // Returns the cycles until the first event, as the CPU's cycle counter counts them.
+ int32_t timingNextEvent(struct GBA* gba) {
+-	struct Event* next = gba->timing.root;
++	struct Event* next = firstHard(gba->timing.root);
+ 	if (!next) {
+ 		return INT_MAX;
+ 	}
+@@ -212,6 +238,10 @@ int32_t timingTick(struct GBA* gba, int32_t cycles) {
+ 		struct Event* next = timing->root;
+ 		int32_t nextWhen = untilEvent(gba, next);
+ 		if (nextWhen > 0) {
++			if (next->lazy) {
++				next = firstHard(next);
++				return next ? untilEvent(gba, next) : INT_MAX;
++			}
+ 			return nextWhen;
+ 		}
+ 		timing->root = next->next;
+@@ -247,7 +277,7 @@ bool timingDeferrable(struct GBA* gba, int32_t time, int kind) {
+ 
+ // After compiled code moved nextEvent up to leave early.
+ void timingResetNextEvent(struct GBA* gba) {
+-	struct Event* next = gba->timing.root;
++	struct Event* next = firstHard(gba->timing.root);
+ 	gba->cpu.nextEvent = next ? untilEvent(gba, next) : INT_MAX;
+ }
+ 
+diff --git a/src/video/render-thread.c b/src/video/render-thread.c
+index 4360239..9ac96a1 100644
+--- a/src/video/render-thread.c
++++ b/src/video/render-thread.c
+@@ -52,7 +52,7 @@ enum {
+ };
+ 
+ enum {
+-	LOG_REGISTER,
++	LOG_REGISTER = RENDER_LOG_REGISTER,
+ 	// The rest of the log up to its end is unused, since entries don't wrap around.
+ 	LOG_SKIP,
+ 	LOG_LINE,
+@@ -60,6 +60,10 @@ enum {
+ 	LOG_LATCH,
+ 	LOG_FINISH,
+ 	LOG_SKIP_LINE,
++	// Both halves of a 32-bit register write, made at one time.
++	LOG_REGISTER2 = RENDER_LOG_REGISTER2,
++	// A count of register writes, each a word of its address and value and a word of its time in the line.
++	LOG_REGISTERS = RENDER_LOG_REGISTERS,
+ };
+ 
+ struct RenderThread;
+@@ -82,18 +86,18 @@ struct Worker {
+ };
+ 
+ struct RenderThread {
++	// First, so that render.c's writes can go straight into the log (CSIDE_FAST_LOG). The log is a ring:
++	// positions only grow, and an entry is at its position modulo LOG_SIZE.
++	struct RenderLogEnd end;
+ 	pthread_mutex_t mutex;
+ 	pthread_cond_t idle;
+ 	struct Worker workers[2];
+ 	int count;
+-	// A ring: positions only grow, and an entry is at its position modulo LOG_SIZE.
+-	uint8_t* log;
+-	// How much is logged, as far as the workers know. The emulation thread's end of the log is head:
++	// How much is logged, as far as the workers know. The emulation thread's end of the log is end.head:
+ 	// entries that only set up a line (register writes, line starts, latches) wait there to be made
+ 	// visible with the next entry that is published, since a barrier for each of them cost more than
+ 	// the write itself on ARM.
+ 	atomic_ullong written;
+-	uint64_t head;
+ 	// The emulation thread's: up to where the log is known to be clear of what the workers have yet
+ 	// to do.
+ 	uint64_t roomUntil;
+@@ -210,6 +214,7 @@ struct Sharer {
+ // For the frontend's log and for tests: lines the emulation thread's copy drew, lines it took over
+ // from a worker, lines taken as they were last frame, and times its copy was made anew.
+ unsigned long renderShareCounts[4];
++uint32_t gbaCside;
+ #if !defined(__3DS__)
+ // ARMGBA_RENDER_STALL=n: a worker stops for 2 ms holding about one line in n, to test taking over.
+ static int stallEvery = -1;
+@@ -322,6 +327,21 @@ static uint32_t play(struct GBA* copy, const uint8_t* entry, uint32_t* size) {
+ 		copy->renderer.copyCycle = head[3];
+ 		renderWriteRegister(copy, head[1], head[2]);
+ 		break;
++	case LOG_REGISTER2:
++		copy->renderer.copyCycle = head[3];
++		renderWriteRegister(copy, head[1], (uint16_t) head[2]);
++		renderWriteRegister(copy, head[1] | 2, head[2] >> 16);
++		break;
++	case LOG_REGISTERS: {
++		*size = 16 + 8 * head[1];
++		for (uint32_t i = 0; i < head[1]; ++i) {
++			uint32_t pair[2];
++			memcpy(pair, entry + 16 + 8 * i, sizeof(pair));
++			copy->renderer.copyCycle = pair[1];
++			renderWriteRegister(copy, pair[0] >> 16, (uint16_t) pair[0]);
++		}
++		break;
++	}
+ 	case LOG_START_LINE:
+ 		renderStartLine(copy, head[1]);
+ 		break;
+@@ -437,7 +457,7 @@ static void* work(void* context) {
+ #if defined(__3DS__)
+ 		uint64_t const began = HOST_TICKS();
+ #endif
+-		bool finish = play(w->copy, &t->log[done & (LOG_SIZE - 1)], &size) == LOG_FINISH;
++		bool finish = play(w->copy, &t->end.log[done & (LOG_SIZE - 1)], &size) == LOG_FINISH;
+ #if defined(__3DS__)
+ 		// One worker's time: with two, each draws half the lines.
+ 		if (!w->index) {
+@@ -488,8 +508,8 @@ static void await(struct RenderThread* t, uint64_t target) {
+ // Makes everything logged so far, with an entry of size bytes, visible to the worker, and wakes it
+ // if it sleeps.
+ static void publish(struct RenderThread* t, uint32_t size) {
+-	t->head += size;
+-	atomic_store(&t->written, t->head);
++	t->end.head += size;
++	atomic_store(&t->written, t->end.head);
+ 	if (atomic_load(&t->asleep)) {
+ 		pthread_mutex_lock(&t->mutex);
+ 		pthread_cond_signal(&t->workers[0].wake);
+@@ -500,10 +520,10 @@ static void publish(struct RenderThread* t, uint32_t size) {
+ 
+ // Waits until the worker has done everything logged so far.
+ static void drain(struct RenderThread* t) {
+-	if (atomic_load_explicit(&t->written, memory_order_relaxed) != t->head) {
++	if (atomic_load_explicit(&t->written, memory_order_relaxed) != t->end.head) {
+ 		publish(t, 0);
+ 	}
+-	await(t, t->head);
++	await(t, t->end.head);
+ }
+ 
+ static void finishShared(struct GBA* gba);
+@@ -511,11 +531,11 @@ static void shareBegin(struct GBA* gba);
+ 
+ // Finds room for the biggest entry, in one piece and clear of what the worker has yet to do.
+ static uint8_t* reserve(struct RenderThread* t) {
+-	uint64_t written = t->head;
++	uint64_t written = t->end.head;
+ 	uint32_t at = written & (LOG_SIZE - 1);
+ 	if (at + LOG_MOST > LOG_SIZE) {
+ 		uint32_t head[4] = { LOG_SKIP, LOG_SIZE - at, 0, 0 };
+-		memcpy(&t->log[at], head, sizeof(head));
++		memcpy(&t->end.log[at], head, sizeof(head));
+ 		publish(t, LOG_SIZE - at);
+ 		written += LOG_SIZE - at;
+ 		at = 0;
+@@ -531,7 +551,17 @@ static uint8_t* reserve(struct RenderThread* t) {
+ 		}
+ 		t->roomUntil = logNeededFrom(t) + LOG_SIZE;
+ 	}
+-	return &t->log[at];
++	return &t->end.log[at];
++}
++
++// With CSIDE_FAST_LOG: until where an entry finds room without reserve (the room it has made, up to the ring's end).
++static inline void quickRoom(struct RenderThread* t) {
++	uint64_t const ringEnd = (t->end.head & ~(uint64_t) (LOG_SIZE - 1)) + LOG_SIZE;
++	t->end.quickUntil = (ringEnd < t->roomUntil ? ringEnd : t->roomUntil) - LOG_MOST + 1;
++}
++
++void renderThreadRoom(struct GBA* gba) {
++	quickRoom(gba->renderThread);
+ }
+ 
+ // Logs an entry that is a call with up to three arguments. One that only sets up a line waits to be
+@@ -543,7 +573,7 @@ static void entry(struct GBA* gba, uint32_t kind, uint32_t a, uint32_t b, uint32
+ 	if (kind == LOG_FINISH) {
+ 		publish(t, sizeof(head));
+ 	} else {
+-		t->head += sizeof(head);
++		t->end.head += sizeof(head);
+ 	}
+ }
+ 
+@@ -553,8 +583,37 @@ void renderThreadRegister(struct GBA* gba, uint32_t address, uint16_t value) {
+ 	entry(gba, LOG_REGISTER, address, value, timingCurrentTime(gba) - gba->video.lineStart);
+ }
+ 
++void renderThreadRegister32(struct GBA* gba, uint32_t address, uint32_t value) {
++	entry(gba, LOG_REGISTER2, address, value, timingCurrentTime(gba) - gba->video.lineStart);
++}
++
++void renderThreadRegisters(struct GBA* gba, const uint32_t* words, uint32_t count) {
++	struct RenderThread* t = gba->renderThread;
++	uint64_t const at = t->end.head;
++	bool const quick = at < t->end.quickUntil;
++	uint8_t* start = quick ? &t->end.log[at & (LOG_SIZE - 1)] : reserve(t);
++	uint32_t head[4] = { LOG_REGISTERS, count, 0, 0 };
++	memcpy(start, head, sizeof(head));
++	memcpy(start + 16, words, 8 * count);
++	t->end.head += 16 + 8 * count;
++	if (!quick) {
++		quickRoom(t);
++	}
++}
++
+ void renderThreadStartLine(struct GBA* gba, int y) {
++	struct RenderThread* t = gba->renderThread;
++	uint64_t const at = t->end.head;
++	if (gbaCside & CSIDE_FAST_LOG && at < t->end.quickUntil) {
++		uint32_t const slot[4] = { LOG_START_LINE, (uint32_t) y, 0, 0 };
++		memcpy(&t->end.log[at & (LOG_SIZE - 1)], slot, sizeof(slot));
++		t->end.head = at + 16;
++		return;
++	}
+ 	entry(gba, LOG_START_LINE, y, 0, 0);
++	if (gbaCside & CSIDE_FAST_LOG) {
++		quickRoom(t);
++	}
+ }
+ 
+ void renderThreadLatch(struct GBA* gba) {
+@@ -565,7 +624,8 @@ void renderThreadLatch(struct GBA* gba) {
+ static void logLine(struct GBA* gba, uint32_t kind, int y) {
+ 	struct RenderThread* t = gba->renderThread;
+ 	struct Renderer* renderer = &gba->renderer;
+-	uint8_t* start = reserve(t);
++	bool const quick = gbaCside & CSIDE_FAST_LOG && t->end.head < t->end.quickUntil;
++	uint8_t* start = quick ? &t->end.log[t->end.head & (LOG_SIZE - 1)] : reserve(t);
+ 	uint8_t* data = start + 16;
+ 	uint32_t changed = renderer->memoryChanged;
+ 	renderer->memoryChanged = 0;
+@@ -598,6 +658,9 @@ static void logLine(struct GBA* gba, uint32_t kind, int y) {
+ 	memcpy(start, head, sizeof(head));
+ 	// Entries start on word boundaries.
+ 	publish(t, (data - start + 3) & ~3u);
++	if (!quick && gbaCside & CSIDE_FAST_LOG) {
++		quickRoom(t);
++	}
+ }
+ 
+ void renderThreadScanline(struct GBA* gba, int y) {
+@@ -636,11 +699,12 @@ static void helperClone(struct RenderThread* t) {
+ 		}
+ 	}
+ 	sharerSet(t->helper, t, HELPER, t->frameSeq);
+-	t->helperDone = t->head;
++	t->helperDone = t->end.head;
+ 	t->helperActive = true;
+ 	++renderShareCounts[3];
+ 	t->idleFrames = 0;
+ 	t->roomUntil = 0;
++	t->end.quickUntil = 0;
+ }
+ 
+ // Lines are shared from here on, if they can be: two workers, each frame waited for, a copy for the
+@@ -714,10 +778,10 @@ static void finishShared(struct GBA* gba) {
+ 		if (t->idleFrames > 30) {
+ 			t->helperActive = false;
+ 		} else {
+-			uint64_t const end = t->head;
++			uint64_t const end = t->end.head;
+ 			while (t->helperDone < end) {
+ 				uint32_t size;
+-				play(t->helper, &t->log[t->helperDone & (LOG_SIZE - 1)], &size);
++				play(t->helper, &t->end.log[t->helperDone & (LOG_SIZE - 1)], &size);
+ 				t->helperDone += size;
+ 			}
+ 		}
+@@ -795,7 +859,7 @@ void renderThreadFinishFrame(struct GBA* gba) {
+ 		renderHooksPublish(gba);
+ 	}
+ 	entry(gba, LOG_FINISH, 0, 0, 0);
+-	t->finishLogged = t->head;
++	t->finishLogged = t->end.head;
+ }
+ 
+ void renderThreadSetWiden(struct GBA* gba, void (*widen)(uint32_t* dst, const uint16_t* src), uint32_t* first, uint32_t* second) {
+@@ -877,16 +941,17 @@ bool renderThreadStart(struct GBA* gba, bool late, bool second) {
+ 	struct RenderThread* t = calloc(1, sizeof(*t));
+ 	if (t) {
+ 		t->workers[0].copy = calloc(1, sizeof(struct GBA));
+-		t->log = malloc(LOG_SIZE);
++		t->end.log = malloc(LOG_SIZE);
+ 	}
+-	if (!t || !t->workers[0].copy || !t->log) {
++	if (!t || !t->workers[0].copy || !t->end.log) {
+ 		if (t) {
+ 			free(t->workers[0].copy);
+-			free(t->log);
++			free(t->end.log);
+ 		}
+ 		free(t);
+ 		return false;
+ 	}
++	t->end.mask = LOG_SIZE - 1;
+ 	pthread_mutex_init(&t->mutex, NULL);
+ 	pthread_cond_init(&t->workers[0].wake, NULL);
+ 	pthread_cond_init(&t->workers[1].wake, NULL);
+@@ -905,7 +970,7 @@ bool renderThreadStart(struct GBA* gba, bool late, bool second) {
+ 	if (pthread_create(&t->workers[0].thread, NULL, work, &t->workers[0])) {
+ #endif
+ 		free(t->workers[0].copy);
+-		free(t->log);
++		free(t->end.log);
+ 		free(t);
+ 		return false;
+ 	}
+@@ -967,6 +1032,6 @@ void renderThreadStop(struct GBA* gba) {
+ 	free(t->workers[1].copy);
+ 	free(t->helper);
+ 	free(t->merged);
+-	free(t->log);
++	free(t->end.log);
+ 	free(t);
+ }
+diff --git a/src/video/render.c b/src/video/render.c
+index ab9ff7b..caff27f 100644
+--- a/src/video/render.c
++++ b/src/video/render.c
+@@ -3479,6 +3479,9 @@ void renderSkipScanline(struct GBA* gba, int y) {
+ }
+ 
+ void renderStartLine(struct GBA* gba, int y) {
++	if (gbaCside & CSIDE_LEAN_VIDEO && gba->renderThread) {
++		return;
++	}
+ 	struct HookSlot* slot = twinOf(gba);
+ 	if (slot) {
+ 		oneStartLine(slot->twin, y);
+@@ -3487,6 +3490,10 @@ void renderStartLine(struct GBA* gba, int y) {
+ }
+ 
+ void renderLatchDispcnt(struct GBA* gba) {
++	if (gbaCside & CSIDE_LEAN_VIDEO && gba->renderThread) {
++		oneLatchDispcnt(gba);
++		return;
++	}
+ 	struct HookSlot* slot = twinOf(gba);
+ 	if (slot) {
+ 		oneLatchDispcnt(slot->twin);
+@@ -3537,6 +3544,106 @@ uint16_t renderWriteRegister(struct GBA* gba, uint32_t address, uint16_t value)
+ 	return oneWriteRegister(gba, address, value) | kept;
+ }
+ 
++// Copies draw for this machine, so what it reads of its renderer is DISPCNT and its latch (video.c) and the
++// registers' values as they read back; the rest stays as it was, and a copy takes the whole state from
++// renderThreadClone (and this machine takes it back from the copies in renderThreadStop).
++const uint16_t renderLeanMask[0x30] = {
++	[0x000 >> 1] = 0xFFF7, [0x002 >> 1] = 0xFFFF, [0x004 >> 1] = 0xFFFF, [0x006 >> 1] = 0xFFFF,
++	[0x008 >> 1] = 0xDFFF, [0x00A >> 1] = 0xDFFF, [0x00C >> 1] = 0xFFFF, [0x00E >> 1] = 0xFFFF,
++	[0x010 >> 1] = 0x01FF, [0x012 >> 1] = 0x01FF, [0x014 >> 1] = 0x01FF, [0x016 >> 1] = 0x01FF,
++	[0x018 >> 1] = 0x01FF, [0x01A >> 1] = 0x01FF, [0x01C >> 1] = 0x01FF, [0x01E >> 1] = 0x01FF,
++	[0x020 >> 1] = 0xFFFF, [0x022 >> 1] = 0xFFFF, [0x024 >> 1] = 0xFFFF, [0x026 >> 1] = 0xFFFF,
++	[0x028 >> 1] = 0xFFFF, [0x02A >> 1] = 0xFFFF, [0x02C >> 1] = 0xFFFF, [0x02E >> 1] = 0xFFFF,
++	[0x030 >> 1] = 0xFFFF, [0x032 >> 1] = 0xFFFF, [0x034 >> 1] = 0xFFFF, [0x036 >> 1] = 0xFFFF,
++	[0x038 >> 1] = 0xFFFF, [0x03A >> 1] = 0xFFFF, [0x03C >> 1] = 0xFFFF, [0x03E >> 1] = 0xFFFF,
++	[0x040 >> 1] = 0xFFFF, [0x042 >> 1] = 0xFFFF, [0x044 >> 1] = 0xFFFF, [0x046 >> 1] = 0xFFFF,
++	[0x048 >> 1] = 0x3F3F, [0x04A >> 1] = 0x3F3F, [0x04C >> 1] = 0xFFFF, [0x04E >> 1] = 0xFFFF,
++	[0x050 >> 1] = 0x3FFF, [0x052 >> 1] = 0x1F1F, [0x054 >> 1] = 0x001F, [0x056 >> 1] = 0xFFFF,
++	[0x058 >> 1] = 0xFFFF, [0x05A >> 1] = 0xFFFF, [0x05C >> 1] = 0xFFFF, [0x05E >> 1] = 0xFFFF,
++};
++
++// The slot of the machine this thread emulates, found by renderWriteRegisterLean alone (so no other thread writes it).
++static struct HookSlot* emulatedHooks;
++
++// The value of a video register as it reads back, with the hooks' masked bits kept out of it.
++static inline uint16_t leanValue(struct GBA* gba, uint32_t address, uint16_t value) {
++	struct HookSlot* any = emulatedHooks;
++	if (!any || any->gba != gba) {
++		any = emulatedHooks = findHooks(gba);
++	}
++	uint16_t kept = 0;
++	if (any && any->hooks->second && any->hooks->maskedBits && address == any->hooks->maskedRegister) {
++		kept = value & any->hooks->maskedBits;
++		value &= ~any->hooks->maskedBits;
++	}
++	value &= renderLeanMask[address >> 1];
++	if (address == 0x000) {
++		gba->renderer.dispcnt = value;
++		gba->vramStall = (value & 7) == 2 && (value & 0x0C00) == 0x0C00;
++		videoDispcntWritten(gba);
++	} else if (address == 0x054 && value > 0x10) {
++		value = 0x10;
++	}
++	return value | kept;
++}
++
++uint16_t renderWriteRegisterLean(struct GBA* gba, uint32_t address, uint16_t value) {
++	return leanValue(gba, address, value);
++}
++
++void renderWriteVideo(struct GBA* gba, uint32_t address, uint16_t value) {
++	gba->io[address >> 1] = leanValue(gba, address, value);
++	struct RenderLogEnd* end = (struct RenderLogEnd*) gba->renderThread;
++	uint64_t const at = end->head;
++	if (at < end->quickUntil) {
++		uint32_t* slot = (uint32_t*) (end->log + (at & end->mask));
++		slot[0] = RENDER_LOG_REGISTER;
++		slot[1] = address;
++		slot[2] = value;
++		slot[3] = (uint32_t) (timingCurrentTime(gba) - gba->video.lineStart);
++		end->head = at + 16;
++		return;
++	}
++	renderThreadRegister(gba, address, value);
++	renderThreadRoom(gba);
++}
++
++void renderWriteVideo32(struct GBA* gba, uint32_t address, uint32_t value) {
++	gba->io[address >> 1] = leanValue(gba, address, (uint16_t) value);
++	gba->io[(address >> 1) + 1] = leanValue(gba, address | 2, value >> 16);
++	struct RenderLogEnd* end = (struct RenderLogEnd*) gba->renderThread;
++	uint64_t const at = end->head;
++	if (at < end->quickUntil) {
++		uint32_t* slot = (uint32_t*) (end->log + (at & end->mask));
++		slot[0] = RENDER_LOG_REGISTER2;
++		slot[1] = address;
++		slot[2] = value;
++		slot[3] = (uint32_t) (timingCurrentTime(gba) - gba->video.lineStart);
++		end->head = at + 16;
++		return;
++	}
++	renderThreadRegister32(gba, address, value);
++	renderThreadRoom(gba);
++}
++
++void renderBatchBegin(struct GBA* gba, struct RenderBatch* batch) {
++	struct HookSlot* any = emulatedHooks;
++	if (!any || any->gba != gba) {
++		any = emulatedHooks = findHooks(gba);
++	}
++	bool const masks = any && any->hooks->second && any->hooks->maskedBits;
++	batch->count = 0;
++	batch->maskedRegister = masks ? any->hooks->maskedRegister : 0xFFFF;
++	batch->maskedBits = masks ? any->hooks->maskedBits : 0;
++}
++
++void renderBatchFlush(struct GBA* gba, struct RenderBatch* batch) {
++	if (batch->count) {
++		renderThreadRegisters(gba, batch->words, batch->count / 2);
++		batch->count = 0;
++	}
++}
++
+ void renderReset(struct GBA* gba) {
+ 	struct HookSlot* slot = findHooks(gba);
+ 	if (slot) {
+diff --git a/src/video/render.h b/src/video/render.h
+index 5debb4c..e46bb6e 100644
+--- a/src/video/render.h
++++ b/src/video/render.h
+@@ -286,6 +286,45 @@ void renderForget(struct Renderer*);
+ // Chooses the SIMD paths if the CPU has them; ARMGBA_RENDER=reference keeps to the scalar ones.
+ void renderInit(void);
+ uint16_t renderWriteRegister(struct GBA*, uint32_t address, uint16_t value);
++// The same for a machine whose copies draw (CSIDE_LEAN_VIDEO): only what the machine reads of its own renderer is kept.
++uint16_t renderWriteRegisterLean(struct GBA*, uint32_t address, uint16_t value);
++// The emulation thread's end of the render log (render-thread.c), the first member of a machine's RenderThread, so that
++// a register write can go straight in while head is below quickUntil (CSIDE_FAST_LOG).
++struct RenderLogEnd {
++	uint8_t* log;
++	uint64_t head;
++	uint64_t quickUntil;
++	uint32_t mask;
++};
++enum {
++	RENDER_LOG_REGISTER = 0,
++	RENDER_LOG_REGISTER2 = 7,
++};
++// With CSIDE_LEAN_VIDEO and CSIDE_FAST_LOG: a write to a video register (or to two, the 32-bit one), made as
++// renderWriteRegisterLean and renderThreadRegister make it, with the value as it reads back put in io.
++void renderWriteVideo(struct GBA*, uint32_t address, uint16_t value);
++void renderWriteVideo32(struct GBA*, uint32_t address, uint32_t value);
++// CSIDE_BATCH: the register writes of one DMA run to video registers, kept in a batch and logged as one entry (the
++// copies play them at the same times). The batch is flushed before anything that may log, and at the run's end.
++struct RenderBatch {
++	uint32_t count;
++	// What the hooks mask out of a register's value, as they stand when the run starts.
++	uint16_t maskedRegister;
++	uint16_t maskedBits;
++	// For each write, the register and its value, and the time in its line.
++	uint32_t words[2 * 32];
++};
++enum {
++	RENDER_BATCH_MAX = 32,
++	RENDER_LOG_REGISTERS = 8,
++};
++void renderBatchBegin(struct GBA*, struct RenderBatch*);
++// What the lean writes keep of each register's value (renderBatchWrite, in gba.h; renderWriteRegisterLean).
++extern const uint16_t renderLeanMask[0x30];
++void renderBatchFlush(struct GBA*, struct RenderBatch*);
++void renderThreadRegisters(struct GBA*, const uint32_t* words, uint32_t count);
++// After a write that went through the slow path: where the log has room for entries written straight in.
++void renderThreadRoom(struct GBA*);
+ void renderScanline(struct GBA*, int y);
+ void renderSkipScanline(struct GBA*, int y);
+ // At the start of each line, the affine backgrounds finish the last line and take on new reference
+@@ -310,6 +349,8 @@ void renderThreadClone(struct GBA*);
+ // Returns the copy's renderer, with everything logged so far drawn.
+ const struct Renderer* renderThreadRenderer(struct GBA*);
+ void renderThreadRegister(struct GBA*, uint32_t address, uint16_t value);
++// Both halves of a 32-bit write to two video registers, as one entry (CSIDE_FAST_LOG).
++void renderThreadRegister32(struct GBA*, uint32_t address, uint32_t value);
+ void renderThreadScanline(struct GBA*, int y);
+ void renderThreadSkipScanline(struct GBA*, int y);
+ void renderThreadStartLine(struct GBA*, int y);

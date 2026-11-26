@@ -1,0 +1,102 @@
+diff --git a/include/mgba/internal/arm/isa-inlines.h b/include/mgba/internal/arm/isa-inlines.h
+index ebda28e41..cb2e605d7 100644
+--- a/include/mgba/internal/arm/isa-inlines.h
++++ b/include/mgba/internal/arm/isa-inlines.h
+@@ -10,6 +10,10 @@
+ 
+ #include "arm.h"
+ 
++#if defined(M_CORE_GBA) && !defined(ENABLE_DEBUGGERS)
++#include <mgba/internal/gba/gba.h>
++#endif
++
+ #define ARM_COND_EQ (cpu->cpsr.z)
+ #define ARM_COND_NE (!cpu->cpsr.z)
+ #define ARM_COND_CS (cpu->cpsr.c)
+@@ -70,9 +74,19 @@
+ #define ARM_STUB cpu->irqh.hitStub(cpu, opcode)
+ #define ARM_ILL cpu->irqh.hitIllegal(cpu, opcode)
+ 
++/* The debugger's memory shim replaces setActiveRegion, so only builds without debuggers skip the call. */
++static inline void _armSetActiveRegion(struct ARMCore* cpu, uint32_t pc) {
++#if defined(M_CORE_GBA) && !defined(ENABLE_DEBUGGERS)
++	if (GBAJumpFast(cpu, pc)) {
++		return;
++	}
++#endif
++	cpu->memory.setActiveRegion(cpu, pc);
++}
++
+ static inline int32_t ARMWritePC(struct ARMCore* cpu) {
+ 	uint32_t pc = cpu->gprs[ARM_PC] & -WORD_SIZE_THUMB;
+-	cpu->memory.setActiveRegion(cpu, pc);
++	_armSetActiveRegion(cpu, pc);
+ 	LOAD_32(cpu->prefetch[0], pc & cpu->memory.activeMask, cpu->memory.activeRegion);
+ 	pc += WORD_SIZE_ARM;
+ 	LOAD_32(cpu->prefetch[1], pc & cpu->memory.activeMask, cpu->memory.activeRegion);
+@@ -82,7 +96,7 @@ static inline int32_t ARMWritePC(struct ARMCore* cpu) {
+ 
+ static inline int32_t ThumbWritePC(struct ARMCore* cpu) {
+ 	uint32_t pc = cpu->gprs[ARM_PC] & -WORD_SIZE_THUMB;
+-	cpu->memory.setActiveRegion(cpu, pc);
++	_armSetActiveRegion(cpu, pc);
+ 	LOAD_16(cpu->prefetch[0], pc & cpu->memory.activeMask, cpu->memory.activeRegion);
+ 	pc += WORD_SIZE_THUMB;
+ 	LOAD_16(cpu->prefetch[1], pc & cpu->memory.activeMask, cpu->memory.activeRegion);
+diff --git a/include/mgba/internal/gba/gba.h b/include/mgba/internal/gba/gba.h
+index 65e994dc6..2520d586e 100644
+--- a/include/mgba/internal/gba/gba.h
++++ b/include/mgba/internal/gba/gba.h
+@@ -191,6 +191,27 @@ void GBATestKeypadIRQ(struct GBA* gba);
+ void GBAFrameStarted(struct GBA* gba);
+ void GBAFrameEnded(struct GBA* gba);
+ 
++/* The usual jump (same region, no idle loop to check) needs no more than this; false leaves the rest to
++ * GBASetActiveRegion's slow path. */
++static inline bool GBAJumpFast(struct ARMCore* cpu, uint32_t address) {
++	struct GBA* gba = (struct GBA*) cpu->master;
++	struct GBAMemory* memory = &gba->memory;
++	int newRegion = address >> BASE_OFFSET;
++	if (gba->idleOptimization < IDLE_LOOP_DETECT && newRegion == memory->activeRegion &&
++	    (gba->idleOptimization < IDLE_LOOP_REMOVE || newRegion == GBA_REGION_BIOS || address != gba->idleLoop) &&
++	    (newRegion < GBA_REGION_ROM0 || (address & (GBA_SIZE_ROM0 - 1)) < memory->romSize)) {
++		gba->lastJump = address;
++		memory->lastPrefetchedPc = 0;
++		if (cpu->cpsr.t) {
++			cpu->memory.activeMask |= WORD_SIZE_THUMB;
++		} else {
++			cpu->memory.activeMask &= -WORD_SIZE_ARM;
++		}
++		return true;
++	}
++	return false;
++}
++
+ CXX_GUARD_END
+ 
+ #endif
+diff --git a/src/gba/memory.c b/src/gba/memory.c
+index ef3646b24..153af60c1 100644
+--- a/src/gba/memory.c
++++ b/src/gba/memory.c
+@@ -428,19 +428,7 @@ static __attribute__((noinline)) void _stalledStore(struct ARMCore* cpu, int32_t
+ 
+ /* The usual jump (same region, no idle loop to check) takes a short path; the rest is _setActiveRegionSlow. */
+ static void GBASetActiveRegion(struct ARMCore* cpu, uint32_t address) {
+-	struct GBA* gba = (struct GBA*) cpu->master;
+-	struct GBAMemory* memory = &gba->memory;
+-	int newRegion = address >> BASE_OFFSET;
+-	if (gba->idleOptimization < IDLE_LOOP_DETECT && newRegion == memory->activeRegion &&
+-	    (gba->idleOptimization < IDLE_LOOP_REMOVE || newRegion == GBA_REGION_BIOS || address != gba->idleLoop) &&
+-	    (newRegion < GBA_REGION_ROM0 || (address & (GBA_SIZE_ROM0 - 1)) < memory->romSize)) {
+-		gba->lastJump = address;
+-		memory->lastPrefetchedPc = 0;
+-		if (cpu->cpsr.t) {
+-			cpu->memory.activeMask |= WORD_SIZE_THUMB;
+-		} else {
+-			cpu->memory.activeMask &= -WORD_SIZE_ARM;
+-		}
++	if (GBAJumpFast(cpu, address)) {
+ 		return;
+ 	}
+ 	_setActiveRegionSlow(cpu, address);

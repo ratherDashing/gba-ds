@@ -50,6 +50,9 @@ bool mapcap_request(MapCapture* mc, Emu* live);
 void mapcap_set_alt(int on);
 int mapcap_alt_view(void);
 bool mapcap_busy(MapCapture* mc);
+/* What every capture has taken so far (the one running included, up to now), in microseconds and shadow-core frames:
+ * sums that wrap (the bench's columns take differences). The game thread's, which owns the capture. */
+void mapcap_work_totals(uint32_t* us, uint32_t* frames);
 /* Calls off the capture running, if any (the game moved on: a newer one's
  * wanted): it stops at once and publishes nothing; mapcap_busy is false
  * again as soon as it has. */

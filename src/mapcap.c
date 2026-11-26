@@ -3,6 +3,9 @@
 #ifdef __ANDROID__
 #include "android.h"
 #endif
+#ifdef __3DS__
+#include "host.h"
+#endif
 
 #include <pthread.h>
 #include <sys/resource.h>
@@ -12,6 +15,9 @@
 #include <stdlib.h>
 #include <time.h>
 #include <string.h>
+#ifdef __3DS__
+#include "host.h"
+#endif
 
 struct MapCapture {
 	const MapProfile* prof;
@@ -431,7 +437,7 @@ static void grab_under(MapCapture* mc, Emu* s) {
 	emu_layers(s, p->underLayers);
 	emu_state_load(s, mc->underState);
 	emu_frame(s, 0);
-	memcpy(mc->under, s->fb, GBA_W * GBA_H * sizeof(uint32_t));
+	memcpy(mc->under, emu_fb(s), GBA_W * GBA_H * sizeof(uint32_t));
 	emu_layers(s, 0x1F);
 	if (n > base) emu_hide_sprites(s, rules, base);
 	emu_state_load(s, mc->underState);
@@ -473,8 +479,14 @@ static int count_diff(const uint32_t* a, const uint32_t* b, size_t n, int limit)
 	return d;
 }
 
+/* A frame of the shadow core, drawn only if its picture is looked at after. */
+static void frame_if(Emu* s, uint32_t keys, bool drawn) {
+	if (drawn) emu_frame(s, keys);
+	else emu_frame_blind(s, keys);
+}
+
 static bool map_up(const MapProfile* p, Emu* s) {
-	return memprobes_match(p->mem, 4, s) && screen_matches(p, s->fb);
+	return memprobes_match(p->mem, 4, s) && screen_matches(p, emu_fb(s));
 }
 
 /* Runs the shadow core from `state`; returns NULL on success or a reason.
@@ -490,17 +502,49 @@ static long frame_luma(const uint32_t* px, size_t n) {
 static void place_rate(MapCapture* mc);
 
 static const char* do_capture_(MapCapture* mc, const void* state);
+/* The bench's sums: finished captures plus the one running so far, so a capture that outlasts a bench window is shared
+ * out over the windows it ran in (the game thread reads; it also owns mc). */
+static pthread_mutex_t workLock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+	uint32_t us, frames, since;
+	MapCapture* mc;
+	unsigned long f0;
+} work;
+
+static uint32_t clock_us(const struct timespec* t) {
+	return (uint32_t) t->tv_sec * 1000000u + (uint32_t) (t->tv_nsec / 1000);
+}
+
+void mapcap_work_totals(uint32_t* us, uint32_t* frames) {
+	struct timespec t;
+	pthread_mutex_lock(&workLock);
+	clock_gettime(CLOCK_MONOTONIC, &t); /* (inside the lock: a total never reads more than its capture's end gives) */
+	*us = work.us;
+	*frames = work.frames;
+	if (work.mc) {
+		*us += clock_us(&t) - work.since;
+		*frames += (uint32_t) (__atomic_load_n(&work.mc->shadow.frames, __ATOMIC_RELAXED) - work.f0);
+	}
+	pthread_mutex_unlock(&workLock);
+}
 /* A capture, timed for GBADS_DEBUG: how long, how many of the shadow
  * core's frames */
 static const char* do_capture(MapCapture* mc, const void* state) {
 	static int dbg = -1;
 	if (dbg < 0) dbg = getenv("GBADS_DEBUG") != NULL;
 	struct timespec t0, t1;
+	unsigned long f0 = mc->shadow.frames, b0 = mc->shadow.blindFrames;
+	pthread_mutex_lock(&workLock);
 	clock_gettime(CLOCK_MONOTONIC, &t0);
-	unsigned long f0 = mc->shadow.frames;
+	work.since = clock_us(&t0), work.f0 = f0, work.mc = mc;
+	pthread_mutex_unlock(&workLock);
 	const char* err = do_capture_(mc, state);
+	pthread_mutex_lock(&workLock);
 	clock_gettime(CLOCK_MONOTONIC, &t1);
-	if (dbg) fprintf(stderr, "capture: %.0f ms, %lu frames%s%s\n", (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6, mc->shadow.frames - f0,
+	work.us += clock_us(&t1) - clock_us(&t0), work.frames += (uint32_t) (mc->shadow.frames - f0), work.mc = NULL;
+	pthread_mutex_unlock(&workLock);
+	if (dbg) fprintf(stderr, "capture: %.0f ms, %lu frames (%lu drawn)%s%s\n", (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6,
+	                 mc->shadow.frames - f0, (mc->shadow.frames - f0) - (mc->shadow.blindFrames - b0),
 	                 mc->cancel ? ", called off" : err ? ": " : "", mc->cancel ? "" : err ? err : "");
 	return err;
 }
@@ -540,20 +584,21 @@ static const char* do_capture_(MapCapture* mc, const void* state) {
 	if (p->openPoke.addr) emu_write8(s, p->openPoke.addr, p->openPoke.value);
 	/* (openAlt: the game's other way to the map, from where it's asked for) */
 	const MacroStep* open = p->openAlt[0].frames && memprobes_match(p->openAltIf, 2, s) ? p->openAlt : p->open;
+	/* (the button presses and the waits on memory aren't looked at: they run without drawing) */
 	for (int i = 0; i < 8 && open[i].frames; ++i) {
 		for (int f = 0; f < open[i].frames; ++f) {
-			emu_frame(s, open[i].keys);
+			emu_frame_blind(s, open[i].keys);
 		}
 	}
 	if (p->open2[0].frames) {
 		int limit = p->openWithin ? p->openWithin : p->settleMax;
 		int g = 0;
-		while (g < limit && !memprobes_match(p->mem, 4, s)) emu_frame(s, 0), ++g;
+		while (g < limit && !memprobes_match(p->mem, 4, s)) emu_frame_blind(s, 0), ++g;
 		if (g >= limit) return "map button did nothing";
 		if (memprobes_match(p->open2If, 2, s)) {
-			for (int f = 0; f < p->open2Delay; ++f) emu_frame(s, 0);
+			for (int f = 0; f < p->open2Delay; ++f) emu_frame_blind(s, 0);
 			for (int i = 0; i < 4 && p->open2[i].frames; ++i) {
-				for (int f = 0; f < p->open2[i].frames; ++f) emu_frame(s, p->open2[i].keys);
+				for (int f = 0; f < p->open2[i].frames; ++f) emu_frame_blind(s, p->open2[i].keys);
 			}
 		}
 	}
@@ -568,7 +613,7 @@ static const char* do_capture_(MapCapture* mc, const void* state) {
 			if (presses < p->openTries) {
 				/* ignored for now: press it again */
 				for (int i = 0; i < 8 && open[i].frames; ++i) {
-					for (int g = 0; g < open[i].frames; ++g) emu_frame(s, open[i].keys);
+					for (int g = 0; g < open[i].frames; ++g) emu_frame_blind(s, open[i].keys);
 				}
 				++presses, base = f;
 				continue;
@@ -581,7 +626,7 @@ static const char* do_capture_(MapCapture* mc, const void* state) {
 			continue;
 		}
 		everUp = true;
-		crop(mc, s->fb, mc->work[0]);
+		crop(mc, emu_fb(s), mc->work[0]);
 		if (havePrev && count_diff(mc->prev, mc->work[0], n, p->maxDiff) <= p->maxDiff) {
 			if (++stable >= p->stableFrames) {
 				break;
@@ -612,13 +657,11 @@ static const char* do_capture_(MapCapture* mc, const void* state) {
 	mc->workPages = false; /* (blinking markers) */
 	bool animated = false;
 	for (int i = 1; i < want; ++i) {
-		for (int k = 0; k < step; ++k) {
-			emu_frame(s, 0);
-		}
+		for (int k = 0; k < step; ++k) frame_if(s, 0, k == step - 1);
 		if (!map_up(p, s)) {
 			break;
 		}
-		crop(mc, s->fb, mc->work[i]);
+		crop(mc, emu_fb(s), mc->work[i]);
 		if (memcmp(mc->work[i], mc->work[0], n * sizeof(uint32_t))) {
 			animated = true;
 		}
@@ -667,11 +710,14 @@ static bool grab_rate(MapCapture* mc, const void* state) {
 	Emu* s = &mc->shadow;
 	int w = p->rate.w, h = p->rate.h;
 	if ((w + 2) * (h + 2) > 256 * 16 || !emu_state_load(s, state)) return false;
-	emu_frame(s, 0);
+	/* (only the last frame is looked at: the others run without drawing) */
+	int left = 1 + p->rate.wait;
+	for (int i = 0; i < 4 && p->rate.open[i].frames; ++i) left += p->rate.open[i].frames;
+	frame_if(s, 0, --left == 0);
 	for (int i = 0; i < 4 && p->rate.open[i].frames; ++i) {
-		for (int f = 0; f < p->rate.open[i].frames; ++f) emu_frame(s, p->rate.open[i].keys);
+		for (int f = 0; f < p->rate.open[i].frames; ++f) frame_if(s, p->rate.open[i].keys, --left == 0);
 	}
-	for (int f = 0; f < p->rate.wait; ++f) emu_frame(s, 0);
+	for (int f = 0; f < p->rate.wait; ++f) frame_if(s, 0, --left == 0);
 	uint32_t text = to_fb(p->rate.text);
 	/* the digits, plus a 1-pixel outline in the map's background colour */
 	int count = 0;
@@ -679,7 +725,7 @@ static bool grab_rate(MapCapture* mc, const void* state) {
 	for (int y = 0; y < h; ++y) {
 		for (int x = 0; x < w; ++x) {
 			mc->rateMask[y * w + x] = false;
-			if ((s->fb[(p->rate.y + y) * GBA_W + p->rate.x + x] & 0xFFFFFF) == text) ++count;
+			if ((emu_fb(s)[(p->rate.y + y) * GBA_W + p->rate.x + x] & 0xFFFFFF) == text) ++count;
 		}
 	}
 	if (count < 12) return false; /* the pause screen didn't come up */
@@ -692,7 +738,7 @@ static bool grab_rate(MapCapture* mc, const void* state) {
 				for (int dx = -1; dx <= 1; ++dx) {
 					int u = x - 1 + dx, v = y - 1 + dy;
 					if (u < 0 || v < 0 || u >= w || v >= h) continue;
-					bool t = (s->fb[(p->rate.y + v) * GBA_W + p->rate.x + u] & 0xFFFFFF) == text;
+					bool t = (emu_fb(s)[(p->rate.y + v) * GBA_W + p->rate.x + u] & 0xFFFFFF) == text;
 					if (t && !dx && !dy) isText = true;
 					if (t) nearText = true;
 				}
@@ -745,14 +791,18 @@ static void* worker(void* arg) {
 #ifdef __ANDROID__
 	android_pin_worker_thread("map capture");
 #endif
+#ifdef __3DS__
+	host_capture_thread_lower();
+#endif
 	pthread_mutex_lock(&mc->lock);
 	while (mc->running) {
 		if (!mc->pending) {
 			pthread_cond_wait(&mc->cond, &mc->lock);
 			continue;
 		}
-		mc->pending = false;
-		mc->busy = true;
+		/* (busy first: the game thread reads pending and then busy without the lock, and must never see both clear) */
+		__atomic_store_n(&mc->busy, true, __ATOMIC_SEQ_CST);
+		__atomic_store_n(&mc->pending, false, __ATOMIC_SEQ_CST);
 		pthread_mutex_unlock(&mc->lock);
 
 		const char* err = do_capture(mc, mc->snapshot);
@@ -761,7 +811,7 @@ static void* worker(void* arg) {
 		/* (called off: a newer one's wanted; neither a result nor a failure) */
 		if (!mc->cancel) publish(mc, err);
 		mc->cancel = false;
-		mc->busy = false;
+		__atomic_store_n(&mc->busy, false, __ATOMIC_SEQ_CST);
 	}
 	pthread_mutex_unlock(&mc->lock);
 	return NULL;
@@ -770,8 +820,9 @@ static void* worker(void* arg) {
 /* A capture's result, for mapcap_poll (lock held). */
 static void publish(MapCapture* mc, const char* err) {
 	size_t n = mc->cropPixels;
-	mc->lastError = err;
-	mc->failures = err ? mc->failures + 1 : 0;
+	/* (the game thread reads failures, then lastError, without the lock) */
+	__atomic_store_n(&mc->lastError, err, __ATOMIC_RELEASE);
+	__atomic_store_n(&mc->failures, err ? mc->failures + 1 : 0, __ATOMIC_RELEASE);
 	if (err) return;
 	for (int i = 0; i < mc->workFrames; ++i) {
 		memcpy(mc->published[i], mc->work[i], n * sizeof(uint32_t));
@@ -779,7 +830,7 @@ static void publish(MapCapture* mc, const char* err) {
 	mc->pubFrames = mc->workFrames;
 	mc->pubStep = mc->workStep;
 	mc->pubPages = mc->workPages;
-	++mc->serial;
+	__atomic_store_n(&mc->serial, mc->serial + 1, __ATOMIC_RELEASE);
 }
 
 MapCapture* mapcap_create(const char* romPath, const char* gameCode, bool tight) {
@@ -845,6 +896,10 @@ static void start_thread(MapCapture* mc) {
 	if (sync) mc->noThread = true;
 	if (!mc->running && !mc->noThread) {
 		mc->running = true;
+#ifdef __3DS__
+		host_next_thread_core(host_capture_core());
+		host_next_thread_name("hidden copy");
+#endif
 		if (pthread_create(&mc->thread, NULL, worker, mc) != 0) mc->running = false, mc->noThread = true;
 	}
 }
@@ -1069,7 +1124,8 @@ bool mapcap_request(MapCapture* mc, Emu* live) {
 		publish(mc, do_capture(mc, mc->snapshot));
 		return true;
 	}
-	pthread_mutex_lock(&mc->lock);
+	/* (no waiting for the worker's lock: a miss is tried again next frame) */
+	if (pthread_mutex_trylock(&mc->lock) != 0) return false;
 	if (mc->busy || mc->pending) {
 		pthread_mutex_unlock(&mc->lock);
 		return false;
@@ -1077,7 +1133,7 @@ bool mapcap_request(MapCapture* mc, Emu* live) {
 	/* The worker only reads the snapshot after `pending` is set. */
 	bool ok = emu_state_save(live, mc->snapshot);
 	if (ok) {
-		mc->pending = true;
+		__atomic_store_n(&mc->pending, true, __ATOMIC_SEQ_CST);
 		pthread_cond_signal(&mc->cond);
 	}
 	pthread_mutex_unlock(&mc->lock);
@@ -1101,21 +1157,24 @@ void mapcap_cancel(MapCapture* mc) {
 		return;
 	}
 #endif
-	pthread_mutex_lock(&mc->lock);
+	/* (a miss is asked again next frame: the room is still changed) */
+	if (pthread_mutex_trylock(&mc->lock) != 0) return;
 	if (mc->busy) mc->cancel = true;
 	pthread_mutex_unlock(&mc->lock);
 }
 
+/* The game thread's calls each frame (busy, failures, poll) never wait for the worker's lock: it can be held while the
+ * worker is not running (a core 3 thread of the same priority has the core, and the kernel doesn't time-slice). */
 bool mapcap_busy(MapCapture* mc) {
-	pthread_mutex_lock(&mc->lock);
-	bool b = mc->busy || mc->pending;
-	pthread_mutex_unlock(&mc->lock);
-	return b;
+	/* (pending first: the worker sets busy before it clears pending) */
+	bool pending = __atomic_load_n(&mc->pending, __ATOMIC_SEQ_CST);
+	return pending || __atomic_load_n(&mc->busy, __ATOMIC_SEQ_CST);
 }
 
 bool mapcap_poll(MapCapture* mc, uint32_t lastSerial, MapResult* out) {
 	size_t n = mc->cropPixels;
-	pthread_mutex_lock(&mc->lock);
+	uint32_t serial = __atomic_load_n(&mc->serial, __ATOMIC_ACQUIRE);
+	if (serial == lastSerial || serial == 0 || pthread_mutex_trylock(&mc->lock) != 0) return false;
 	bool fresh = mc->serial != lastSerial && mc->serial != 0;
 	if (fresh) {
 		out->ok = true;
@@ -1141,10 +1200,8 @@ bool mapcap_poll(MapCapture* mc, uint32_t lastSerial, MapResult* out) {
 }
 
 int mapcap_failures(MapCapture* mc, const char** why) {
-	pthread_mutex_lock(&mc->lock);
-	int f = mc->failures;
-	if (why) *why = mc->lastError;
-	pthread_mutex_unlock(&mc->lock);
+	int f = __atomic_load_n(&mc->failures, __ATOMIC_ACQUIRE);
+	if (why) *why = __atomic_load_n(&mc->lastError, __ATOMIC_ACQUIRE);
 	return f;
 }
 

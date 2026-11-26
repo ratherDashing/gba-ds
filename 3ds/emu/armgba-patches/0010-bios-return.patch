@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Tue, 24 Nov 2026 16:20:41 -0500
+Subject: armGBA: MRS reads the CPSR's flags without the spill, and the BIOS's
+ return from an exception runs without the exact CPU (armGBA 2.0 already runs
+ MSR without the exact CPU's decoder, 9cdbe86, and takes an IRQ where compiled
+ code is, 5230ef8)
+
+
+diff --git a/src/cpu/a32/backend.c b/src/cpu/a32/backend.c
+index 8eec179..f1874f4 100644
+--- a/src/cpu/a32/backend.c
++++ b/src/cpu/a32/backend.c
+@@ -2442,11 +2442,11 @@ static void emitSwap(struct Compiler* c, const struct Inst* in) {
+ static void emitMrs(struct Compiler* c, const struct Inst* in) {
+ 	struct Emitter* e = &c->e;
+ 	clobberFlags(c);
+-	if (in->spsr) {
+-		ldrF(e, R0, OFF(cpu.spsr));
+-	} else {
+-		aBl(e, c->jit->spillRoutine);
+-		ldrF(e, R0, OFF(cpu.cpsr));
++	ldrF(e, R0, in->spsr ? OFF(cpu.spsr) : OFF(cpu.cpsr));
++	if (!in->spsr) {
++		aDpI(e, C_AL, D_BIC, false, R0, R0, 0xF0000000);
++		aDpI(e, C_AL, D_AND, false, R1, R_FLAGS, 0xF0000000);
++		aDpR(e, C_AL, D_ORR, false, R0, R0, R1, S_LSL, 0);
+ 	}
+ 	storeGuest(c, in->rd, R0);
+ }
+@@ -2522,6 +2522,27 @@ static void emitSystem(struct Compiler* c, const struct Inst* in) {
+ 	aB(e, C_AL, c->jit->exitRoutine);
+ }
+ 
++// SUBS or MOVS into the PC from the BIOS's exception code: the CPSR comes back from the SPSR and
++// compiled code refills itself; the exact CPU runs it only when an IRQ is waiting.
++static void emitReturn(struct Compiler* c, const struct Inst* in) {
++	struct Emitter* e = &c->e;
++	clobberFlags(c);
++	flushPending(c);
++	ldrF(e, R0, REG(14));
++	if (in->op == ALU_SUB) {
++		aAddI(e, R0, R0, -(int32_t) in->op2.imm, R12);
++	}
++	strF(e, R0, REG(15));
++	aMov(e, R0, R_GBA);
++	callAbs(e, jitHelperReturn);
++	aCmpI(e, R0, -1, R3);
++	uint8_t* exact = aB(e, C_EQ, NULL);
++	ldrF(e, R_FLAGS, OFF(cpu.cpsr));
++	emitIndirect(c, in, c->jit->dispatchBx, false);
++	patchHere(e, exact);
++	emitSystem(c, in);
++}
++
+ // BX to a register.
+ static void emitBx(struct Compiler* c, const struct Inst* in) {
+ 	loadGuest(c, R0, in->rm, in);
+@@ -2562,7 +2583,11 @@ static void emitBody(struct Compiler* c, const struct Inst* in, int index) {
+ 		return;
+ 	}
+ 	if (jitSystem(in)) {
+-		emitSystem(c, in);
++		if (c->region == REGION_BIOS && jitIsReturn(in)) {
++			emitReturn(c, in);
++		} else {
++			emitSystem(c, in);
++		}
+ 		return;
+ 	}
+ 	switch (in->kind) {
+diff --git a/src/cpu/jit-internal.h b/src/cpu/jit-internal.h
+index 10332c7..4c9ec4d 100644
+--- a/src/cpu/jit-internal.h
++++ b/src/cpu/jit-internal.h
+@@ -649,6 +649,9 @@ uint32_t jitHelperExecute(struct GBA*, uint32_t opcode, uint32_t address);
+ // jitHelperSystem's return value for the exact CPU taking over at the next instruction.
+ #define JIT_EXACT (~1u)
+ uint32_t jitHelperSystem(struct GBA*, uint32_t opcode, uint32_t address);
++uint32_t jitHelperReturn(struct GBA*);
++// SUBS pc, lr, #n and MOVS pc, lr: jumps that restore the CPSR from the SPSR.
++bool jitIsReturn(const struct Inst*);
+ uint32_t jitHelperStepOne(struct GBA*, uint32_t pc);
+ enum {
+ 	CAREFUL_RUN,
+diff --git a/src/cpu/jit.c b/src/cpu/jit.c
+index 00e5448..515ac56 100644
+--- a/src/cpu/jit.c
++++ b/src/cpu/jit.c
+@@ -2713,6 +2713,16 @@ bool jitSystem(const struct Inst* in) {
+ 	}
+ }
+ 
++bool jitIsReturn(const struct Inst* in) {
++	if (in->kind != I_ALU || in->thumb || in->cond != COND_AL || in->rd != 15 || !in->setFlags || in->poly || in->patchable) {
++		return false;
++	}
++	if (in->op == ALU_SUB) {
++		return in->rn == 14 && in->op2.isImm;
++	}
++	return in->op == ALU_MOV && !in->op2.isImm && in->op2.rm == 14 && in->op2.type == SHIFT_LSL && !in->op2.amount && !in->op2.byReg;
++}
++
+ // Returns the key of the block at the PC in the CPU state.
+ static uint32_t currentKey(struct GBA* gba) {
+ 	bool thumb = gba->cpu.cpsr & PSR_T;
+@@ -2804,6 +2814,21 @@ uint32_t jitHelperSystem(struct GBA* gba, uint32_t opcode, uint32_t address) {
+ 	return currentKey(gba);
+ }
+ 
++// SUBS or MOVS into the PC from a mode with an SPSR, the target in r15: restores the CPSR and returns
++// the target with the new instruction set in bit 0, or ~0, with nothing done, for the exact CPU to run.
++uint32_t jitHelperReturn(struct GBA* gba) {
++	struct CPU* cpu = &gba->cpu;
++	uint32_t spsr = cpu->spsr;
++	if (!cpuModeHasSpsr(cpu->cpsr & 0x1F) || (gba->irq.line && !(spsr & PSR_I))) {
++		return ~0u;
++	}
++	uint32_t target = cpu->r[15];
++	cpuWriteCpsr(gba, spsr);
++	cpu->irqMasked = spsr & PSR_I;
++	cpu->fetchSeq = true;
++	return (target & ~1u) | !!(spsr & PSR_T);
++}
++
+ // Whether compiled code can go on at pc after the exact CPU ran. Like compiledMayRun, except that
+ // cartridge code may be entered just after a data access stopped the prefetch buffer, which
+ // compiled code then restarts. Also sets up what compiled code relies on.
+diff --git a/src/cpu/x64/backend.c b/src/cpu/x64/backend.c
+index bf6bd6a..3cf7fb3 100644
+--- a/src/cpu/x64/backend.c
++++ b/src/cpu/x64/backend.c
+@@ -2352,6 +2352,26 @@ static void emitSystem(struct Compiler* c, const struct Inst* in) {
+ 	xJmp(e, c->jit->exitRoutine);
+ }
+ 
++// SUBS or MOVS into the PC from the BIOS's exception code: the CPSR comes back from the SPSR and
++// compiled code refills itself; the exact CPU runs it only when an IRQ is waiting.
++static void emitReturn(struct Compiler* c, const struct Inst* in) {
++	struct Emitter* e = &c->e;
++	spill(c);
++	xLoad(e, 4, RAX, M(R15, REG(14)));
++	if (in->op == ALU_SUB) {
++		xAluI(e, X_SUB, 4, R(RAX), (int32_t) in->op2.imm);
++	}
++	xStore(e, 4, M(R15, REG(15)), RAX);
++	xMovRR(e, 8, RDI, R15);
++	callAbs(e, jitHelperReturn);
++	xCall(e, c->jit->reloadRoutine);
++	xAluI(e, X_CMP, 4, R(RAX), -1);
++	uint8_t* exact = xJcc(e, CC_E, NULL);
++	emitIndirect(c, in, c->jit->dispatchBx);
++	patchHere(e, exact);
++	emitSystem(c, in);
++}
++
+ // BX to a register.
+ static void emitBx(struct Compiler* c, const struct Inst* in) {
+ 	loadGuest(c, RAX, in->rm, in);
+@@ -2392,7 +2412,11 @@ static void emitBody(struct Compiler* c, const struct Inst* in, int index) {
+ 		return;
+ 	}
+ 	if (jitSystem(in)) {
+-		emitSystem(c, in);
++		if (c->region == REGION_BIOS && jitIsReturn(in)) {
++			emitReturn(c, in);
++		} else {
++			emitSystem(c, in);
++		}
+ 		return;
+ 	}
+ 	switch (in->kind) {

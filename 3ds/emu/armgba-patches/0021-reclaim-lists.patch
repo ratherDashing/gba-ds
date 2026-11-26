@@ -1,0 +1,111 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Thu, 26 Nov 2026 00:42:43 -0500
+Subject: armGBA: a reclaimed slot's blocks that had code in other slots come
+ off those slots' lists in one pass over each list, and the lookup's scan for
+ entries into the slot tests one range (a reclaim in Final Fantasy VI took
+ 2.6M a32 instructions, 1.6M of them searching those lists one block at a
+ time)
+
+
+diff --git a/src/cpu/jit-internal.h b/src/cpu/jit-internal.h
+index 4a8a7b3..497d0a0 100644
+--- a/src/cpu/jit-internal.h
++++ b/src/cpu/jit-internal.h
+@@ -235,6 +235,8 @@ struct Block {
+ 	int midCount;
+ 	// Going away with a slot of the code memory being reclaimed
+ 	bool evicting;
++	// Going away with another slot's blocks: still to come off its own slots' lists (jit.c: dropLists)
++	bool dropHot, dropCold;
+ };
+ 
+ // The memories code can run from. Blocks are kept per kind.
+diff --git a/src/cpu/jit.c b/src/cpu/jit.c
+index 588b4ed..9b1f0a5 100644
+--- a/src/cpu/jit.c
++++ b/src/cpu/jit.c
+@@ -721,6 +721,56 @@ static void dropRange(struct Block** list, size_t* count, const struct Block* bl
+ 	}
+ }
+ 
++// Takes the first listing of each block marked dropHot (cold: dropCold) off a slot's list, in one pass: what
++// dropRange does for them one by one.
++static void dropMarked(struct Block** list, size_t* count, bool cold) {
++	size_t kept = 0;
++	for (size_t i = 0; i < *count; ++i) {
++		struct Block* block = list[i];
++		bool* const mark = cold ? &block->dropCold : &block->dropHot;
++		if (*mark) {
++			*mark = false;
++			continue;
++		}
++		list[kept++] = block;
++	}
++	*count = kept;
++}
++
++// Takes the blocks going away with another slot's (from evicted[from] on) off their own slots' lists. A reclaim
++// with a few hundred of them searched those lists once for each: 1.6M of its 2.6M instructions (a32, 2026-11-26).
++static void dropLists(struct Jit* jit, int from) {
++	uint64_t hot = 0, cold = 0;
++	for (int i = from; i < jit->evictedCount; ++i) {
++		struct Block* block = jit->evicted[i];
++		int const slot = slotOf(jit, block->entry);
++		int const coldSlot = block->cold ? slotOf(jit, block->cold) : -1;
++		if (slot >= 64 || coldSlot >= 64) {
++			struct CodeSlot* other = &jit->slots[slot];
++			dropRange(other->hot, &other->hotCount, block);
++			if (block->cold) {
++				other = &jit->slots[coldSlot];
++				dropRange(other->cold, &other->coldCount, block);
++			}
++			continue;
++		}
++		block->dropHot = true;
++		hot |= 1ull << slot;
++		if (block->cold) {
++			block->dropCold = true;
++			cold |= 1ull << coldSlot;
++		}
++	}
++	for (int i = 0; hot | cold; ++i, hot >>= 1, cold >>= 1) {
++		if (hot & 1) {
++			dropMarked(jit->slots[i].hot, &jit->slots[i].hotCount, false);
++		}
++		if (cold & 1) {
++			dropMarked(jit->slots[i].cold, &jit->slots[i].coldCount, true);
++		}
++	}
++}
++
+ // Takes the blocks going away off the pages they were listed on, a page at a time, and marks the
+ // words they covered again from the blocks still there.
+ static void dropPages(struct Jit* jit) {
+@@ -837,15 +887,7 @@ static void evictSlot(struct Jit* jit, int victim) {
+ 	slot->hotCount = 0;
+ 	slot->coldCount = 0;
+ 	slot->live = 0;
+-	for (int i = inSlot; i < jit->evictedCount; ++i) {
+-		struct Block* block = jit->evicted[i];
+-		struct CodeSlot* other = &jit->slots[slotOf(jit, block->entry)];
+-		dropRange(other->hot, &other->hotCount, block);
+-		if (block->cold) {
+-			other = &jit->slots[slotOf(jit, block->cold)];
+-			dropRange(other->cold, &other->coldCount, block);
+-		}
+-	}
++	dropLists(jit, inSlot);
+ 	dropPages(jit);
+ 	for (int i = 0; i < jit->evictedCount; ++i) {
+ 		struct Block* block = jit->evicted[i];
+@@ -870,8 +912,7 @@ static void evictSlot(struct Jit* jit, int victim) {
+ 	uint8_t* const lo = jit->codeStart + (size_t) victim * JIT_SLOT;
+ 	uint8_t* const hi = lo + JIT_SLOT;
+ 	for (int i = 0; i < LOOKUP_SIZE; ++i) {
+-		uint8_t* entry = jit->lookup[i].entry;
+-		if (entry >= lo && entry < hi) {
++		if ((uintptr_t) jit->lookup[i].entry - (uintptr_t) lo < JIT_SLOT) {
+ 			emptyLookup(jit, &jit->lookup[i]);
+ 		}
+ 	}

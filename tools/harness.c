@@ -58,10 +58,29 @@ static uint32_t parse_keys(const char* s) {
 	return k;
 }
 
+/* GBADS_AUDIO_HASH=1 (needs GBADS_THREADED_VIDEO, which opens the core with sound): every frame's samples go into a hash
+ * that `save` writes to NAME.audio, so two builds can be compared on the sound they make */
+static bool audioHashOn;
+static uint64_t audioHash = 1469598103934665603ull;
+static uint64_t audioFrames;
+
+static void audio_drain(void) {
+	static int16_t buf[2 * 2048];
+	size_t n;
+	while ((n = emu_audio_read(&emu, buf, 2048)) > 0) {
+		const uint8_t* b = (const uint8_t*) buf;
+		for (size_t i = 0; i < n * 2 * sizeof(int16_t); ++i) {
+			audioHash = (audioHash ^ b[i]) * 1099511628211ull;
+		}
+		audioFrames += n;
+	}
+}
+
 static void run(uint32_t keys, int n) {
 	for (int i = 0; i < n; ++i) {
 		emu_frame(&emu, keys);
 		++frameNo;
+		if (audioHashOn) audio_drain();
 	}
 }
 
@@ -87,9 +106,14 @@ int main(int argc, char** argv) {
 		perror("script");
 		return 1;
 	}
+	/* GBADS_THREADED_VIDEO=1: the picture drawn on mGBA's thread, as on the 3DS (opened as the game, with sound) */
+	bool threaded = getenv("GBADS_THREADED_VIDEO") != NULL;
+	audioHashOn = threaded && getenv("GBADS_AUDIO_HASH") != NULL;
+	emu_threaded_video(threaded);
+	emu_idle_loops(getenv("GBADS_IDLE_LOOPS")); /* remove (the default), detect, ignore or known */
 	/* HARNESS_SAVE=path: a battery save to run with (the file is written to as the game saves) */
 	if (getenv("HARNESS_BIOS")) snprintf(emu_bios_path, sizeof(emu_bios_path), "%s", getenv("HARNESS_BIOS")); /* a BIOS file, as Settings > GBA BIOS (issue #78) */
-	if (!emu_open(&emu, argv[1], getenv("HARNESS_SAVE"), false)) {
+	if (!emu_open(&emu, argv[1], getenv("HARNESS_SAVE"), threaded)) {
 		return 1;
 	}
 	fprintf(stderr, "game code %s\n", emu.gameCode);
@@ -146,6 +170,14 @@ int main(int argc, char** argv) {
 			if (strchr(a1, '/')) snprintf(path, sizeof(path), "%s", a1);
 			else snprintf(path, sizeof(path), "%s/%s.ss", outdir, a1);
 			bool ok = cmd[0] == 's' ? emu_state_save_file(&emu, path) : emu_state_load_file(&emu, path);
+			if (audioHashOn && cmd[0] == 's' && !strchr(a1, '/')) {
+				snprintf(path, sizeof(path), "%s/%s.audio", outdir, a1);
+				FILE* af = fopen(path, "w");
+				if (af) {
+					fprintf(af, "%016llx %llu %u\n", (unsigned long long) audioHash, (unsigned long long) audioFrames, emu_audio_rate(&emu));
+					fclose(af);
+				}
+			}
 			if (!ok) fprintf(stderr, "%s %s failed\n", cmd, path);
 		} else if (!strcmp(cmd, "map")) {
 			if (!mc) {

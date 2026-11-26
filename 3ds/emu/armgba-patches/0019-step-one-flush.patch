@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Wed, 25 Nov 2026 01:10:00 -0500
+Subject: armGBA: a flush asked for by an instruction stepped for a careful
+ copy (a write that changes the work RAM's wait states, or the cartridge's
+ contents changing under it) waits for the run loop, so the copy no longer
+ goes on in blocks the flush freed, with the old wait states' costs (armGBA
+ 2.0 flushed at once there, as jitHelperStepOne clears jitRunning)
+
+
+diff --git a/src/cpu/jit-internal.h b/src/cpu/jit-internal.h
+index c7d4c5e..b3a8349 100644
+--- a/src/cpu/jit-internal.h
++++ b/src/cpu/jit-internal.h
+@@ -449,6 +449,8 @@ struct Jit {
+ 	uint32_t warmWaits;
+ 
+ 	bool flushRequested;
++	// Inside jitHelperStepOne, whose caller is compiled code although jitRunning is false.
++	bool helperStepping;
+ 	// The table-driven interpreter runs instead of compiled code (jitSetInterpreter)
+ 	bool interpret;
+ 	// Set when the wait states changed, for the run loop to look at before compiled code runs again
+diff --git a/src/cpu/jit.c b/src/cpu/jit.c
+index 8efd414..8984060 100644
+--- a/src/cpu/jit.c
++++ b/src/cpu/jit.c
+@@ -1278,7 +1278,7 @@ static void flushSoon(struct GBA* gba) {
+ 	if (!gba->jit) {
+ 		return;
+ 	}
+-	if (gba->jitRunning) {
++	if (gba->jitRunning || gba->jit->helperStepping) {
+ 		gba->jit->flushRequested = true;
+ 		yield(gba);
+ 	} else {
+@@ -3077,7 +3077,7 @@ static uint32_t carefulEntry(struct Jit* jit, uint32_t pc, bool thumb, uint32_t
+ // Called when a careful copy's check fires because an event falls inside the instruction at pc. The
+ // exact CPU runs that instruction, and any after it compiled code can't, then returns the block key
+ // to go on at, or ~0 to leave the state to the run loop.
+-uint32_t jitHelperStepOne(struct GBA* gba, uint32_t pc) {
++static uint32_t stepOne(struct GBA* gba, uint32_t pc) {
+ 	struct Jit* jit = gba->jit;
+ 	struct CPU* cpu = &gba->cpu;
+ 	bool thumb = cpu->cpsr & PSR_T;
+@@ -3130,6 +3130,14 @@ uint32_t jitHelperStepOne(struct GBA* gba, uint32_t pc) {
+ 	return ~0u;
+ }
+ 
++uint32_t jitHelperStepOne(struct GBA* gba, uint32_t pc) {
++	// The copy that called goes on reading its block and code, so a flush the step asks for waits for the run loop.
++	gba->jit->helperStepping = true;
++	uint32_t const key = stepOne(gba, pc);
++	gba->jit->helperStepping = false;
++	return key;
++}
++
+ // Handles a PC write that compiled code doesn't refill itself: to the cartridge, whose prefetch
+ // buffer sets the cost, or close to an event.
+ void jitHelperReload(struct GBA* gba, uint32_t target) {

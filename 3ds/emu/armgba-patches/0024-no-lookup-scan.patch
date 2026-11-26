@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Thu, 26 Nov 2026 10:26:25 -0500
+Subject: armGBA: a reclaim no longer scans the whole lookup for entries into
+ the slot: an entry is only ever a valid block's head or a careful copy's
+ entry, and removing the slot's blocks has emptied those (the 768 KiB scan
+ took 2 ms of each reclaim in Final Fantasy VI on a New 2DS XL and never found
+ one)
+
+
+diff --git a/src/cpu/jit.c b/src/cpu/jit.c
+index 9d8f4cc..9c3939d 100644
+--- a/src/cpu/jit.c
++++ b/src/cpu/jit.c
+@@ -959,14 +959,10 @@ static void evictSlot(struct Jit* jit, int victim) {
+ 		free(block->entries);
+ 		free(block);
+ 	}
+-	// Whatever else still points into the slot's code
++	// Whatever else still points into the slot's code. The lookup doesn't: an entry is only ever a valid
++	// block's head or a careful copy's entry, and removeBlock emptied those (a 768 KiB scan, 2 ms a reclaim).
+ 	uint8_t* const lo = jit->codeStart + (size_t) victim * JIT_SLOT;
+ 	uint8_t* const hi = lo + JIT_SLOT;
+-	for (int i = 0; i < LOOKUP_SIZE; ++i) {
+-		if ((uintptr_t) jit->lookup[i].entry - (uintptr_t) lo < JIT_SLOT) {
+-			emptyLookup(jit, &jit->lookup[i]);
+-		}
+-	}
+ 	memset(jit->siteCache, 0, sizeof(jit->siteCache));
+ 	for (int i = 0; i < TINY_ROUTINES; ++i) {
+ 		if (jit->tiny[i].code >= lo && jit->tiny[i].code < hi) {

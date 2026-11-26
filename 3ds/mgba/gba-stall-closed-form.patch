@@ -1,0 +1,78 @@
+diff --git a/src/gba/memory.c b/src/gba/memory.c
+index cb5cfd2e4..ef3646b24 100644
+--- a/src/gba/memory.c
++++ b/src/gba/memory.c
+@@ -30,6 +30,7 @@ static const uint32_t _agbPrintFunc = 0x4770DFFA; // swi 0xFA; bx lr
+ 
+ static void GBASetActiveRegion(struct ARMCore* cpu, uint32_t region);
+ static __attribute__((noinline)) int32_t GBAMemoryStall(struct ARMCore* cpu, int32_t wait);
++static int32_t _stallLoop(struct ARMCore* cpu, struct GBAMemory* memory, int32_t wait);
+ static int32_t GBAMemoryStallVRAM(struct GBA* gba, int32_t wait, int extra);
+ 
+ static const char GBA_BASE_WAITSTATES[16] = { 0, 0, 2, 0, 0, 0, 0, 0, 4, 4, 4, 4, 4, 4, 4 };
+@@ -377,16 +378,41 @@ static __attribute__((noinline)) void _setActiveRegionSlow(struct ARMCore* cpu,
+ 	cpu->memory.activeMask &= -(cpu->cpsr.t ? WORD_SIZE_THUMB : WORD_SIZE_ARM);
+ }
+ 
+-/* GBAMemoryStall without its loop: when the wait is no longer than one sequential ROM fetch (the usual RAM, I/O and video
+- * accesses) the loop never runs, and the answer is the same fixed number whatever the wait was. */
++/* GBAMemoryStall's prefetch loop in closed form. For wait > s + 1 it runs min((wait - 2) / s, 7 - previousLoads) times
++ * (_stallLoads holds the first number, capped at 7); the answer is then s - n plus whatever of the wait the stall left. */
++static const uint8_t _stallLoads[8][64] = {
++	{ 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 },
++	{ 0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 },
++	{ 0, 0, 0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 },
++	{ 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 },
++	{ 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 },
++	{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 },
++	{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 },
++	{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7 },
++};
++
+ static inline int32_t _stall(struct ARMCore* cpu, struct GBAMemory* memory, int32_t wait) {
+ 	int32_t s = cpu->memory.activeSeqCycles16;
++	uint32_t pc = cpu->gprs[ARM_PC];
++	uint32_t dist = memory->lastPrefetchedPc - pc;
+ 	if (wait <= s + 1) {
+-		uint32_t dist = memory->lastPrefetchedPc - cpu->gprs[ARM_PC];
+-		memory->lastPrefetchedPc = cpu->gprs[ARM_PC] + (dist < 16 ? dist & ~1U : 0);
++		memory->lastPrefetchedPc = pc + (dist < 16 ? dist & ~1U : 0);
+ 		return s - cpu->memory.activeNonseqCycles16;
+ 	}
+-	return GBAMemoryStall(cpu, wait);
++	if (LIKELY((uint32_t) (s - 1) < 8 && (uint32_t) wait < 64)) {
++		int32_t loads = _stallLoads[s - 1][wait];
++		uint32_t previous = 0;
++		if (dist < 16) {
++			previous = dist >> 1;
++			if (loads > 7 - (int32_t) previous) {
++				loads = 7 - previous;
++			}
++		}
++		memory->lastPrefetchedPc = pc + WORD_SIZE_THUMB * (loads + previous);
++		int32_t left = wait - 1 - s * (loads + 1);
++		return s - cpu->memory.activeNonseqCycles16 + (left > 0 ? left : 0);
++	}
++	return _stallLoop(cpu, memory, wait);
+ }
+ 
+ /* The fast paths below end in these when the CPU runs from ROM with the prefetch buffer on: they stay out of line so a
+@@ -1959,15 +1985,10 @@ int32_t GBAMemoryStall(struct ARMCore* cpu, int32_t wait) {
+ 		// The wait is the stall
+ 		return wait;
+ 	}
++	return _stall(cpu, memory, wait);
++}
+ 
+-	int32_t seq = cpu->memory.activeSeqCycles16;
+-	if (wait <= seq + 1) {
+-		// (no loop to run: _stall)
+-		uint32_t dist = memory->lastPrefetchedPc - cpu->gprs[ARM_PC];
+-		memory->lastPrefetchedPc = cpu->gprs[ARM_PC] + (dist < 16 ? dist & ~1U : 0);
+-		return seq - cpu->memory.activeNonseqCycles16;
+-	}
+-
++static __attribute__((noinline)) int32_t _stallLoop(struct ARMCore* cpu, struct GBAMemory* memory, int32_t wait) {
+ 	int32_t previousLoads = 0;
+ 
+ 	// Don't prefetch too much if we're overlapping with a previous prefetch

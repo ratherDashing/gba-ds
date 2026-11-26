@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Wed, 25 Nov 2026 01:40:00 -0500
+Subject: armGBA: the blocks compiled for returns into another block's middle
+ are counted while they are in the code memory, so a slot reclaimed with some
+ lets as many more be compiled (armGBA 2.0's full code memory reclaims a slot
+ instead of flushing, c26cad9, and the count only fell at a flush, so after
+ the first few minutes every such return was stepped)
+
+
+diff --git a/src/cpu/jit-internal.h b/src/cpu/jit-internal.h
+index b3a8349..4a8a7b3 100644
+--- a/src/cpu/jit-internal.h
++++ b/src/cpu/jit-internal.h
+@@ -220,6 +220,8 @@ struct Block {
+ 	// they change back.
+ 	uint32_t waits;
+ 	bool setAside;
++	// Compiled for a place returned to inside another block, counted in jit->midCompiled until its slot is reclaimed.
++	bool midBlock;
+ 	// Compiled as an idle loop's head, with the check that leaves for the run loop at its start.
+ 	bool idleHead;
+ 	// On the list of live cartridge blocks that a wait-state change goes through.
+@@ -545,7 +547,7 @@ struct Jit {
+ 	bool midResume;
+ 	uint32_t irqReturn;
+ 	// Returns to the same place inside a block (by lookup slot, in seenCount) before a block is compiled there
+-	// instead of stepping the rest of this one (0: never), and how many such blocks since the last flush.
++	// instead of stepping the rest of this one (0: never), and how many such blocks the code memory holds.
+ 	uint8_t midAfter;
+ 	// jitSetDeferMore(false): which events may run after an instruction as before (DEFER_YES for every instruction).
+ 	bool deferOld;
+diff --git a/src/cpu/jit.c b/src/cpu/jit.c
+index 8984060..588b4ed 100644
+--- a/src/cpu/jit.c
++++ b/src/cpu/jit.c
+@@ -857,6 +857,9 @@ static void evictSlot(struct Jit* jit, int victim) {
+ 		if (block->allNext) {
+ 			block->allNext->allPrev = block->allPrev;
+ 		}
++		if (block->midBlock && jit->midCompiled) {
++			--jit->midCompiled;
++		}
+ 		free(block->sites);
+ 		free(block->bytes);
+ 		free(block->out);
+@@ -2584,6 +2587,7 @@ void jitRunLoop(struct GBA* gba) {
+ 		// race, filling the code memory every few minutes, each of them first compiled in a 50-150
+ 		// ms frame on a 3DS).
+ 		bool const mid = jit->midResume || pc == jit->irqReturn;
++		bool midBlock = false;
+ 		jit->midResume = false;
+ 		if (pc == jit->irqReturn) {
+ 			jit->irqReturn = ~0u;
+@@ -2616,7 +2620,7 @@ void jitRunLoop(struct GBA* gba) {
+ 					leanStep(gba);
+ 					continue;
+ 				}
+-				++jit->midCompiled;
++				midBlock = true;
+ 			}
+ 		}
+ 		if (!entry) {
+@@ -2625,6 +2629,10 @@ void jitRunLoop(struct GBA* gba) {
+ 				leanStep(gba);
+ 				continue;
+ 			}
++			if (midBlock && !block->midBlock) {
++				block->midBlock = true;
++				++jit->midCompiled;
++			}
+ 			entry = block->entry;
+ 		}
+ 		if (gba->traceFile) {

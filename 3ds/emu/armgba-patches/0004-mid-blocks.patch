@@ -1,0 +1,105 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Tue, 17 Nov 2026 09:43:42 -0500
+Subject: armGBA: a place returned to inside a block gets a block of its own
+
+
+diff --git a/src/cpu/jit-internal.h b/src/cpu/jit-internal.h
+index 79f0c97..2e7b71f 100644
+--- a/src/cpu/jit-internal.h
++++ b/src/cpu/jit-internal.h
+@@ -533,6 +533,10 @@ struct Jit {
+ 	// an event (midResume), or from an interrupt (irqReturn, ~0 when none is pending).
+ 	bool midResume;
+ 	uint32_t irqReturn;
++	// Returns to the same place inside a block (by lookup slot, in seenCount) before a block is compiled there
++	// instead of stepping the rest of this one (0: never), and how many such blocks since the last flush.
++	uint8_t midAfter;
++	uint32_t midCompiled;
+ 	bool coldThumb;
+ 	int coldLeft;
+ 	uint8_t* hotMark;
+diff --git a/src/cpu/jit.c b/src/cpu/jit.c
+index c8792f0..61e1c7c 100644
+--- a/src/cpu/jit.c
++++ b/src/cpu/jit.c
+@@ -598,6 +598,7 @@ uint32_t jitSlowAccess(struct GBA* gba, int kind, uint32_t address, uint32_t val
+ void jitFlush(struct GBA* gba) {
+ 	struct Jit* jit = gba->jit;
+ 	freeAll(jit);
++	jit->midCompiled = 0;
+ 	for (int i = 0; i < jit->slotCount; ++i) {
+ 		jit->slots[i].hotCount = 0;
+ 		jit->slots[i].coldCount = 0;
+@@ -856,6 +857,12 @@ uint8_t* jitReclaimSlot(struct Jit* jit) {
+ 	return jit->codeStart + (size_t) victim * JIT_SLOT;
+ }
+ 
++void jitSetMidAfter(struct GBA* gba, int times) {
++	if (gba->jit) {
++		gba->jit->midAfter = (uint8_t) (times < 0 ? 0 : times > 255 ? 255 : times);
++	}
++}
++
+ size_t jitCodeUsed(struct GBA* gba, size_t* size) {
+ 	struct Jit* jit = gba->jit;
+ 	if (size) {
+@@ -1757,6 +1764,10 @@ enum {
+ 	// exact CPU steps to the event. Yoshi's Island's took half of a 3DS's 9 MiB within 20-30 s,
+ 	// filling it (each flush a 100-170 ms frame, 2026-11-16).
+ 	CAREFUL_SHARE = 3,
++	// The most blocks compiled for returns into a block's middle between flushes: one per 16 KiB of code memory.
++	MID_BLOCK_SHIFT = 14,
++	// Returns to one place before it gets a block (jit->midAfter, before the frontend's setting).
++	MID_AFTER = 16,
+ };
+ 
+ // Whether careful copies have taken their share of the code memory since it was last emptied.
+@@ -2435,9 +2446,15 @@ void jitRunLoop(struct GBA* gba) {
+ 			// interrupt taken in the copy comes back to it, on every line for an H-blank IRQ.
+ 			const struct Block* twin = within ? within->twin : NULL;
+ 			unsigned const index = within ? (pc - within->pc) / (uint32_t) width : 0;
++			uint8_t* seen = &jit->seenCount[lookupHash(key)];
+ 			if (twin && twin->valid && index < (unsigned) twin->count) {
+ 				entry = twin->entries[index];
+-			} else if (within) {
++			} else if (within && (!jit->midAfter || *seen < jit->midAfter || jit->midCompiled >= jit->codeSize >> MID_BLOCK_SHIFT || compileBusy())) {
++				// A place that keeps being returned to, as an interrupt returns to the same instruction line
++				// after line, gets a block of its own; the rest, whose events fall all over, are stepped.
++				if (jit->midAfter && *seen < jit->midAfter) {
++					++*seen;
++				}
+ 				jit->coldPc = pc + width;
+ 				jit->coldThumb = thumb;
+ 				jit->coldLeft = (int) ((within->end - pc) / (uint32_t) width) - 1;
+@@ -2445,6 +2462,8 @@ void jitRunLoop(struct GBA* gba) {
+ 				++jit->midSteps;
+ 				leanStep(gba);
+ 				continue;
++			} else if (within) {
++				++jit->midCompiled;
+ 			}
+ 		}
+ 		if (!entry) {
+@@ -3129,6 +3148,7 @@ bool jitInit(struct GBA* gba) {
+ 	}
+ 	jit->gba = gba;
+ 	gba->jit = jit;
++	jit->midAfter = MID_AFTER;
+ #if defined(__3DS__)
+ 	jit->codeSize = CODE_SIZE;
+ 	jit->code = jitHostAllocCode(&jit->codeSize);
+diff --git a/src/cpu/jit.h b/src/cpu/jit.h
+index cf21b58..88cd9b4 100644
+--- a/src/cpu/jit.h
++++ b/src/cpu/jit.h
+@@ -31,6 +31,9 @@ int32_t jitFetchGap(struct GBA*);
+ // gap: jitFetchGap from before the change.
+ void jitWaitstatesChanged(struct GBA*, int32_t gap);
+ void jitFlush(struct GBA*);
++// How many times the CPU returns to the same place inside a block (from an interrupt, or an event
++// stepped up to) before a block is compiled there, instead of stepping the rest of this block; 0: never.
++void jitSetMidAfter(struct GBA*, int times);
+ // The code memory compiled code takes so far, and (size) all there is: for a frontend that empties it
+ // (jitFlush) at a moment of its choosing, before it fills at one of the game's.
+ size_t jitCodeUsed(struct GBA*, size_t* size);

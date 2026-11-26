@@ -1,6 +1,8 @@
 #include "paths.h"
 #include "i18n.h"
 
+#include "bench.h"
+
 #include "emu.h"
 #include "patch.h"
 #include "profiles.h"
@@ -110,7 +112,8 @@ void game_paths(const Config* cfg, const char* rom, GamePaths* o) {
 	}
 	/* First run: carry over a battery save in the other form beside it
 	 * (RetroArch's .srm for a .sav, or the other way round) */
-	if (!file_exists(o->sav)) {
+	/* (a bench job starts from a cartridge never played: nothing carried over) */
+	if (!file_exists(o->sav) && !bench_active()) {
 		char other[1100];
 		snprintf(other, sizeof(other), "%s/%s.%s", saveDir, o->base, strcmp(ext, "srm") ? "srm" : "sav");
 		if (copy_file(other, o->sav)) fprintf(stderr, "imported %s -> %s\n", other, o->sav);
@@ -118,7 +121,7 @@ void game_paths(const Config* cfg, const char* rom, GamePaths* o) {
 	/* Saves kept in a folder of their own (save_dir; Android's Settings >
 	 * Folders), and none there yet: the one next to the ROM, where they
 	 * were kept before, in either form, is copied over (and left there) */
-	if (!file_exists(o->sav) && cfg->saveDir[0] && strcmp(saveDir, romDir)) {
+	if (!file_exists(o->sav) && cfg->saveDir[0] && strcmp(saveDir, romDir) && !bench_active()) {
 		char beside[1100];
 		snprintf(beside, sizeof(beside), "%s/%s.%s", romDir, o->base, ext);
 		if (!file_exists(beside)) snprintf(beside, sizeof(beside), "%s/%s.%s", romDir, o->base, strcmp(ext, "srm") ? "srm" : "sav");

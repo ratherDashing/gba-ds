@@ -1,0 +1,223 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Tue, 24 Nov 2026 16:24:29 -0500
+Subject: armGBA: the game and the hidden copy each count their own compiling,
+ and the stats count flushes by cause and refused compiles (armGBA 2.0's full
+ code memory reclaims a slot instead of flushing, c26cad9, so blocks' records
+ are freed slot by slot, not by an arena a flush gives back)
+
+
+diff --git a/src/cpu/jit-internal.h b/src/cpu/jit-internal.h
+index 2986997..36e1141 100644
+--- a/src/cpu/jit-internal.h
++++ b/src/cpu/jit-internal.h
+@@ -572,6 +572,14 @@ struct Jit {
+ 	uint64_t formMisses;
+ 	uint64_t writeReasons[4];
+ 	uint64_t flushReasons[2];
++	// For the stats: flushes for want of heap, blocks flushes freed (compiled since the last), the ticks they took, and whether
++	// the last compile was refused for heap
++	uint64_t heapLowFlushes, flushedBlocks, compiledAtFlush, flushWorkTicks;
++	// Ticks this machine has spent compiling, when its frame began, and how many of them a frame may take (the 3DS)
++	uint64_t compileTicks, compileFrameStart, compileBudget;
++	// Compiles refused (the stats): for want of heap, for want of an allocation, for want of code memory
++	uint64_t refused[3];
++	bool heapLow;
+ 	uint64_t exits[5];
+ 	uint64_t carefulSteps;
+ 	uint64_t midSteps;
+diff --git a/src/cpu/jit.c b/src/cpu/jit.c
+index 2b56c5e..22e7b13 100644
+--- a/src/cpu/jit.c
++++ b/src/cpu/jit.c
+@@ -367,6 +367,8 @@ static void removeBlock(struct Jit* jit, struct Block* block) {
+ 
+ // Frees every block and list, for a flush or at shutdown.
+ static void freeAll(struct Jit* jit) {
++	jit->flushedBlocks += jit->compiled - jit->compiledAtFlush;
++	jit->compiledAtFlush = jit->compiled;
+ 	for (int kind = 0; kind < CODE_KINDS; ++kind) {
+ 		if (!jit->pages[kind]) {
+ 			continue;
+@@ -640,9 +642,16 @@ uint32_t jitIoStore(struct GBA* gba, int kind, uint32_t address, uint32_t value)
+ 	return slowDone(gba, runs, 0);
+ }
+ 
++#if defined(__3DS__)
++uint64_t renderThreadHostTicks(void);
++#endif
++
+ // Throws all compiled code away and starts again from the bottom of the code memory.
+ void jitFlush(struct GBA* gba) {
+ 	struct Jit* jit = gba->jit;
++#if defined(__3DS__)
++	uint64_t const began = renderThreadHostTicks();
++#endif
+ 	freeAll(jit);
+ 	jit->midCompiled = 0;
+ 	for (int i = 0; i < jit->slotCount; ++i) {
+@@ -678,6 +687,9 @@ void jitFlush(struct GBA* gba) {
+ 	jit->irqReturn = ~0u;
+ 	jit->carefulAtFlush = jit->carefulBytes;
+ 	++jit->flushes;
++#if defined(__3DS__)
++	jit->flushWorkTicks += renderThreadHostTicks() - began;
++#endif
+ }
+ 
+ static int slotOf(const struct Jit* jit, const uint8_t* p) {
+@@ -1529,23 +1541,20 @@ enum {
+ 	WARM_MOST = 1 << 16,
+ };
+ 
+-#if defined(__3DS__)
+-// For the frontend's numbers: time spent compiling, in the host's ticks.
+-uint64_t renderThreadHostTicks(void);
+-uint64_t jitCompileTicks;
+-#endif
+-
+ static struct Block* compileBlock(struct GBA* gba, uint32_t pc, bool thumb, const struct Block* parent) {
+ #if defined(__3DS__)
++	struct Jit* const jit = gba->jit;
+ 	// Blocks take heap as well as code memory (about as much again): when the heap runs low the
+ 	// caller flushes, as when the code memory is full. Mario Kart ran the heap out with room left
+ 	// for code, and crashed (2026-11-09).
+-	if (jitHostMemoryLow()) {
++	jit->heapLow = jitHostMemoryLow();
++	if (jit->heapLow) {
++		++jit->refused[0];
+ 		return NULL;
+ 	}
+ 	uint64_t const began = renderThreadHostTicks();
+ 	struct Block* block = compileBlockTimed(gba, pc, thumb, parent);
+-	jitCompileTicks += renderThreadHostTicks() - began;
++	jit->compileTicks += renderThreadHostTicks() - began;
+ 	return block;
+ #else
+ 	return compileBlockTimed(gba, pc, thumb, parent);
+@@ -1627,6 +1636,7 @@ static struct Block* compileBlockTimed(struct GBA* gba, uint32_t pc, bool thumb,
+ 
+ 	struct Block* block = calloc(1, sizeof(*block));
+ 	if (!block) {
++		++jit->refused[1];
+ 		return NULL;
+ 	}
+ 	block->pc = pc;
+@@ -1664,6 +1674,7 @@ static struct Block* compileBlockTimed(struct GBA* gba, uint32_t pc, bool thumb,
+ 		free(block->out);
+ 		free(block->entries);
+ 		free(block);
++		++jit->refused[2];
+ 		return NULL;
+ 	}
+ 	idleSpan(jit, block, &insts[count - 1]);
+@@ -1748,19 +1759,33 @@ enum {
+ };
+ 
+ #if defined(__3DS__)
+-// From the frontend, each frame: how long compiling may take in it before blocks are put off to a
+-// later frame (the frame's time left over after emulation, in the host's ticks), and what
+-// jitCompileTicks was when the frame began. A race starting compiled hundreds of blocks in a
+-// frame or two, each frame then late (2026-11-09).
+-uint64_t jitCompileBudget = ~0ull, jitCompileFrameStart;
+ uint64_t jitBudgetPutOff;
++
++// From the frontend, at the start of each frame: how long this machine's compiling may take in it
++// before blocks are put off to a later frame (the frame's time left over after emulation, in the
++// host's ticks). A race starting compiled hundreds of blocks in a frame or two, each frame then late
++// (2026-11-09). Each machine counts its own compiling: with one count for all, the hidden copy's
++// compiling used up the game's time and the game compiled no careful copies while a capture ran.
++void jitSetCompileBudget(struct GBA* gba, uint64_t ticks) {
++	struct Jit* const jit = gba->jit;
++	if (jit) {
++		jit->compileFrameStart = jit->compileTicks;
++		jit->compileBudget = ticks;
++	}
++}
++#else
++void jitSetCompileBudget(struct GBA* gba, uint64_t ticks) {
++	(void) gba;
++	(void) ticks;
++}
+ #endif
+ 
+ // Whether compiling has used up its time in this frame.
+-static bool compileBusy(void) {
++static bool compileBusy(const struct Jit* jit) {
+ #if defined(__3DS__)
+-	return jitCompileTicks - jitCompileFrameStart > jitCompileBudget;
++	return jit->compileTicks - jit->compileFrameStart > jit->compileBudget;
+ #else
++	(void) jit;
+ 	return false;
+ #endif
+ }
+@@ -1773,9 +1798,9 @@ void jitSetCompileAfter(int times) {
+ }
+ 
+ // Times a block's start is stepped through before it's compiled, as things are.
+-static int compileAfter(void) {
++static int compileAfter(const struct Jit* jit) {
+ 	int const busy = compileAfterSetting + 2 > COMPILE_AFTER_BUSY ? compileAfterSetting + 2 : COMPILE_AFTER_BUSY;
+-	return compileBusy() ? busy : compileAfterSetting;
++	return compileBusy(jit) ? busy : compileAfterSetting;
+ }
+ 
+ // Returns the block for a PC: an existing one, one brought back unchanged from before a rewrite, or
+@@ -1798,7 +1823,7 @@ static struct Block* getBlock(struct GBA* gba, uint32_t pc, bool thumb) {
+ 	// then steps to the end of the block
+ 	// without looking each instruction up.
+ 	uint8_t* seen = &jit->seenCount[lookupHash(key)];
+-	if (*seen < compileAfter() && !gba->traceFile) {
++	if (*seen < compileAfter(jit) && !gba->traceFile) {
+ #if defined(__3DS__)
+ 		jitBudgetPutOff += *seen >= compileAfterSetting;
+ #endif
+@@ -1812,6 +1837,7 @@ static struct Block* getBlock(struct GBA* gba, uint32_t pc, bool thumb) {
+ 	block = compileBlock(gba, pc, thumb, NULL);
+ 	if (!block) {
+ 		++jit->flushReasons[1];
++		jit->heapLowFlushes += jit->heapLow;
+ 		jitFlush(gba);
+ 		block = compileBlock(gba, pc, thumb, NULL);
+ 	}
+@@ -2531,7 +2557,7 @@ void jitRunLoop(struct GBA* gba) {
+ 			uint8_t* seen = &jit->seenCount[lookupHash(key)];
+ 			if (twin && twin->valid && index < (unsigned) twin->count) {
+ 				entry = twin->entries[index];
+-			} else if (within && (!jit->midAfter || *seen < jit->midAfter || jit->midCompiled >= jit->codeSize >> MID_BLOCK_SHIFT || compileBusy())) {
++			} else if (within && (!jit->midAfter || *seen < jit->midAfter || jit->midCompiled >= jit->codeSize >> MID_BLOCK_SHIFT || compileBusy(jit))) {
+ 				// A place that keeps being returned to, as an interrupt returns to the same instruction line
+ 				// after line, gets a block of its own; the rest, whose events fall all over, are stepped.
+ 				if (jit->midAfter && *seen < jit->midAfter) {
+@@ -2639,7 +2665,7 @@ void jitRunLoop(struct GBA* gba) {
+ 				// to the event instead, as when there's no room for one.
+ 				// Nor is one compiled in a frame that has used up its time for compiling, or once careful
+ 				// copies have taken their share of the code memory (CAREFUL_SHARE).
+-				bool const earned = link->from->twin || (link->from->checkFires >= CAREFUL_AFTER && !compileBusy() && !carefulFull(jit));
++				bool const earned = link->from->twin || (link->from->checkFires >= CAREFUL_AFTER && !compileBusy(jit) && !carefulFull(jit));
+ 				if (!earned) {
+ 					struct Block* from = link->from;
+ 					if (gba->video.frameCounter - from->firesFrom > CAREFUL_FRAMES) {
+@@ -2685,7 +2711,7 @@ void jitRunLoop(struct GBA* gba) {
+ 			// When tracing, every block is entered from here.
+ 			// A block not met yet is left to the run loop, which steps through it the first time.
+ 			if (!jit->flushRequested && !jit->waitsChanged && compilable(gba, next, thumb) && !gba->traceFile &&
+-			    (findBlock(jit, blockKey(next, thumb)) || jit->seenCount[lookupHash(blockKey(next, thumb))] >= compileAfter())) {
++			    (findBlock(jit, blockKey(next, thumb)) || jit->seenCount[lookupHash(blockKey(next, thumb))] >= compileAfter(jit))) {
+ 				uint64_t epoch = jit->codeEpoch;
+ 				struct Block* target = getBlock(gba, next, thumb);
+ 				if (target && epoch == jit->codeEpoch) {
+diff --git a/src/cpu/jit.h b/src/cpu/jit.h
+index 47de2a3..483828c 100644
+--- a/src/cpu/jit.h
++++ b/src/cpu/jit.h
+@@ -36,6 +36,8 @@ void jitFlush(struct GBA*);
+ void jitSetMidAfter(struct GBA*, int times);
+ // How many visits to a new block are stepped through before it is compiled (1 to 250, for every machine; 0 or less: 2, as built).
+ void jitSetCompileAfter(int times);
++// The host ticks this machine may spend compiling in a frame before blocks are put off; call at the start of a frame (the 3DS).
++void jitSetCompileBudget(struct GBA*, uint64_t ticks);
+ // false: a careful copy lets only events that start no DMA run after an instruction, as it did before it let more.
+ void jitSetDeferMore(struct GBA*, bool on);
+ // The code memory compiled code takes so far, and (size) all there is: for a frontend that empties it

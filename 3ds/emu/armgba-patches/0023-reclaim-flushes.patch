@@ -1,0 +1,131 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Thu, 26 Nov 2026 09:53:14 -0500
+Subject: armGBA: a reclaim's unlinked jumps reach the instruction cache in one
+ kernel call on the 3DS (jitHostFlushBatch), and the list of cartridge blocks
+ and the other slots' lists are passed over with a filter of the blocks going
+ away, so a block that isn't one isn't read (a cache miss each; with a kernel
+ call a jump, these were most of a 13-25 ms reclaim in Final Fantasy VI on a
+ New 2DS XL)
+
+
+diff --git a/src/cpu/jit-internal.h b/src/cpu/jit-internal.h
+index 497d0a0..9524b5c 100644
+--- a/src/cpu/jit-internal.h
++++ b/src/cpu/jit-internal.h
+@@ -649,6 +649,8 @@ void jitHostFreeCode(void* code, size_t size);
+ // Whether the heap is too low to compile more: the recompiler flushes.
+ bool jitHostMemoryLow(void);
+ void jitHostFlushCode(void* start, void* end);
++// While on, jitHostFlushCode only notes that code changed; turning it off makes all of it visible.
++void jitHostFlushBatch(bool on);
+ #endif
+ 
+ bool backendInit(struct Jit*);
+diff --git a/src/cpu/jit.c b/src/cpu/jit.c
+index 839c45d..9d8f4cc 100644
+--- a/src/cpu/jit.c
++++ b/src/cpu/jit.c
+@@ -732,12 +732,36 @@ static void dropRange(struct Block** list, size_t* count, const struct Block* bl
+ 	}
+ }
+ 
++enum {
++	EVICT_FILTER = 1 << 15,
++};
++
++// A bit for each block going away in a filter on the stack: a block whose bit is clear isn't one, so a list
++// can be passed over without reading its blocks, a cache miss each.
++static uint32_t evictFilterBit(const struct Block* block) {
++	return (uint32_t) ((uintptr_t) block >> 3) * 0x9E3779B1u >> 17;
++}
++
++static bool evictFilterHas(const uint32_t* filter, const struct Block* block) {
++	uint32_t const bit = evictFilterBit(block);
++	return (filter[bit / 32] >> (bit % 32)) & 1;
++}
++
++static void evictFilterAdd(uint32_t* filter, const struct Block* block) {
++	uint32_t const bit = evictFilterBit(block);
++	filter[bit / 32] |= 1u << (bit % 32);
++}
++
+ // Takes the first listing of each block marked dropHot (cold: dropCold) off a slot's list, in one pass: what
+-// dropRange does for them one by one.
+-static void dropMarked(struct Block** list, size_t* count, bool cold) {
++// dropRange does for them one by one. Only blocks in the filter are read.
++static void dropMarked(struct Block** list, size_t* count, bool cold, const uint32_t* filter) {
+ 	size_t kept = 0;
+ 	for (size_t i = 0; i < *count; ++i) {
+ 		struct Block* block = list[i];
++		if (!evictFilterHas(filter, block)) {
++			list[kept++] = block;
++			continue;
++		}
+ 		bool* const mark = cold ? &block->dropCold : &block->dropHot;
+ 		if (*mark) {
+ 			*mark = false;
+@@ -752,6 +776,7 @@ static void dropMarked(struct Block** list, size_t* count, bool cold) {
+ // with a few hundred of them searched those lists once for each: 1.6M of its 2.6M instructions (a32, 2026-11-26).
+ static void dropLists(struct Jit* jit, int from) {
+ 	uint64_t hot = 0, cold = 0;
++	uint32_t filter[EVICT_FILTER / 32] = { 0 };
+ 	for (int i = from; i < jit->evictedCount; ++i) {
+ 		struct Block* block = jit->evicted[i];
+ 		int const slot = slotOf(jit, block->entry);
+@@ -765,6 +790,7 @@ static void dropLists(struct Jit* jit, int from) {
+ 			}
+ 			continue;
+ 		}
++		evictFilterAdd(filter, block);
+ 		block->dropHot = true;
+ 		hot |= 1ull << slot;
+ 		if (block->cold) {
+@@ -774,10 +800,10 @@ static void dropLists(struct Jit* jit, int from) {
+ 	}
+ 	for (int i = 0; hot | cold; ++i, hot >>= 1, cold >>= 1) {
+ 		if (hot & 1) {
+-			dropMarked(jit->slots[i].hot, &jit->slots[i].hotCount, false);
++			dropMarked(jit->slots[i].hot, &jit->slots[i].hotCount, false, filter);
+ 		}
+ 		if (cold & 1) {
+-			dropMarked(jit->slots[i].cold, &jit->slots[i].coldCount, true);
++			dropMarked(jit->slots[i].cold, &jit->slots[i].coldCount, true, filter);
+ 		}
+ 	}
+ }
+@@ -872,6 +898,11 @@ static void evictSlot(struct Jit* jit, int victim) {
+ 		}
+ 	}
+ 	bool listed = false;
++#if defined(__3DS__)
++	// The jumps unlinked here reach the instruction cache in one kernel call, not one each: thousands
++	// of them took 9 of a 25 ms reclaim in Final Fantasy VI on a New 2DS XL.
++	jitHostFlushBatch(true);
++#endif
+ 	for (int i = 0; i < jit->evictedCount; ++i) {
+ 		struct Block* block = jit->evicted[i];
+ 		removeBlock(jit, block);
+@@ -885,11 +916,20 @@ static void evictSlot(struct Jit* jit, int victim) {
+ 			*prev = block->dormantNext;
+ 		}
+ 	}
++#if defined(__3DS__)
++	jitHostFlushBatch(false);
++#endif
+ 	if (listed) {
++		// Reading every cartridge block took 3 ms of a reclaim in Final Fantasy VI (13,000 of them).
++		uint32_t filter[EVICT_FILTER / 32] = { 0 };
++		for (int i = 0; i < jit->evictedCount; ++i) {
++			evictFilterAdd(filter, jit->evicted[i]);
++		}
+ 		int kept = 0;
+ 		for (int i = 0; i < jit->romBlockCount; ++i) {
+-			if (!jit->romBlocks[i]->evicting) {
+-				jit->romBlocks[kept++] = jit->romBlocks[i];
++			struct Block* const block = jit->romBlocks[i];
++			if (!evictFilterHas(filter, block) || !block->evicting) {
++				jit->romBlocks[kept++] = block;
+ 			}
+ 		}
+ 		jit->romBlockCount = kept;

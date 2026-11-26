@@ -1,0 +1,77 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Tue, 17 Nov 2026 09:43:42 -0500
+Subject: armGBA: the sound log is published and read with the fewest barriers,
+ and threadLogsLean = false puts a barrier at every entry again (armGBA 2.0's
+ render log, e9d0ec8, already waits for the line)
+
+
+diff --git a/src/audio/audio-thread.c b/src/audio/audio-thread.c
+index c2f8202..dc97a8e 100644
+--- a/src/audio/audio-thread.c
++++ b/src/audio/audio-thread.c
+@@ -62,6 +62,8 @@ struct AudioThread {
+ 	struct Entry log[LOG_ENTRIES];
+ 	atomic_uint written;
+ 	atomic_uint done;
++	// The emulation thread's: how far the worker had got when it last looked.
++	unsigned doneSeen;
+ 	atomic_bool asleep;
+ 	atomic_bool awaited;
+ 	// Who is making the logged calls on the copy: nobody (0), the worker (1), or the emulation
+@@ -76,6 +78,7 @@ unsigned long audioStoodIn;
+ 
+ struct GBA* audioThreaded;
+ int audioThreadQuiet;
++bool threadLogsLean = true;
+ static struct AudioThread* thread;
+ 
+ // Makes a logged call on the copy.
+@@ -192,7 +195,9 @@ static void* work(void* context) {
+ 
+ static void wake(struct AudioThread* t) {
+ 	t->sinceWake = 0;
+-	if (atomic_load(&t->asleep)) {
++	// The entry just written is seen by the worker, before this looks whether it sleeps.
++	atomic_thread_fence(memory_order_seq_cst);
++	if (atomic_load_explicit(&t->asleep, memory_order_relaxed)) {
+ 		pthread_mutex_lock(&t->mutex);
+ 		pthread_cond_signal(&t->wake);
+ 		pthread_mutex_unlock(&t->mutex);
+@@ -257,11 +262,19 @@ static void drain(struct AudioThread* t) {
+ void audioThreadWrite(uint32_t kind, uint32_t a, uint32_t b, uint32_t time, uint32_t value) {
+ 	struct AudioThread* t = thread;
+ 	unsigned const written = atomic_load_explicit(&t->written, memory_order_relaxed);
+-	if (written - atomic_load(&t->done) >= LOG_ENTRIES) {
+-		drain(t);
++	if (written - t->doneSeen >= LOG_ENTRIES || !threadLogsLean) {
++		t->doneSeen = atomic_load(&t->done);
++		if (written - t->doneSeen >= LOG_ENTRIES) {
++			drain(t);
++			t->doneSeen = atomic_load(&t->done);
++		}
+ 	}
+ 	t->log[written % LOG_ENTRIES] = (struct Entry) { kind, a, b, time, value };
+-	atomic_store(&t->written, written + 1);
++	if (threadLogsLean) {
++		atomic_store_explicit(&t->written, written + 1, memory_order_release);
++	} else {
++		atomic_store(&t->written, written + 1);
++	}
+ 	if (++t->sinceWake >= WAKE_AFTER) {
+ 		wake(t);
+ 	}
+diff --git a/src/gba.h b/src/gba.h
+index 2961013..d4773fb 100644
+--- a/src/gba.h
++++ b/src/gba.h
+@@ -1157,6 +1157,9 @@ enum {
+ 	AUDIO_LOG_WAVE_SHAPE,
+ 	AUDIO_LOG_WAVE_VOLUME,
+ };
++// Whether the sound log is published and read with the fewest barriers (false: a barrier at every
++// entry, as it was).
++extern bool threadLogsLean;
+ // The console whose sound a thread makes, if any, and whether its calls are inside one already
+ // logged whole.
+ extern struct GBA* audioThreaded;

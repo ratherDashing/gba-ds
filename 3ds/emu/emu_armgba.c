@@ -12,8 +12,12 @@
 #include "gba.h"
 #include "cheats.h"
 #include "cpu/jit.h"
+#ifdef __3DS__
+#include "cpu/jit-internal.h"
+#endif
 #include "video/render.h"
 
+#include "bench.h"
 #include "emu.h"
 #ifdef __3DS__
 #include "host.h"
@@ -28,6 +32,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <zlib.h>
 
 /* What Emu.core points at (the other builds' struct mCore). */
@@ -42,6 +47,15 @@ typedef struct ArmCore {
 	char warmPath[64]; /* (the game itself: its warm list's file) */
 	bool late; /* (drawn on a render thread a frame late) */
 	bool savePending;
+#ifdef __3DS__
+	int codeCore; /* the core that last wrote this machine's code: its shared routines are written where it is opened */
+#endif
+	/* armgba_stats: the lines' interval (0: none) and the counters at the last one (3DS) */
+	unsigned statsEvery;
+	struct JitSeen* seen;
+	bool game; /* the machine with the sound: not a copy */
+	uint64_t compileBudget; /* (3DS, the game: the host ticks of compiling a frame may take before the code met for the first times is put off) */
+	unsigned ran, loads; /* frames run and states loaded here (a copy's frame counter is the game's, from the state it loaded) */
 	/* sound not yet read (emu_audio_read): stereo frames in a ring */
 	int16_t* ring;
 	size_t ringCap, ringHead, ringCount;
@@ -60,6 +74,14 @@ typedef struct ArmCore {
 	/* emu_mark_backdrop: the same picture drawn again on a backdrop of
 	 * MARK_555, where every pixel no layer or sprite drew stays MARK_555 */
 	uint16_t* markFrame;
+	/* armgba_picture_thread: the render workers widen the frames they hand over, into wideBuf in turn, and
+	 * e->fb points at the one that holds the frame taken (fbOwn is the one this machine made) */
+	uint32_t* fbOwn;
+	uint32_t* wideBuf[2];
+	bool wideLinear;   /* raw_picture: wideBuf is linear memory, written back by the worker, that the copy engine reads as it is */
+	unsigned widePitch; /* ... and the words a row of it has (256: one transfer tiles it; 240: two passes) */
+	uint32_t* twin[2]; /* gpu_twin: wideBuf's pictures again in the GPU's byte order (linear memory, HOST_TWIN_STRIDE words a row) */
+	int bright; /* emu_bright_samples: the bright samples of the frame taken, as the workers counted them; -1 if not, or given */
 } ArmCore;
 
 static ArmCore* AC(const Emu* e) {
@@ -79,15 +101,41 @@ void emu_read_cancel(const volatile bool* flag) {
 	readCancel = flag;
 }
 
-static uint8_t* read_file(const char* path, size_t* n) {
+#ifdef __3DS__
+#define rom_free host_rom_free
+#else
+#define rom_free free
+#endif
+
+#ifdef __3DS__
+static _Thread_local uint8_t* romRoomNow; /* (the room emu_open set aside at the top for the read that comes next, and its size) */
+static _Thread_local size_t romRoomSize;
+#endif
+
+/* top (3DS): read into a cartridge's whole buffer at the top of the heap's range, where a long session's
+ * small allocations can't cut up the room the next game's cartridge needs. */
+static uint8_t* read_file_to(const char* path, size_t* n, bool top) {
 	struct stat st;
 	*n = 0;
 	if (stat(path, &st) || st.st_size <= 0 || st.st_size > 64 * 1024 * 1024) return NULL;
 	FILE* f = fopen(path, "rb");
-	uint8_t* p = f ? malloc((size_t) st.st_size) : NULL;
+	uint8_t* p = NULL;
+#ifdef __3DS__
+	size_t const whole = gbaRomBufferSize((size_t) st.st_size);
+	if (f && top && romRoomNow && romRoomSize == whole) p = romRoomNow, romRoomNow = NULL;
+	else if (f && top) p = host_top_alloc(whole);
+	if (p) memset(p + st.st_size, 0, whole - (size_t) st.st_size);
+#else
+	(void) top;
+#endif
+	if (f && !p) p = malloc((size_t) st.st_size);
 #ifdef __3DS__
 	if (!f) fprintf(stderr, "%s: can't be opened\n", path);
-	else if (!p) fprintf(stderr, "%s: no memory for its %u KiB (%u KiB of the heap free)\n", path, (unsigned) (st.st_size >> 10), (unsigned) (host_heap_free() >> 10));
+	else if (!p) {
+		char shape[400];
+		host_heap_shape(shape, sizeof(shape));
+		fprintf(stderr, "%s: no memory for its %u KiB (%u KiB of the heap free): %s\n", path, (unsigned) (st.st_size >> 10), (unsigned) (host_heap_free() >> 10), shape);
+	}
 #endif
 #ifdef __3DS__
 	/* In pieces: one read of a whole ROM holds the SD card for seconds, and
@@ -110,11 +158,15 @@ static uint8_t* read_file(const char* path, size_t* n) {
 	if (p && fread(p, 1, (size_t) st.st_size, f) == (size_t) st.st_size) *n = (size_t) st.st_size;
 #endif
 	else {
-		free(p);
+		rom_free(p);
 		p = NULL;
 	}
 	if (f) fclose(f);
 	return p;
+}
+
+static uint8_t* read_file(const char* path, size_t* n) {
+	return read_file_to(path, n, false);
 }
 
 static bool has_ext(const char* name, const char* const* exts) {
@@ -376,14 +428,30 @@ uint8_t* emu_rom_read_patched(const char* path, char files[][1024], int n, size_
 	return p ? p : emu_rom_read_all(path, size);
 }
 
-uint8_t* emu_rom_read_played(const char* path, size_t* size, int* patch, char* patchName, uint32_t* fileCrc) {
+/* (a patched ROM is built in the heap, so a room given back after the code memory was placed under it stays out of reach;
+ * a 32 MiB ROM's patch never fits and its read takes the room) */
+static bool patches_apply(const char* romPath) {
+	char beside[1024];
+	bool planned = false, any = false;
+	pthread_mutex_lock(&patchedLock);
+	if (plan.rom[0] && !strcmp(plan.rom, romPath)) planned = true, any = plan.n > 0;
+	pthread_mutex_unlock(&patchedLock);
+	return planned ? any : patch_find(romPath, beside, sizeof(beside));
+}
+
+/* top: a plain ROM file into a top block (read_file_to), for a core's own cartridge only (freed with rom_free) */
+static uint8_t* read_played(const char* path, size_t* size, int* patch, char* patchName, uint32_t* fileCrc, bool top) {
 	int r;
 	uint8_t* p = patched_rom(path, size, &r, patchName, fileCrc, NULL);
 	if (patch) *patch = r;
 	if (p) return p;
-	uint8_t* rom = emu_rom_read_all(path, size);
+	uint8_t* rom = emu_is_archive_name(path) ? zip_first_rom(path, 0, size) : read_file_to(path, size, top);
 	if (rom && fileCrc) *fileCrc = doCrc32(rom, *size);
 	return rom;
+}
+
+uint8_t* emu_rom_read_played(const char* path, size_t* size, int* patch, char* patchName, uint32_t* fileCrc) {
+	return read_played(path, size, patch, patchName, fileCrc, false);
 }
 
 /* ---------------------------------------------- one ROM, several cores
@@ -434,8 +502,21 @@ static void save_read(ArmCore* c) {
 	free(file);
 }
 
-/* Written to a new file, then put in the old one's place. */
-static bool save_file(const char* path, const void* data, size_t n) {
+/* gba-ds.cfg armgba_save: 0 a new file put in the old one's place, in the game's own frame; 1 the same on a thread of
+ * its own (the SD card can keep the game waiting for seconds). The file is never written over in place: power lost
+ * half-way would leave half old, half new. */
+static int save_mode(void) {
+	const char* v = getenv("GBADS_ARMGBA_SAVE");
+	return v ? atoi(v) & 1 : 1;
+}
+
+static double ms_since(const struct timespec* t0) {
+	struct timespec t1;
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	return (t1.tv_sec - t0->tv_sec) * 1000.0 + (t1.tv_nsec - t0->tv_nsec) / 1e6;
+}
+
+static bool save_file(const char* path, const uint8_t* data, size_t n) {
 	size_t len = strlen(path) + 8;
 	char* tmp = malloc(len);
 	if (!tmp) return false;
@@ -443,90 +524,119 @@ static bool save_file(const char* path, const void* data, size_t n) {
 	FILE* f = fopen(tmp, "wb");
 	bool ok = f && fwrite(data, 1, n, f) == n;
 	if (f) ok = fclose(f) == 0 && ok;
-	if (ok) {
+	if (!ok) {
+		fprintf(stderr, "save: couldn't write %s\n", tmp);
+		remove(tmp);
+	} else {
 		remove(path); /* (FAT: rename doesn't replace) */
 		ok = rename(tmp, path) == 0;
-	}
-	if (!ok) {
-		fprintf(stderr, "save: couldn't write %s\n", path);
-		remove(tmp);
+		/* (the old file is gone: if only this failed, the new one is the only whole copy and stays) */
+		if (!ok) fprintf(stderr, "save: couldn't put %s in place of %s\n", tmp, path);
 	}
 	free(tmp);
 	return ok;
 }
 
-/* Writes made while playing go to a thread of their own: on the 3DS a save
- * written to the SD card took the game about 150 ms (Mario Kart writes its
- * save in races: a hitch each time). The newest copy waiting replaces an
- * older one not started yet. */
-static struct {
-	pthread_mutex_t lock;
-	pthread_cond_t wake, idle;
-	bool started, busy;
-	char* path; /* (waiting: the file and a copy of the save) */
-	void* data;
-	size_t n;
-} saver = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, PTHREAD_COND_INITIALIZER, false, false, NULL, NULL, 0 };
-
-static void* saver_main(void* arg) {
-	(void) arg;
-	pthread_mutex_lock(&saver.lock);
-	for (;;) {
-		while (!saver.path) pthread_cond_wait(&saver.wake, &saver.lock);
-		char* path = saver.path;
-		void* data = saver.data;
-		size_t n = saver.n;
-		saver.path = NULL, saver.data = NULL;
-		saver.busy = true;
-		pthread_mutex_unlock(&saver.lock);
-		save_file(path, data, n);
-		free(path);
-		free(data);
-		pthread_mutex_lock(&saver.lock);
-		saver.busy = false;
-		pthread_cond_broadcast(&saver.idle);
-	}
-	return NULL;
-}
-
-/* Until every write handed over is on the card. */
-static void saver_wait(void) {
-	pthread_mutex_lock(&saver.lock);
-	while (saver.path || saver.busy) pthread_cond_wait(&saver.idle, &saver.lock);
-	pthread_mutex_unlock(&saver.lock);
+/* (the log line says what the SD card cost: the console's bench lost 0.2 to 14 s to it at each save. No float printing:
+ * newlib keeps a thread's float buffers for good, and a thread for each game leaves them high in the heap, in the way of the
+ * next big ROM) */
+static bool save_timed(const char* path, const uint8_t* data, size_t n, unsigned frame) {
+	struct timespec t0;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
+	bool ok = save_file(path, data, n);
+	fprintf(stderr, "save: %u bytes written at frame %u in %u ms\n", (unsigned) n, frame, (unsigned) (ms_since(&t0) + 0.5));
+	return ok;
 }
 
 static bool save_write(ArmCore* c) {
 	size_t n = save_size(c->gba);
 	if (!c->savePath || !n) return false;
-	saver_wait();
-	return save_file(c->savePath, c->gba->savedata.storage, n);
+	return save_timed(c->savePath, c->gba->savedata.storage, n, c->gba->video.frameCounter);
 }
 
-static void save_write_later(ArmCore* c) {
-	size_t n = save_size(c->gba);
-	if (!c->savePath || !n) return;
-	char* path = strdup(c->savePath);
-	void* data = malloc(n);
+/* The writing thread, made at the first save and kept until its game closes: a game's saves are
+ * handed to it as copies. */
+static struct {
+	pthread_mutex_t lock;
+	pthread_cond_t wake;
+	pthread_t thread;
+	bool started, busy, quit;
+	char* path;
+	uint8_t* data;
+	size_t n;
+	unsigned frame;
+} saver = { PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER };
+
+static void* saver_main(void* arg) {
+	(void) arg;
 	pthread_mutex_lock(&saver.lock);
-	if (!saver.started && path && data) {
-		pthread_t th;
-		saver.started = pthread_create(&th, NULL, saver_main, NULL) == 0;
-		if (saver.started) pthread_detach(th);
-	}
-	if (!saver.started || !path || !data) {
+	for (;;) {
+		while (!saver.busy && !saver.quit) pthread_cond_wait(&saver.wake, &saver.lock);
+		if (!saver.busy) break;
 		pthread_mutex_unlock(&saver.lock);
+		save_timed(saver.path, saver.data, saver.n, saver.frame);
+		pthread_mutex_lock(&saver.lock);
+		free(saver.path);
+		free(saver.data);
+		saver.busy = false;
+		pthread_cond_broadcast(&saver.wake);
+	}
+	pthread_mutex_unlock(&saver.lock);
+	return NULL;
+}
+
+/* Waits for the write in hand, and ends the thread. */
+static void saver_stop(void) {
+	if (!saver.started) return;
+	pthread_mutex_lock(&saver.lock);
+	saver.quit = true;
+	pthread_cond_broadcast(&saver.wake);
+	pthread_mutex_unlock(&saver.lock);
+	pthread_join(saver.thread, NULL);
+	saver.started = saver.quit = false;
+}
+
+/* The thread, if there is room for it (a 32 MiB game leaves the heap little). */
+static bool saver_start(void) {
+	if (saver.started) return true;
+#ifdef __3DS__
+	if (host_heap_free() < (1536u << 10)) return false;
+#endif
+	saver.quit = false;
+#ifdef __3DS__
+	host_next_thread_name("battery save");
+#endif
+	saver.started = pthread_create(&saver.thread, NULL, saver_main, NULL) == 0;
+	return saver.started;
+}
+
+/* A save handed to the thread; false: it's still on the last one (try again next frame). Without a thread
+ * (none could be made, or no memory for the copy) the game writes it itself. */
+static bool save_hand_off(ArmCore* c) {
+	size_t n = save_size(c->gba);
+	if (!c->savePath || !n) return true;
+	pthread_mutex_lock(&saver.lock);
+	bool busy = saver.busy;
+	pthread_mutex_unlock(&saver.lock);
+	if (busy) return false;
+	char* path = strdup(c->savePath);
+	uint8_t* data = malloc(n);
+	if (!path || !data || !saver_start()) {
 		free(path);
 		free(data);
 		save_write(c);
-		return;
+		return true;
 	}
 	memcpy(data, c->gba->savedata.storage, n);
-	free(saver.path);
-	free(saver.data);
-	saver.path = path, saver.data = data, saver.n = n;
-	pthread_cond_signal(&saver.wake);
+	pthread_mutex_lock(&saver.lock);
+	saver.path = path;
+	saver.data = data;
+	saver.n = n;
+	saver.frame = c->gba->video.frameCounter;
+	saver.busy = true;
+	pthread_cond_broadcast(&saver.wake);
 	pthread_mutex_unlock(&saver.lock);
+	return true;
 }
 
 /* The game's writes to its save go to the file once they've stopped for a
@@ -538,8 +648,12 @@ static void save_tick(ArmCore* c) {
 		c->savePending = true;
 		c->saveQuiet = 0;
 	} else if (c->savePending && ++c->saveQuiet >= 15) {
-		c->savePending = false;
-		save_write_later(c);
+		if (save_mode() & 1) {
+			c->savePending = !save_hand_off(c);
+		} else {
+			c->savePending = false;
+			save_write(c);
+		}
 	}
 }
 
@@ -600,22 +714,134 @@ static void warm_save(ArmCore* c) { (void) c; }
 
 /* ---------------------------------------------- open, close, frames */
 
+/* gba-ds.cfg armgba_stats = N: every N frames of the game (of a copy: of those it ran) and as a machine closes, a log
+ * line of what the recompiler did. The ms compiling are this machine's; those in cache calls are the whole program's. */
+#ifdef __3DS__
+extern uint64_t jitFlushTicks;
+extern uint32_t jitFlushCalls;
+extern bool jitStatsOn;
+extern uint64_t renderWaitTicks, renderWorkTicks, audioWaitTicks, audioWorkTicks;
+uint64_t renderThreadHostTicks(void);
+static uint64_t pictureTicks, splitTicks;
+
+struct JitSeen {
+	uint64_t compiled, deferred, flushes0, flushes1, flushesAll, heapLow, freed, compileTicks, flushTicks, flushWork, invalidations, codeWrites, stepped, revived;
+	uint32_t flushCalls, loads;
+	uint64_t renderWait, renderWork, audioWait, audioWork, picture, split;
+	unsigned last;
+};
+
+/* In a bench job the line goes with the job's results (the log's ring drops writes while the card is busy, and did drop these);
+ * otherwise to the log. Its words don't start "threads:", which the bench's own line of where each thread ran does. */
+static void stat_line(const char* format, ...) {
+	char line[600];
+	va_list args;
+	va_start(args, format);
+	vsnprintf(line, sizeof(line), format, args);
+	va_end(args);
+	if (bench_active()) bench_note(line);
+	else fprintf(stderr, "%s\n", line);
+}
+
+/* (the game's core, once its machine is made: the key is read here, so a bench job's options can switch it) */
+static void jit_stats_open(ArmCore* c, bool game) {
+	const char* v = getenv("GBADS_ARMGBA_STATS");
+	int every = v ? atoi(v) : 0;
+	if (game) jitStatsOn = every > 0;
+	else if (!jitStatsOn) every = 0; /* (a copy counts when the game's machine did: opened after it) */
+	c->seen = every > 0 ? calloc(1, sizeof(*c->seen)) : NULL;
+	if (!c->seen) return;
+	c->statsEvery = (unsigned) every;
+	c->seen->flushTicks = jitFlushTicks; /* (these two are the whole program's, not this machine's) */
+	c->seen->flushCalls = jitFlushCalls;
+	c->seen->renderWait = renderWaitTicks;
+	c->seen->renderWork = renderWorkTicks;
+	c->seen->audioWait = audioWaitTicks;
+	c->seen->audioWork = audioWorkTicks;
+	c->seen->picture = pictureTicks;
+	c->seen->split = splitTicks;
+}
+
+static void jit_stats(ArmCore* c, unsigned frame, bool game, bool closing) {
+	struct JitSeen* seen = c->seen;
+	struct Jit* jit = c->gba->jit;
+	if (!seen || !jit || (!closing && frame % c->statsEvery)) return;
+	double const perMs = 268111.856, frames = frame - seen->last ? frame - seen->last : 1;
+	if (game) stat_line("jit threads: frames %u-%u: game thread waits for the renderer %.2f ms and the mixer %.2f ms a frame; renderer works %.2f ms, mixer %.2f ms; the game thread's picture %.2f ms, second picture %.2f ms",
+	        seen->last, frame, (renderWaitTicks - seen->renderWait) / perMs / frames, (audioWaitTicks - seen->audioWait) / perMs / frames,
+	        (renderWorkTicks - seen->renderWork) / perMs / frames, (audioWorkTicks - seen->audioWork) / perMs / frames, (pictureTicks - seen->picture) / perMs / frames,
+	        (splitTicks - seen->split) / perMs / frames);
+	uint64_t const others = jit->flushes - seen->flushesAll - (jit->flushReasons[0] - seen->flushes0) - (jit->flushReasons[1] - seen->flushes1);
+	stat_line("jit%s%s: frames %u-%u: compiled +%u, first visits stepped +%u, flushes +%u by writes or waits +%u by full memory (%u of them heap low) +%u by states or resets, emptying %.1f ms (%u blocks freed), compiling %.2f ms and, for all machines, cache calls %.2f ms (%u) a frame",
+	        game ? "" : " copy", closing ? " (closing)" : "", seen->last, frame, (unsigned) (jit->compiled - seen->compiled), (unsigned) (jit->deferred - seen->deferred),
+	        (unsigned) (jit->flushReasons[0] - seen->flushes0), (unsigned) (jit->flushReasons[1] - seen->flushes1), (unsigned) (jit->heapLowFlushes - seen->heapLow),
+	        (unsigned) others, (jit->flushWorkTicks - seen->flushWork) / perMs, (unsigned) (jit->flushedBlocks - seen->freed),
+	        (jit->compileTicks - seen->compileTicks) / perMs / frames, (jitFlushTicks - seen->flushTicks) / perMs / frames, (unsigned) (jitFlushCalls - seen->flushCalls));
+	stat_line("jit%s code: frames %u-%u: code %u of %u KiB (hot %u, cold %u, careful copies %u, unused %u), heap %u KiB free; invalidated +%u, writes to code +%u, instructions stepped +%u, revived +%u, states loaded +%u; compiles refused so far: heap low %u, no allocation %u, no code room %u",
+	        game ? "" : " copy", seen->last, frame, (unsigned) ((jit->codeNext - jit->codeStart) >> 10),
+	        (unsigned) (jit->codeSize >> 10), (unsigned) (jit->hotBytes >> 10), (unsigned) (jit->coldBytes >> 10),
+	        (unsigned) (jit->carefulBytes >> 10), (unsigned) (jit->wastedBytes >> 10), (unsigned) (host_heap_free() >> 10),
+	        (unsigned) (jit->invalidations - seen->invalidations), (unsigned) (jit->codeWrites - seen->codeWrites),
+	        (unsigned) (jit->stepped - seen->stepped), (unsigned) (jit->revived - seen->revived), (unsigned) (c->loads - seen->loads),
+	        (unsigned) jit->refused[0], (unsigned) jit->refused[1], (unsigned) jit->refused[2]);
+	seen->loads = c->loads;
+	seen->invalidations = jit->invalidations;
+	seen->codeWrites = jit->codeWrites;
+	seen->stepped = jit->stepped;
+	seen->revived = jit->revived;
+	seen->compiled = jit->compiled;
+	seen->deferred = jit->deferred;
+	seen->flushes0 = jit->flushReasons[0];
+	seen->flushes1 = jit->flushReasons[1];
+	seen->flushesAll = jit->flushes;
+	seen->heapLow = jit->heapLowFlushes;
+	seen->freed = jit->flushedBlocks;
+	seen->flushWork = jit->flushWorkTicks;
+	seen->compileTicks = jit->compileTicks;
+	seen->flushTicks = jitFlushTicks;
+	seen->flushCalls = jitFlushCalls;
+	seen->renderWait = renderWaitTicks;
+	seen->renderWork = renderWorkTicks;
+	seen->audioWait = audioWaitTicks;
+	seen->audioWork = audioWorkTicks;
+	seen->picture = pictureTicks;
+	seen->split = splitTicks;
+	seen->last = frame;
+}
+#endif
+
+#ifdef __3DS__
+static void twin_open(ArmCore* c, bool oneWorker);
+static void twin_close(ArmCore* c);
+static bool raw_open(ArmCore* c);
+#endif
+static void wide_free(ArmCore* c);
 static void close_core(ArmCore* c) {
 	if (!c) return;
+#ifdef __3DS__
+	if (c->gba && c->seen) jit_stats(c, c->game ? c->gba->video.frameCounter : c->ran, c->game, true);
+	if (c->game) host_jit_game_rom(0);
+#endif
 	if (c->gba) {
 		warm_save(c);
+		if (c->savePath) saver_stop(); /* (what it has in hand lands before the last write) */
 		if (c->savePath && (c->savePending || c->gba->savedata.dirty)) save_write(c);
-		else if (c->savePath) saver_wait(); /* (the last one handed over, on the card before the app can end) */
 		if (c->cheatsOn) cheatsClear(&c->cheats, c->gba);
 		if (c->shared) {
 			pthread_mutex_lock(&sharedLock);
 			c->gba->rom = NULL; /* gbaDestroy frees what's there */
 			if (--c->shared->users == 0) {
-				free(c->shared->rom);
+				rom_free(c->shared->rom);
 				memset(c->shared, 0, sizeof(*c->shared));
 			}
 			pthread_mutex_unlock(&sharedLock);
 		}
+#ifdef __3DS__
+		else if (host_top_owns(c->gba->rom)) {
+			host_top_free(c->gba->rom); /* (not malloc's, so not gbaDestroy's to free) */
+			c->gba->rom = NULL;
+		}
+#endif
 		/* (its render thread first: it draws with the hooks) */
 		renderThreadStop(c->gba);
 		split_release(c);
@@ -623,10 +849,25 @@ static void close_core(ArmCore* c) {
 		gbaDestroy(c->gba);
 	}
 	free(c->markFrame);
+#ifdef __3DS__
+	twin_close(c);
+#endif
+	wide_free(c);
 	free(c->savePath);
+#ifdef __3DS__
+	free(c->seen);
+#endif
 	free(c->ring);
 	free(c);
 }
+
+static uint32_t colour_8888(uint16_t v);
+static void widen_tables(void);
+static void widen_row(uint32_t* dst, const uint16_t* src);
+/* Each wide buffer's bright samples (emu_bright) row by row, counted by the worker that widens the row while its source
+ * is in that worker's cache; 0xFF: a row not widened yet (set only at open: every frame widens all 160 rows, so none goes stale). */
+static const uint32_t* brightBase[2];
+static uint8_t brightRows[2][GBA_H];
 
 int emuRenderWorkers = 1;
 bool emuHiddenCopy;
@@ -707,12 +948,21 @@ static const uint8_t* own_bios(void) {
 	return file;
 }
 
+/* (testing, as emu.c's: GBADS_RTC_FIXED=<unix seconds> holds the cartridge clock still; the bench sets it) */
+static int64_t rtcFixed;
+static int64_t rtc_fixed_now(void* context) {
+	(void) context;
+	return rtcFixed;
+}
+
 bool emu_open(Emu* e, const char* romPath, const char* savePath, bool audio) {
 	memset(e, 0, sizeof(*e));
+	e->fbPitch = GBA_W;
 	ArmCore* c = calloc(1, sizeof(*c));
 	if (!c) return false;
 	e->core = (struct mCore*) c;
 	c->layers = 0x1F;
+	c->bright = -1;
 #ifdef __3DS__
 	/* (the game's own core is the one with sound: the large share of the
 	 * recompiler's memory, and the console's other cores to draw and mix on) */
@@ -723,6 +973,7 @@ bool emu_open(Emu* e, const char* romPath, const char* savePath, bool audio) {
 	 * the heap had 30 MiB free but not 8 in one piece once the game's code
 	 * memory was placed, and Pokémon Pinball didn't start) */
 	void* romRoom = NULL;
+	size_t romRoomBytes = 0;
 	{
 		/* (the ROM is read after the machine is made: its size, so that the
 		 * recompiler leaves it room; a .zip's isn't known, taken as 16 MiB) */
@@ -731,7 +982,10 @@ bool emu_open(Emu* e, const char* romPath, const char* savePath, bool audio) {
 		for (int i = 0; i < SHARED_MAX; ++i) held |= sharedRoms[i].users && !strcmp(sharedRoms[i].path, romPath);
 		struct stat rst;
 		if (!held) toLoad = emu_is_archive_name(romPath) || stat(romPath, &rst) ? 16u << 20 : (size_t) rst.st_size;
-		if (toLoad) romRoom = malloc(gbaRomBufferSize(toLoad));
+		/* (a plain file's room is at the top of the heap's range: the code memory placed first can push the break up past it) */
+		romRoomBytes = gbaRomBufferSize(toLoad);
+		if (toLoad && emu_is_archive_name(romPath)) romRoom = malloc(romRoomBytes);
+		else if (toLoad && (toLoad > (16u << 20) || !patches_apply(romPath))) romRoom = host_top_alloc(romRoomBytes);
 		/* (set aside already: the heap free doesn't count it, so nothing more
 		 * is kept for it) */
 		host_jit_main(audio, romRoom ? 0 : toLoad, emuHiddenCopy);
@@ -746,6 +1000,14 @@ bool emu_open(Emu* e, const char* romPath, const char* savePath, bool audio) {
 		goto fail;
 	}
 	struct GBA* gba = c->gba;
+	threadLogsLean = !getenv("GBADS_ARMGBA_LEAN_LOGS") || atoi(getenv("GBADS_ARMGBA_LEAN_LOGS")); /* (armgba_lean_logs = 0: a barrier at every entry of the sound log) */
+	c->compileBudget = getenv("GBADS_ARMGBA_COMPILE_BUDGET") ? (uint64_t) (atof(getenv("GBADS_ARMGBA_COMPILE_BUDGET")) * 268111.856) : 268111 * 3 / 2; /* (armgba_compile_budget, in ms: 1.5 when unset) */
+	jitSetCompileAfter(getenv("GBADS_ARMGBA_COMPILE_AFTER") ? atoi(getenv("GBADS_ARMGBA_COMPILE_AFTER")) : 0); /* (armgba_compile_after: 0 when unset, so a bench job after another gets the built 2 back) */
+	if (getenv("GBADS_ARMGBA_MID_AFTER")) jitSetMidAfter(gba, atoi(getenv("GBADS_ARMGBA_MID_AFTER"))); /* (armgba_mid_after: 0 steps every return into a block) */
+	if (getenv("GBADS_ARMGBA_DEFER")) jitSetDeferMore(gba, atoi(getenv("GBADS_ARMGBA_DEFER")) != 0); /* (armgba_defer = 0: only events that start no DMA run after the instruction they fall in) */
+	if (getenv("GBADS_ARMGBA_LAZY_CARRY")) jitSetLazyCarry(gba, atoi(getenv("GBADS_ARMGBA_LAZY_CARRY")) != 0); /* (armgba_lazy_carry = 1: a console A/B) */
+	if (getenv("GBADS_ARMGBA_MID_CAREFUL")) jitSetMidCareful(gba, atoi(getenv("GBADS_ARMGBA_MID_CAREFUL"))); /* (armgba_mid_careful = 1, 2 or 3: a console A/B) */
+	gbaCside = getenv("GBADS_ARMGBA_CSIDE") ? (uint32_t) atoi(getenv("GBADS_ARMGBA_CSIDE")) : 0; /* (armgba_cside: a bit mask of exact C-side savings, 0 when unset; a console A/B) */
 	c->hooks.context = c;
 	renderSetHooks(gba, &c->hooks);
 	gbaLoadBios(gba, armgbaBios, SIZE_BIOS);
@@ -800,9 +1062,15 @@ bool emu_open(Emu* e, const char* romPath, const char* savePath, bool audio) {
 #endif
 	if (!s) {
 #ifdef __3DS__
-		free(romRoom), romRoom = NULL;
+		/* (a plain file's room goes to its read as it is; a .zip's is given back first) */
+		if (romRoom && host_top_owns(romRoom)) romRoomNow = romRoom, romRoomSize = romRoomBytes;
+		else host_rom_free(romRoom);
+		romRoom = NULL;
 #endif
-		rom = emu_rom_read_played(romPath, &size, &e->patch, e->patchName, &e->fileCrc);
+		rom = read_played(romPath, &size, &e->patch, e->patchName, &e->fileCrc, true);
+#ifdef __3DS__
+		host_rom_free(romRoomNow), romRoomNow = NULL;
+#endif
 		{
 			/* (the names of the ones left out, as src/emu.c reports them) */
 			int r;
@@ -843,7 +1111,7 @@ bool emu_open(Emu* e, const char* romPath, const char* savePath, bool audio) {
 #ifdef __3DS__
 			/* the buffer the file was read into becomes the cartridge */
 			size_t whole = gbaRomBufferSize(size);
-			uint8_t* grown = whole > size ? realloc(rom, whole) : rom;
+			uint8_t* grown = whole > size && !host_top_owns(rom) ? realloc(rom, whole) : rom;
 			if (grown) {
 				rom = grown;
 				if (whole > size) memset(rom + size, 0, whole - size);
@@ -870,7 +1138,7 @@ bool emu_open(Emu* e, const char* romPath, const char* savePath, bool audio) {
 			}
 		}
 		pthread_mutex_unlock(&sharedLock);
-		free(rom);
+		rom_free(rom);
 		if (!ok) {
 			fprintf(stderr, "could not load ROM %s\n", romPath);
 			goto fail;
@@ -878,12 +1146,20 @@ bool emu_open(Emu* e, const char* romPath, const char* savePath, bool audio) {
 	}
 
 #ifdef __3DS__
-	free(romRoom), romRoom = NULL; /* (a cartridge borrowed from another core: not needed) */
+	host_rom_free(romRoom), romRoom = NULL; /* (a cartridge borrowed from another core: not needed) */
 #endif
 	gba->savedata.backed = true;
 	if (savePath) {
 		c->savePath = strdup(savePath);
 		if (c->savePath) save_read(c);
+		if (c->savePath && (save_mode() & 1)) saver_start(); /* (its log lines here, not in a frame) */
+	}
+#ifdef __3DS__
+	c->codeCore = host_core_now();
+#endif
+	if (getenv("GBADS_RTC_FIXED")) {
+		rtcFixed = atoll(getenv("GBADS_RTC_FIXED"));
+		gba->gpio.clock = rtc_fixed_now;
 	}
 	gbaReset(gba, true);
 	gba->savedata.dirty = false;
@@ -904,15 +1180,42 @@ bool emu_open(Emu* e, const char* romPath, const char* savePath, bool audio) {
 	 * hidden copies aren't) */
 	if (getenv("GBADS_RENDER_THREAD") && renderThreadStart(gba, audio && getenv("GBADS_RENDER_LATE") != NULL, atoi(getenv("GBADS_RENDER_THREAD")) == 2))
 		renderSetHooks(gba, &c->hooks), c->late = audio && getenv("GBADS_RENDER_LATE") != NULL;
+	if (getenv("GBADS_AUDIO_THREAD")) audioThreadStart(gba);
 #endif
 
-	e->fb = calloc(GBA_W * GBA_H, sizeof(uint32_t));
+	e->fb = c->fbOwn = calloc(GBA_W * GBA_H, sizeof(uint32_t));
 	e->audio = audio;
+	if (c->late && getenv("GBADS_ARMGBA_PICTURE_THREAD") && atoi(getenv("GBADS_ARMGBA_PICTURE_THREAD")) == 1) {
+#ifdef __3DS__
+		c->wideLinear = emuRenderWorkers == 1 && raw_open(c);
+#endif
+		if (!c->wideLinear) {
+			c->wideBuf[0] = calloc(GBA_W * GBA_H, sizeof(uint32_t));
+			c->wideBuf[1] = calloc(GBA_W * GBA_H, sizeof(uint32_t));
+		}
+		if (c->wideBuf[0] && c->wideBuf[1]) {
+			widen_tables();
+#ifdef __3DS__
+			if (!c->wideLinear) twin_open(c, emuRenderWorkers == 1);
+#endif
+			brightBase[0] = c->wideBuf[0], brightBase[1] = c->wideBuf[1];
+			memset(brightRows, 0xFF, sizeof(brightRows));
+			renderThreadSetWiden(gba, widen_row, c->wideBuf[0], c->wideBuf[1]);
+		} else {
+			wide_free(c);
+		}
+	}
+#ifdef __3DS__
+	c->game = audio;
+	if (audio) host_jit_game_rom(gba->romSize);
+	jit_stats_open(c, audio);
+#endif
 	if (audio) {
-		c->ringCap = 8192;
+		c->ringCap = 8192; /* (a power of two: the ring's indexes are masked, the ARM11 has no divide) */
 		c->ring = calloc(c->ringCap, 2 * sizeof(int16_t));
 	}
 	cheatsInit(&c->cheats);
+	widen_tables(); /* (before any other thread takes a picture) */
 	if (!e->fb || (audio && !c->ring)) goto fail;
 #ifdef __3DS__
 	host_mem_note(audio ? "the game opened" : "a copy opened");
@@ -920,7 +1223,7 @@ bool emu_open(Emu* e, const char* romPath, const char* savePath, bool audio) {
 	return true;
 fail:
 #ifdef __3DS__
-	free(romRoom);
+	host_rom_free(romRoom);
 #endif
 	close_core(c);
 	e->core = NULL;
@@ -931,55 +1234,377 @@ fail:
 
 static Emu* rewindOwner;
 void emu_close(Emu* e) {
+#ifdef __3DS__
+	if (e->fbCompactCopies) {
+		char line[120];
+		snprintf(line, sizeof(line), "the picture was copied to rows of 240 words %u times in %llu frames (raw_picture)", e->fbCompactCopies, (unsigned long long) e->frames);
+		logLine("%s", line);
+		if (bench_active()) bench_note(line);
+	}
+#endif
 	if (e->core) {
+		if (AC(e)->fbOwn) e->fb = AC(e)->fbOwn;
+		e->fbPitch = GBA_W;
 		if (rewindOwner == e) emu_rewind_deinit();
 		close_core(AC(e));
 		e->core = NULL;
 	}
 	free(e->fb);
 	e->fb = NULL;
+	e->fbGpu = NULL;
+	free(e->fbCompact);
+	e->fbCompact = NULL;
+	e->fbCompactOk = false;
+	e->fbPitch = GBA_W;
 }
 
 bool emu_cancelled(const Emu* e) {
 	return e->cancel && *e->cancel;
 }
 
+/* Each bit of a color widens on its own, so a color is its low byte's entry ORed with its high byte's. */
+static uint32_t widenLow[256], widenHigh[256];
+static bool widenReady;
+static void widen_tables(void) {
+	if (__atomic_load_n(&widenReady, __ATOMIC_ACQUIRE)) return;
+	for (uint32_t i = 0; i < 256; ++i) {
+		widenLow[i] = colour_8888((uint16_t) i);
+		widenHigh[i] = colour_8888((uint16_t) (i << 8));
+	}
+	__atomic_store_n(&widenReady, true, __ATOMIC_RELEASE);
+}
+
+static inline uint32_t widen(uint32_t v) {
+	return widenLow[v & 0xFF] | widenHigh[(v >> 8) & 0xFF];
+}
+
+/* (the tables come in as pointers so each lookup is one load; the compiler would add their offsets into the addresses otherwise) */
+static __attribute__((noipa)) void widen_words(uint32_t* restrict dst, const uint32_t* restrict words, const uint32_t* restrict low, const uint32_t* restrict high) {
+	for (int i = 0; i < GBA_W * GBA_H / 2; i += 2) {
+		uint32_t const a = words[i], b = words[i + 1];
+		dst[2 * i] = low[a & 0xFF] | high[(a >> 8) & 0xFF];
+		dst[2 * i + 1] = low[(a >> 16) & 0xFF] | high[a >> 24];
+		dst[2 * i + 2] = low[b & 0xFF] | high[(b >> 8) & 0xFF];
+		dst[2 * i + 3] = low[(b >> 16) & 0xFF] | high[b >> 24];
+	}
+}
+
+#ifdef __3DS__
+/* gpu_twin: the picture the workers widen is also written in the GPU's byte order (the words swapped, as the game thread's swap made them), into a
+ * linear buffer that the worker flushes itself, when the last row is in. */
+static struct {
+	uint32_t* wide;
+	uint32_t* twin;
+} twinMap[2];
+
+/* The whole twin is written back in one call when its last row is in (or, if that row never came, when the rows start on the
+ * other twin); only the one worker calls this (twin_open: one worker). */
+static const uint32_t* twinDirty;
+static uint64_t twinRowTicks, twinFlushTicks;
+static unsigned twinFrames;
+
+/* Where row `wideRow` of a wide buffer has its twin (NULL: none), and which twin that is, for twin_row_done. */
+static uint32_t* twin_row_at(const uint32_t* wideRow, int* y, uint32_t** twin) {
+	for (int k = 0; k < 2; ++k) {
+		const uint32_t* base = twinMap[k].wide;
+		if (!base || wideRow < base || wideRow >= base + GBA_W * GBA_H) continue;
+		*y = (int) ((wideRow - base) / GBA_W);
+		*twin = twinMap[k].twin;
+		return *twin + (size_t) *y * HOST_TWIN_STRIDE;
+	}
+	return NULL;
+}
+
+/* The row is in: the whole twin is written back in one call with its last row (or, if that row never came, when the rows
+ * start on the other twin). Only the one worker calls this (twin_open: one worker). */
+static void twin_row_done(int y, uint32_t* twin) {
+	const size_t bytes = (size_t) GBA_H * HOST_TWIN_STRIDE * sizeof(uint32_t);
+	if (twinDirty && twinDirty != twin) host_flush_data(twinDirty, bytes);
+	if (y == GBA_H - 1) {
+		const uint64_t t0 = host_ticks();
+		host_flush_data(twin, bytes);
+		twinFlushTicks += host_ticks() - t0;
+		twinDirty = NULL;
+		++twinFrames;
+	} else {
+		twinDirty = twin;
+	}
+}
+
+static void twin_open(ArmCore* c, bool oneWorker) {
+	c->twin[0] = c->twin[1] = NULL;
+	if (!oneWorker || !host_gpu_twin_ready()) return;
+	const size_t bytes = (size_t) GBA_H * HOST_TWIN_STRIDE * sizeof(uint32_t);
+	for (int k = 0; k < 2; ++k) {
+		c->twin[k] = host_linear_alloc(bytes);
+		if (!c->twin[k]) break;
+		memset(c->twin[k], 0, bytes);
+		host_flush_data(c->twin[k], bytes);
+	}
+	if (!c->twin[0] || !c->twin[1]) {
+		for (int k = 0; k < 2; ++k) {
+			if (c->twin[k]) host_linear_free(c->twin[k]);
+			c->twin[k] = NULL;
+		}
+		return;
+	}
+	twinDirty = NULL;
+	for (int k = 0; k < 2; ++k) twinMap[k].wide = c->wideBuf[k], twinMap[k].twin = c->twin[k];
+	logLine("picture twin: made (2 x %u KiB of linear memory)", (unsigned) (bytes >> 10));
+}
+
+static void twin_close(ArmCore* c) {
+	if (!c->twin[0]) return;
+	host_picture_twin(NULL, NULL); /* (a later game's picture may sit at the freed picture's address) */
+	host_gpu_settle();
+	if (twinFrames) {
+		logLine("picture twin: per frame the render worker spent %.3f ms widening the rows with it and %.3f ms flushing it (%u frames)", twinRowTicks / HOST_TICKS_PER_MS / twinFrames,
+		        twinFlushTicks / HOST_TICKS_PER_MS / twinFrames, twinFrames);
+	}
+	twinRowTicks = twinFlushTicks = 0, twinFrames = 0;
+	twinDirty = NULL;
+	for (int k = 0; k < 2; ++k) {
+		twinMap[k].wide = twinMap[k].twin = NULL;
+		host_linear_free(c->twin[k]);
+		c->twin[k] = NULL;
+	}
+}
+
+/* raw_picture: wideBuf is what the copy engine reads (with some slack after it), written back by the one
+ * worker when its last row is in, as the twin's. */
+static const uint32_t* rawBase[2];
+static const uint32_t* rawDirty;
+static uint64_t rawFlushTicks;
+static unsigned rawFrames;
+
+static unsigned rawPitch;
+
+/* The buffer that row dst (as armGBA counts them: GBA_W words apart from the buffer's start) belongs to, and which row it is. */
+static uint32_t* raw_row_at(const uint32_t* dst, int* y, const uint32_t** base) {
+	*base = dst >= rawBase[1] && dst < rawBase[1] + GBA_W * GBA_H ? rawBase[1] : rawBase[0];
+	*y = (int) ((dst - *base) / GBA_W);
+	return (uint32_t*) *base + (size_t) *y * rawPitch;
+}
+
+static void raw_row_done(const uint32_t* base, int y) {
+	const size_t bytes = (size_t) rawPitch * GBA_H * sizeof(uint32_t);
+	if (rawDirty && rawDirty != base) host_flush_data(rawDirty, bytes);
+	if (y == GBA_H - 1) {
+		const uint64_t t0 = host_ticks();
+		host_flush_data(base, bytes);
+		rawFlushTicks += host_ticks() - t0;
+		rawDirty = NULL;
+		++rawFrames;
+	} else {
+		rawDirty = base;
+	}
+}
+
+static bool raw_open(ArmCore* c) {
+	if (!host_raw_picture_ready()) return false;
+	c->widePitch = host_raw_picture_pitch();
+	const size_t bytes = ((size_t) c->widePitch * GBA_H + HOST_RAW_SLACK_WORDS) * sizeof(uint32_t);
+	for (int k = 0; k < 2; ++k) {
+		c->wideBuf[k] = host_linear_alloc(bytes);
+		if (!c->wideBuf[k]) break;
+		memset(c->wideBuf[k], 0, bytes);
+		host_flush_data(c->wideBuf[k], bytes);
+	}
+	if (!c->wideBuf[0] || !c->wideBuf[1]) {
+		for (int k = 0; k < 2; ++k) {
+			if (c->wideBuf[k]) host_linear_free(c->wideBuf[k]);
+			c->wideBuf[k] = NULL;
+		}
+		logLine("raw picture: no linear memory for the picture buffers, the byte swap stays");
+		return false;
+	}
+	rawDirty = NULL;
+	rawPitch = c->widePitch;
+	for (int k = 0; k < 2; ++k) rawBase[k] = c->wideBuf[k];
+	logLine("raw picture: made (2 x %u KiB of linear memory, rows %u words apart)", (unsigned) (bytes >> 10), c->widePitch);
+	return true;
+}
+#endif
+
+/* (the copy engine may still be reading a raw picture: the GPU is waited for before it goes) */
+static void wide_free(ArmCore* c) {
+	if (c->wideBuf[0] && brightBase[0] == c->wideBuf[0]) brightBase[0] = brightBase[1] = NULL;
+#ifdef __3DS__
+	if (c->wideLinear) {
+		host_picture_raw(NULL); /* (a later game's picture may sit at the freed picture's address) */
+		host_gpu_settle();
+		if (rawFrames) {
+			char line[120];
+			snprintf(line, sizeof(line), "raw picture: per frame the render worker spent %.3f ms flushing it (%u frames)", rawFlushTicks / HOST_TICKS_PER_MS / rawFrames, rawFrames);
+			logLine("%s", line);
+			if (bench_active()) bench_note(line);
+		}
+		rawFlushTicks = 0, rawFrames = 0;
+		rawDirty = NULL;
+		rawBase[0] = rawBase[1] = NULL;
+		host_linear_free(c->wideBuf[0]);
+		host_linear_free(c->wideBuf[1]);
+		c->wideBuf[0] = c->wideBuf[1] = NULL;
+		c->wideLinear = false;
+		rawPitch = 0;
+		return;
+	}
+#endif
+	free(c->wideBuf[0]);
+	free(c->wideBuf[1]);
+	c->wideBuf[0] = c->wideBuf[1] = NULL;
+}
+
+static void bright_count(const uint32_t* dst, const uint16_t* src) {
+	if (!brightBase[0]) return;
+	int const k = dst >= brightBase[1] && dst < brightBase[1] + GBA_W * GBA_H;
+	if (dst < brightBase[k] || dst >= brightBase[k] + GBA_W * GBA_H) return;
+	int const y = (int) ((dst - brightBase[k]) / GBA_W);
+	int n = 0;
+	for (int x = (EMU_DARK_STEP - y * GBA_W % EMU_DARK_STEP) % EMU_DARK_STEP; x < GBA_W; x += EMU_DARK_STEP) n += emu_bright(widen(src[x]));
+	brightRows[k][y] = (uint8_t) n;
+}
+
+static int bright_sum(int k) {
+	int n = 0;
+	for (int y = 0; y < GBA_H; ++y) {
+		if (brightRows[k][y] == 0xFF) return -1;
+		n += brightRows[k][y];
+	}
+	return n;
+}
+
+int emu_bright_samples(Emu* e) {
+	ArmCore* const c = AC(e);
+	if (!c) return -1;
+	int const n = e->fbPainted ? -1 : c->bright;
+	c->bright = -1;
+	return n;
+}
+
+/* One row, from a render worker (its source is word aligned: the log's frame). */
+static void widen_row(uint32_t* dst, const uint16_t* src) {
+	const uint32_t* words = __builtin_assume_aligned(src, 4);
+	bright_count(dst, src);
+#ifdef __3DS__
+	int y = 0;
+	uint32_t* twin = NULL;
+	uint32_t* const tw = twinMap[0].twin ? twin_row_at(dst, &y, &twin) : NULL;
+	if (tw) {
+		/* (the same words, swapped into the twin as they are made) */
+		const uint64_t t0 = host_ticks();
+		for (int i = 0; i < GBA_W / 2; i += 2) {
+			uint32_t const a = words[i], b = words[i + 1];
+			uint32_t const w0 = widenLow[a & 0xFF] | widenHigh[(a >> 8) & 0xFF], w1 = widenLow[(a >> 16) & 0xFF] | widenHigh[a >> 24];
+			uint32_t const w2 = widenLow[b & 0xFF] | widenHigh[(b >> 8) & 0xFF], w3 = widenLow[(b >> 16) & 0xFF] | widenHigh[b >> 24];
+			dst[2 * i] = w0, dst[2 * i + 1] = w1, dst[2 * i + 2] = w2, dst[2 * i + 3] = w3;
+			tw[2 * i] = __builtin_bswap32(w0), tw[2 * i + 1] = __builtin_bswap32(w1);
+			tw[2 * i + 2] = __builtin_bswap32(w2), tw[2 * i + 3] = __builtin_bswap32(w3);
+		}
+		twinRowTicks += host_ticks() - t0;
+		twin_row_done(y, twin);
+		return;
+	}
+	const uint32_t* rawBuf = NULL;
+	int rawY = 0;
+	if (rawBase[0]) dst = raw_row_at(dst, &rawY, &rawBuf); /* (raw_picture's rows may be further apart than armGBA counts) */
+#endif
+	for (int i = 0; i < GBA_W / 2; i += 2) {
+		uint32_t const a = words[i], b = words[i + 1];
+		dst[2 * i] = widenLow[a & 0xFF] | widenHigh[(a >> 8) & 0xFF];
+		dst[2 * i + 1] = widenLow[(a >> 16) & 0xFF] | widenHigh[a >> 24];
+		dst[2 * i + 2] = widenLow[b & 0xFF] | widenHigh[(b >> 8) & 0xFF];
+		dst[2 * i + 3] = widenLow[(b >> 16) & 0xFF] | widenHigh[b >> 24];
+	}
+#ifdef __3DS__
+	if (rawBuf) raw_row_done(rawBuf, rawY);
+#endif
+}
+
+/* A whole picture; two colors a word where they are word aligned (the ARM11 can't load a half-word pair otherwise). */
+static void widen_picture(uint32_t* dst, const uint16_t* src) {
+	widen_tables();
+	if (!((uintptr_t) src & 3)) {
+		widen_words(dst, __builtin_assume_aligned(src, 4), widenLow, widenHigh);
+		return;
+	}
+	for (int i = 0; i < GBA_W * GBA_H; ++i) dst[i] = widen(src[i]);
+}
+
 /* armGBA's picture is the GBA's own 15-bit colours; GBA DS wants mGBA's
  * 32-bit ones (bytes R, G, B, X), widened the way mGBA widens them. */
 #define MARK_555 0x7C1F
 static void take_picture(Emu* e) {
-	const uint16_t* src = (const uint16_t*) AC(e)->gba->renderer.frame;
-	const uint16_t* mark = AC(e)->markFrame;
-	uint32_t* dst = e->fb;
-	for (int i = 0; i < GBA_W * GBA_H; ++i) {
-		uint32_t v = src[i];
-		uint32_t c = ((v << 3) & 0xF8) | ((v << 6) & 0xF800) | ((v << 9) & 0xF80000);
-		/* (emu_mark_backdrop: the backdrop's pixels told apart by their
-		 * fourth byte, as mGBA's flags there tell them apart) */
-		dst[i] = c | ((c >> 5) & 0x070707) | (mark && mark[i] == MARK_555 ? 0xFC000000u : 0xFF000000u);
+	ArmCore* c = AC(e);
+	const uint32_t* wide = c->wideBuf[0] ? renderThreadWide(c->gba) : NULL;
+	e->fbGpu = NULL;
+	e->fbGpuDirty = 0;
+	e->fbPitch = GBA_W;
+	e->fbCompactOk = false;
+	if (wide && c->wideLinear && c->widePitch != GBA_W && c->markFrame) {
+		/* (the marks are put on rows of GBA_W: on a copy) */
+		for (int y = 0; y < GBA_H; ++y) memcpy(&c->fbOwn[y * GBA_W], &wide[y * c->widePitch], GBA_W * sizeof(uint32_t));
+		e->fb = c->fbOwn;
+	} else if (wide) {
+		e->fb = (uint32_t*) wide;
+		if (c->twin[0] && !c->markFrame) { /* (a marked picture's fourth bytes are not the twin's) */
+			e->fbGpu = c->twin[wide == c->wideBuf[1]];
+			e->fbGpuStride = EMU_TWIN_STRIDE;
+		} else if (c->wideLinear && !c->markFrame) {
+			e->fbGpu = wide;
+			e->fbGpuStride = c->widePitch;
+			e->fbPitch = c->widePitch;
+		}
+	} else {
+		e->fb = c->fbOwn;
+		widen_picture(e->fb, (const uint16_t*) c->gba->renderer.frame);
 	}
+	/* (emu_mark_backdrop: the backdrop's pixels told apart by their fourth byte, as mGBA's flags there tell them apart) */
+	const uint16_t* mark = AC(e)->markFrame;
+	for (int i = 0; mark && i < GBA_W * GBA_H; ++i) {
+		if (mark[i] == MARK_555) e->fb[i] = (e->fb[i] & 0x00FFFFFFu) | 0xFC000000u;
+	}
+	/* (the marks are in the fourth bytes, which emu_bright doesn't read) */
+	c->bright = wide ? bright_sum(wide == c->wideBuf[1]) : -1;
+	e->fbPainted = false;
 }
 
 static void run_frame(Emu* e, uint32_t keys, bool draw) {
 	if (emu_cancelled(e)) return;
 	ArmCore* c = AC(e);
 	struct GBA* gba = c->gba;
+#ifdef __3DS__
+	/* The copy's thread runs the routines the game's thread wrote at open; its core's instruction cache may still hold the
+	 * last game's code at those addresses. */
+	int const core = host_core_now();
+	if (core != c->codeCore) {
+		bool const emptied = host_icache_invalidate();
+		logLine("instruction cache of core %d %s (the code was written on core %d)", core, emptied ? "emptied" : "left alone", c->codeCore);
+		c->codeCore = core;
+	}
+#endif
+	if (!draw && e->fb != c->fbOwn) {
+		/* (the picture kept is a worker's buffer, which it writes again when this frame ends: copied before) */
+		const int pitch = emu_pitch(e);
+		for (int y = 0; y < GBA_H; ++y) memcpy(&c->fbOwn[y * GBA_W], &e->fb[y * pitch], GBA_W * sizeof(uint32_t));
+		e->fb = c->fbOwn;
+		e->fbPitch = GBA_W;
+		e->fbCompactOk = false;
+		e->fbGpu = NULL;
+	}
+	if (!draw) c->bright = -1;
 	++e->frames;
 	gbaSetKeys(gba, (uint16_t) keys);
 	gba->gpio.luminance = solar_reading();
 	videoSetDrawSkipped(!draw);
 	uint32_t const frame = gba->video.frameCounter;
 #ifdef __3DS__
-	if (c->ring) {
-		/* (the game: past 1.5 ms of compiling in a frame, code met for the
-		 * first times is stepped through a few times more before it's
-		 * compiled, and compiled in a later frame if it doesn't come round
-		 * again; a Mario Kart race frame has about that much to spare: 4 ms
-		 * made 18-22 ms frames) */
-		extern uint64_t jitCompileTicks, jitCompileBudget, jitCompileFrameStart;
-		jitCompileFrameStart = jitCompileTicks;
-		jitCompileBudget = 268111 * 3 / 2;
-	}
+	/* (each machine, for its own frames: past 1.5 ms of compiling in a frame, code met for the
+	 * first times is stepped through a few times more before it's
+	 * compiled, and compiled in a later frame if it doesn't come round
+	 * again; a Mario Kart race frame has about that much to spare: 4 ms
+	 * made 18-22 ms frames) */
+	jitSetCompileBudget(gba, c->compileBudget);
 #endif
 	do {
 		gbaRunPart(gba);
@@ -987,17 +1612,34 @@ static void run_frame(Emu* e, uint32_t keys, bool draw) {
 	videoSetDrawSkipped(false);
 	audioThreadKick(gba);
 	if (c->cheatsOn) cheatsApply(&c->cheats, gba);
+#ifdef __3DS__
+	bool const timed = jitStatsOn && c->game && draw; /* (the sums are the game thread's: a copy runs on another one) */
+	uint64_t const t0 = timed ? renderThreadHostTicks() : 0;
+#endif
 	if (draw) take_picture(e);
+#ifdef __3DS__
+	uint64_t const t1 = timed ? renderThreadHostTicks() : 0;
+#endif
 	if (draw) split_frame(c);
+#ifdef __3DS__
+	if (timed) {
+		pictureTicks += t1 - t0;
+		splitTicks += renderThreadHostTicks() - t1;
+	}
+#endif
 	audioThreadTake(gba);
+#ifdef __3DS__
+	++c->ran;
+	jit_stats(c, c->game ? gba->video.frameCounter : c->ran, c->game, false);
+#endif
 	if (c->ring) {
 		const int16_t* in = (const int16_t*) gba->audio.out;
 		for (uint32_t i = 0; i < gba->audio.outCount; ++i) {
 			if (c->ringCount == c->ringCap) { /* nobody's reading: the oldest goes */
-				c->ringHead = (c->ringHead + 1) % c->ringCap;
+				c->ringHead = (c->ringHead + 1) & (c->ringCap - 1);
 				--c->ringCount;
 			}
-			size_t at = (c->ringHead + c->ringCount) % c->ringCap;
+			size_t at = (c->ringHead + c->ringCount) & (c->ringCap - 1);
 			c->ring[at * 2] = in[i * 2];
 			c->ring[at * 2 + 1] = in[i * 2 + 1];
 			++c->ringCount;
@@ -1047,6 +1689,30 @@ void emu_frame(Emu* e, uint32_t keys) {
 	run_frame(e, keys, true);
 }
 
+/* (armGBA draws with its own threads, set up by its frontend options, not mGBA's proxy) */
+void emu_threaded_video(bool on) {
+	(void) on;
+}
+
+/* (the bench's "video wait": the game thread waiting for the renderer's worker, in microseconds) */
+uint32_t emu_video_wait_us(void) {
+#ifdef __3DS__
+	extern uint64_t renderWaitTicks;
+	return (uint32_t) (renderWaitTicks * 1000 / 268112);
+#else
+	return 0;
+#endif
+}
+
+void emu_idle_loops(const char* mode) {
+	(void) mode;
+}
+
+bool emu_threaded(const Emu* e) {
+	(void) e;
+	return false;
+}
+
 void emu_frame_blind(Emu* e, uint32_t keys) {
 	run_frame(e, keys, false);
 }
@@ -1060,11 +1726,11 @@ size_t emu_audio_read(Emu* e, int16_t* out, size_t maxFrames) {
 	if (!c->ring) return 0;
 	size_t n = c->ringCount < maxFrames ? c->ringCount : maxFrames;
 	for (size_t i = 0; i < n; ++i) {
-		size_t at = (c->ringHead + i) % c->ringCap;
+		size_t at = (c->ringHead + i) & (c->ringCap - 1);
 		out[i * 2] = c->ring[at * 2];
 		out[i * 2 + 1] = c->ring[at * 2 + 1];
 	}
-	c->ringHead = (c->ringHead + n) % c->ringCap;
+	c->ringHead = (c->ringHead + n) & (c->ringCap - 1);
 	c->ringCount -= n;
 	return n;
 }
@@ -1093,6 +1759,9 @@ bool emu_state_load(Emu* e, const void* buf) {
 	ArmCore* c = AC(e);
 	/* (the borrowed cartridge is this core's own business, not the state's) */
 	bool ok = gbaLoadState(c->gba, buf, gbaStateSize());
+#ifdef __3DS__
+	++c->loads;
+#endif
 	layers_apply(c);
 	return ok;
 }
@@ -1872,7 +2541,7 @@ static void split_frame(ArmCore* c) {
 	if (!split.grabbing && (int32_t) (c->hooks.secondCount - split.hudNeed) < 0) return;
 	if (bandOn) lastBandY0 = split.bandY0, lastBandY1 = split.bandY1;
 	uint32_t* dst = split.grabbing ? split.grabBuf : split.hudBuf;
-	for (int i = 0; dst && i < GBA_W * GBA_H; ++i) dst[i] = colour_8888(split.frame[i]);
+	if (dst) widen_picture(dst, split.frame);
 	if (!split.grabbing) hudFresh = true;
 	if (split.grabbing) {
 		split.grabbing = false;
@@ -1887,6 +2556,9 @@ static void split_release(ArmCore* c) {
 	c->hooks.second = false;
 	c->hooks.line = NULL;
 	memset(&split, 0, sizeof(split));
+	/* (as src/emu.c's: Pokemon Pinball's tall view leaves these set, and the next game kept its HUD on both screens) */
+	splitCopying = false;
+	copyAbove = 0;
 }
 
 /* a video register written again as it stands, so both pictures take it
@@ -1902,6 +2574,7 @@ bool emu_hud_split(Emu* e, bool on, unsigned bgMask, const SpriteRule* objs, int
 	if (!split.core) {
 		if (!on) return true;
 		memset(&split, 0, sizeof(split));
+		splitCopying = false;
 		split.core = c;
 		split.hudBuf = hud;
 		for (int i = 0; i < GBA_W * GBA_H; ++i) split.frame[i] = HUD_CLEAR_555;

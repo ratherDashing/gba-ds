@@ -1,0 +1,23 @@
+diff --git a/src/feature/thread-proxy.c b/src/feature/thread-proxy.c
+index c3878e896..3ab984b56 100644
+--- a/src/feature/thread-proxy.c
++++ b/src/feature/thread-proxy.c
+@@ -170,9 +170,17 @@ static void _unlock(struct mVideoLogger* logger) {
+ 	MutexUnlock(&proxyRenderer->mutex);
+ }
+ 
++#ifdef __3DS__
++/* (GBA DS's 3ds/ctr/host.c, video_wake in gba-ds.cfg: the drawing thread is woken when the line number's low bits are all set) */
++extern int gbadsVideoWake;
++#define VIDEO_WAKE_MASK gbadsVideoWake
++#else
++#define VIDEO_WAKE_MASK 15
++#endif
++
+ static void _wake(struct mVideoLogger* logger, int y) {
+ 	struct mVideoThreadProxy* proxyRenderer = (struct mVideoThreadProxy*) logger;
+-	if ((y & 15) == 15) {
++	if ((y & VIDEO_WAKE_MASK) == VIDEO_WAKE_MASK) {
+ 		ConditionWake(&proxyRenderer->toThreadCond);
+ 	}
+ }

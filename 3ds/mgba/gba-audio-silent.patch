@@ -1,0 +1,51 @@
+diff --git a/include/mgba/internal/gb/audio.h b/include/mgba/internal/gb/audio.h
+index 8b9b775c3..d78751ca2 100644
+--- a/include/mgba/internal/gb/audio.h
++++ b/include/mgba/internal/gb/audio.h
+@@ -240,6 +240,15 @@ void GBAudioWriteNR51(struct GBAudio* audio, uint8_t);
+ void GBAudioWriteNR52(struct GBAudio* audio, uint8_t);
+ 
+ void GBAudioRun(struct GBAudio* audio, int32_t timestamp, int channels);
++
++/* GBAudioRun(audio, timestamp, 0xF) for the GBA's sampling loop, called only when some channel has anything to do. */
++static inline void GBAudioRunSample(struct GBAudio* audio, int32_t timestamp) {
++	if (audio->p || (audio->playingCh1 && audio->ch1.envelope.dead != 2) || timestamp - audio->ch1.lastUpdate > 0x40000000 ||
++	    (audio->playingCh2 && audio->ch2.envelope.dead != 2) || timestamp - audio->ch2.lastUpdate > 0x40000000 ||
++	    audio->playingCh3 || audio->playingCh4) {
++		GBAudioRun(audio, timestamp, 0xF);
++	}
++}
+ void GBAudioUpdateFrame(struct GBAudio* audio);
+ 
+ void GBAudioSamplePSG(struct GBAudio* audio, int16_t* left, int16_t* right);
+diff --git a/src/gba/audio.c b/src/gba/audio.c
+index c46ce1ac4..d66065716 100644
+--- a/src/gba/audio.c
++++ b/src/gba/audio.c
+@@ -365,12 +365,24 @@ void GBAAudioSample(struct GBAAudio* audio, int32_t timestamp) {
+ 
+ 	int maxSample = 2 << GBARegisterSOUNDBIASGetResolution(audio->soundbias);
+ 	int sample;
++	int16_t psgLeft = 0;
++	int16_t psgRight = 0;
++	uint32_t psgLastKey = 0;
++	bool psgValid = false;
+ 	for (sample = audio->sampleIndex; timestamp >= audio->sampleInterval && sample < maxSample; ++sample, timestamp -= audio->sampleInterval) {
+ 		int16_t sampleLeft = 0;
+ 		int16_t sampleRight = 0;
+ 		int psgShift = 4 - audio->volume;
+-		GBAudioRun(&audio->psg, sample * audio->sampleInterval + audio->lastSample, 0xF);
+-		GBAudioSamplePSG(&audio->psg, &sampleLeft, &sampleRight);
++		GBAudioRunSample(&audio->psg, sample * audio->sampleInterval + audio->lastSample);
++		uint32_t psgKey = (uint8_t) audio->psg.ch1.sample | (uint8_t) audio->psg.ch2.sample << 8 |
++		                  (uint8_t) audio->psg.ch3.sample << 16 | (uint32_t) (uint8_t) audio->psg.ch4.sample << 24;
++		if (!psgValid || psgKey != psgLastKey) {
++			GBAudioSamplePSG(&audio->psg, &psgLeft, &psgRight);
++			psgValid = true;
++			psgLastKey = psgKey;
++		}
++		sampleLeft = psgLeft;
++		sampleRight = psgRight;
+ 		sampleLeft >>= psgShift;
+ 		sampleRight >>= psgShift;
+ 

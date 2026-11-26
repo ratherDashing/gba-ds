@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Thu, 26 Nov 2026 09:52:46 -0500
+Subject: armGBA: a block's place in its slot's lists is found by halves when
+ it isn't at the end, so compiling a block whose cold code goes below code
+ already in the slot no longer reads every block above it (a cache miss each,
+ about 60 of the 220 data cache misses of a compile in Final Fantasy VI)
+
+
+diff --git a/src/cpu/jit.c b/src/cpu/jit.c
+index 9b1f0a5..839c45d 100644
+--- a/src/cpu/jit.c
++++ b/src/cpu/jit.c
+@@ -418,9 +418,20 @@ static void insertRange(struct Block*** list, size_t* count, size_t* cap, struct
+ 		*cap = *cap ? *cap * 2 : 256;
+ 		*list = realloc(*list, *cap * sizeof(**list));
+ 	}
++	// The list is in code order (syncSite searches it), so the place after the last block not above
++	// this one is found in halves when it isn't the end: a scan read a block per step, a cache miss each.
++	size_t lo = 0;
+ 	size_t at = *count;
+-	while (at && (cold ? (*list)[at - 1]->cold > block->cold : (*list)[at - 1]->entry > block->entry)) {
+-		--at;
++	if (at && (cold ? (*list)[at - 1]->cold <= block->cold : (*list)[at - 1]->entry <= block->entry)) {
++		lo = at;
++	}
++	while (lo < at) {
++		size_t const mid = lo + (at - lo) / 2;
++		if (cold ? (*list)[mid]->cold > block->cold : (*list)[mid]->entry > block->entry) {
++			at = mid;
++		} else {
++			lo = mid + 1;
++		}
+ 	}
+ 	memmove(&(*list)[at + 1], &(*list)[at], (*count - at) * sizeof(**list));
+ 	(*list)[at] = block;

@@ -1,0 +1,21 @@
+--- a/include/mgba-util/platform/3ds/threading.h
++++ b/include/mgba-util/platform/3ds/threading.h
+@@ -66,11 +66,17 @@
+ 	return 0;
+ }
+ 
++/* (GBA DS's 3ds/ctr/host.c: the core mGBA's drawing thread asks for, video_core in gba-ds.cfg) */
++extern int gbadsVideoCore;
++
+ static inline int ThreadCreate(Thread* thread, ThreadEntry entry, void* context) {
+ 	if (!entry || !thread) {
+ 		return 1;
+ 	}
+-	*thread = threadCreate(entry, context, 0x8000, 0x18, 2, false);
++	*thread = threadCreate(entry, context, 0x8000, 0x18, gbadsVideoCore, false);
++	if (!*thread && gbadsVideoCore != 2) {
++		*thread = threadCreate(entry, context, 0x8000, 0x18, 2, false);
++	}
+ 	return !*thread;
+ }
+ 

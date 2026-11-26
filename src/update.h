@@ -35,7 +35,7 @@ typedef struct {
 
 /* (not in a side build, GBADS_SIDE: it would replace itself with the release; nor on armGBA, which has no
  * libmgba to unpack the release with) */
-#if !defined(__wasi__) && !defined(GBADS_SIDE) && !defined(GBADS_ARMGBA)
+#if !defined(__wasi__) && !defined(GBADS_SIDE) && !defined(GBADS_ARMGBA) && !defined(__3DS__)
 #define GBADS_UPDATES 1
 /* exeDir: the app's folder; argv: for the restart */
 void update_init(const Config* cfg, const char* exeDir, int argc, char** argv);

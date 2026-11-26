@@ -5,6 +5,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 
 #define GBA_W 240
 #define GBA_H 160
@@ -53,7 +55,22 @@ typedef struct SpriteRule {
 
 typedef struct Emu {
 	struct mCore* core;
-	uint32_t* fb; /* GBA_W * GBA_H, mGBA native 32-bit color (XBGR8888, i.e. bytes R,G,B,X) */
+	uint32_t* fb; /* GBA_W * GBA_H, mGBA native 32-bit color (XBGR8888, i.e. bytes R,G,B,X); read it with emu_fb() */
+	const uint32_t* fbGpu; /* 3DS armGBA: the picture in the GPU's byte order, rows EMU_TWIN_STRIDE words apart, or (raw_picture) fb itself, written back (else NULL) */
+	uint32_t fbGpuDirty;   /* ... and the bands of 8 rows of it written by the game thread since (to be flushed before the GPU reads it) */
+	uint32_t fbGpuStride;  /* ... and the words a row of fbGpu has */
+	uint32_t fbPitch;      /* the words a row of fb has (0: GBA_W; raw_picture's pictures have rows 256 apart); emu_fb() gives GBA_W rows whatever this is */
+	uint32_t* fbCompact;   /* fb in GBA_W rows, made by emu_fb() when fb has other rows (valid while fbCompactOk) */
+	bool fbCompactOk;
+	bool fbPainted; /* fb written by emu_fb_put, emu_fb_put_run or emu_fb_set since its frame was made (emu_bright_samples);
+	                 * anything else that paints fb must set it too, or frame_is_dark gets the workers' count of the old picture */
+	unsigned fbCompactCopies; /* how many copies emu_fb() made (each costs the game thread a read of the whole picture) */
+#ifdef COLOR_16_BIT
+	/* libmgba with 16-bit pixels (RGB565): mGBA draws into fb16; fb is made from it by emu_fb() */
+	uint16_t* fb16;
+	bool fb16Linear; /* in linear memory: the GPU can read it */
+	bool fbStale;    /* fb16 has a newer picture than fb */
+#endif
 	/* The core's platform (mPlatform: mPLATFORM_GBA, mPLATFORM_GB). A Game Boy / Game Boy Color game
 	 * (issue #77) draws its 160x144 picture centred in the same GBA_W x GBA_H frame, at (picX, picY),
 	 * so the rest of the app sees a GBA-sized picture; for a GBA game it is the whole frame. */
@@ -69,11 +86,141 @@ typedef struct Emu {
 	bool audio;
 	void* rumble; /* the live game's rumble (emu_rumble_level), NULL for the hidden copies */
 	unsigned long frames; /* frames run (emu_frame), for timing the captures */
+	unsigned long blindFrames; /* of them, run without drawing (emu_frame_blind) */
 	/* a hidden copy's capture called off (mapcap_cancel): while it's set,
 	 * frames don't run, so whatever the capture waits for gives up at
 	 * once; emu_cancelled says so, so it keeps nothing of that run */
 	volatile bool* cancel;
 } Emu;
+
+#ifdef COLOR_16_BIT
+#define EMU_FB16_STRIDE 256 /* a GPU texture's width: the picture goes to the GPU as it is */
+/* fb made from fb16: the 8-bit values mGBA's 32-bit pixels have for the same colors (except blends, which land between steps there) */
+void emu_fb_sync(Emu* e);
+/* n pixels of RGB565 as XBGR8888 (the same colors as emu_fb's) */
+void emu_expand565_row(uint32_t* dst, const uint16_t* src, int n);
+extern uint32_t emuExpandLo[256], emuExpandHi[256];
+static inline uint32_t emu_expand565_one(uint16_t c) {
+	return emuExpandHi[c >> 8] | emuExpandLo[c & 0xFF];
+}
+static inline uint32_t* emu_fb(Emu* e) {
+	if (e->fbStale) emu_fb_sync(e);
+	return e->fb;
+}
+/* The picture in rows of GBA_W copied to dst (GBA_W * GBA_H words), and whether it is the same as px. */
+static inline void emu_fb_copy(Emu* e, uint32_t* dst) {
+	memcpy(dst, emu_fb(e), GBA_W * GBA_H * sizeof(uint32_t));
+}
+static inline bool emu_fb_same(Emu* e, const uint32_t* px) {
+	return !memcmp(px, emu_fb(e), GBA_W * GBA_H * sizeof(uint32_t));
+}
+/* Painting over the picture goes to fb16 too (mGBA redraws only changed lines, so it starts the next frame from this one). */
+static inline void emu_fb_put(Emu* e, int x, int y, uint32_t c) {
+	e->fb16[y * EMU_FB16_STRIDE + x] = (c & 0xF8) << 8 | (c >> 5 & 0x7C0) | (c >> 19 & 0x1F);
+	if (!e->fbStale) e->fb[y * GBA_W + x] = c;
+}
+/* The whole picture put back (GBA_W * GBA_H of XBGR8888). */
+void emu_fb_set(Emu* e, const uint32_t* px);
+/* One pixel of the picture as XBGR8888, without making all of fb. */
+static inline uint32_t emu_pixel(Emu* e, int x, int y) {
+	return e->fbStale ? emu_expand565_one(e->fb16[y * EMU_FB16_STRIDE + x]) : e->fb[y * GBA_W + x];
+}
+/* The same by pixel number (row after row, GBA_W to a row). */
+static inline uint32_t emu_pixel_n(Emu* e, int i) {
+	return e->fbStale ? emu_expand565_one(e->fb16[i / GBA_W * EMU_FB16_STRIDE + i % GBA_W]) : e->fb[i];
+}
+/* The next core opened has fb16 in linear memory, for the GPU's transfer. */
+void emu_picture_linear(bool on);
+
+#else
+static inline int emu_pitch(const Emu* e) {
+	return e->fbPitch ? (int) e->fbPitch : GBA_W;
+}
+/* The picture in rows of GBA_W: fb itself, or a copy of it (made once a picture) where its rows are further apart. */
+static inline uint32_t* emu_fb(Emu* e) {
+	const int pitch = emu_pitch(e);
+	if (pitch == GBA_W) return e->fb;
+	if (!e->fbCompactOk) {
+		if (!e->fbCompact && !(e->fbCompact = (uint32_t*) malloc(GBA_W * GBA_H * sizeof(uint32_t)))) return e->fb;
+		for (int y = 0; y < GBA_H; ++y) memcpy(&e->fbCompact[y * GBA_W], &e->fb[y * pitch], GBA_W * sizeof(uint32_t));
+		e->fbCompactOk = true;
+		++e->fbCompactCopies;
+	}
+	return e->fbCompact;
+}
+/* The same without the copy emu_fb() makes where the rows are further apart (the picture's one reader per picture that only copies or compares it). */
+static inline void emu_fb_copy(Emu* e, uint32_t* dst) {
+	const int pitch = emu_pitch(e);
+	if (pitch == GBA_W || e->fbCompactOk) memcpy(dst, emu_fb(e), GBA_W * GBA_H * sizeof(uint32_t));
+	else for (int y = 0; y < GBA_H; ++y) memcpy(&dst[y * GBA_W], &e->fb[y * pitch], GBA_W * sizeof(uint32_t));
+}
+static inline bool emu_fb_same(Emu* e, const uint32_t* px) {
+	const int pitch = emu_pitch(e);
+	if (pitch == GBA_W || e->fbCompactOk) return !memcmp(px, emu_fb(e), GBA_W * GBA_H * sizeof(uint32_t));
+	for (int y = 0; y < GBA_H; ++y) {
+		if (memcmp(&px[y * GBA_W], &e->fb[y * pitch], GBA_W * sizeof(uint32_t))) return false;
+	}
+	return true;
+}
+static inline uint32_t emu_pixel(Emu* e, int x, int y) {
+	return e->fb[y * emu_pitch(e) + x];
+}
+static inline uint32_t emu_pixel_n(Emu* e, int i) {
+	const int pitch = emu_pitch(e);
+	return pitch == GBA_W ? e->fb[i] : e->fb[i / GBA_W * pitch + i % GBA_W];
+}
+/* (the 3DS's fbGpu, the picture's twin in the GPU's byte order, is kept the same as fb: pixels put go there too, in the bands of
+ * 8 rows noted in fbGpuDirty; a whole picture set takes the twin away. With raw_picture fbGpu is fb itself: the bands are only noted) */
+#define EMU_TWIN_STRIDE 256
+static inline void emu_fb_put(Emu* e, int x, int y, uint32_t c) {
+	e->fb[y * emu_pitch(e) + x] = c;
+	e->fbPainted = true;
+	if (e->fbCompactOk) e->fbCompact[y * GBA_W + x] = c;
+	if (e->fbGpu) {
+		if (e->fbGpu != e->fb) ((uint32_t*) e->fbGpu)[y * EMU_TWIN_STRIDE + x] = __builtin_bswap32(c);
+		e->fbGpuDirty |= 1u << (y >> 3);
+	}
+}
+/* n pixels of one row from px. */
+static inline void emu_fb_put_run(Emu* e, int x, int y, const uint32_t* px, int n) {
+	memcpy(&e->fb[y * emu_pitch(e) + x], px, (size_t) n * sizeof(uint32_t));
+	e->fbPainted = true;
+	if (e->fbCompactOk) memcpy(&e->fbCompact[y * GBA_W + x], px, (size_t) n * sizeof(uint32_t));
+	if (e->fbGpu) {
+		if (e->fbGpu != e->fb) {
+			uint32_t* tw = (uint32_t*) e->fbGpu + y * EMU_TWIN_STRIDE + x;
+			for (int i = 0; i < n; ++i) tw[i] = __builtin_bswap32(px[i]);
+		}
+		e->fbGpuDirty |= 1u << (y >> 3);
+	}
+}
+static inline void emu_fb_set(Emu* e, const uint32_t* px) {
+	const int pitch = emu_pitch(e);
+	if (pitch == GBA_W) memcpy(e->fb, px, GBA_W * GBA_H * sizeof(uint32_t));
+	else for (int y = 0; y < GBA_H; ++y) memcpy(&e->fb[y * pitch], &px[y * GBA_W], GBA_W * sizeof(uint32_t));
+	e->fbCompactOk = false;
+	e->fbGpu = NULL;
+	e->fbPainted = true;
+}
+#endif
+/* game.c's frame_is_dark samples every EMU_DARK_STEP-th pixel from the first and counts the bright ones. */
+#define EMU_DARK_STEP 7
+static inline bool emu_bright(uint32_t c) {
+	return (((c & 0xFF) + ((c >> 8) & 0xFF) * 2 + ((c >> 16) & 0xFF)) >> 2) > 40;
+}
+#ifdef GBADS_ARMGBA
+/* The bright samples of the frame just made, as the render workers counted them, or -1; given once a frame. */
+int emu_bright_samples(Emu* e);
+#else
+static inline int emu_bright_samples(Emu* e) {
+	(void) e;
+	return -1;
+}
+#endif
+
+#ifdef GBADS_PICDUMP
+void emu_pic_dump_shown(Emu* e, const uint32_t* shown);
+#endif
 
 /* savePath may be NULL (no battery save attached). */
 bool emu_open(Emu* e, const char* romPath, const char* savePath, bool audio);
@@ -111,6 +258,15 @@ float emu_rumble_level(const Emu* e);
 /* The same without drawing it (e->fb keeps the last picture): for waits on
  * a hidden copy. */
 void emu_frame_blind(Emu* e, uint32_t keys);
+/* The next game core opened with sound has its picture drawn on a thread of mGBA's (threaded_video). */
+void emu_threaded_video(bool on);
+/* How the next cores opened skip their games' idle loops (idle_loops): "remove" (mGBA's own table), "detect",
+ * "ignore", or "known" (remove for the games with a known loop, mGBA's table and ours, ignore for the rest). */
+void emu_idle_loops(const char* mode);
+/* this core's picture is drawn on mGBA's thread */
+bool emu_threaded(const Emu* e);
+/* The time emu_frame has waited for the thread that draws (mGBA's threaded video, armGBA's render worker), in microseconds (a sum that wraps). */
+uint32_t emu_video_wait_us(void);
 /* the cartridge has a sun sensor (Boktai) */
 bool emu_has_solar(Emu* e);
 /* true while this core's capture has been called off (Emu.cancel) */

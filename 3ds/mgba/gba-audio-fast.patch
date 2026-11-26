@@ -1,0 +1,116 @@
+diff --git a/src/gb/audio.c b/src/gb/audio.c
+index 6a97d8bea..3416f1c6d 100644
+--- a/src/gb/audio.c
++++ b/src/gb/audio.c
+@@ -494,7 +494,7 @@ void GBAudioRun(struct GBAudio* audio, int32_t timestamp, int channels) {
+ 		int period = 4 * (2048 - audio->ch1.control.frequency) * audio->timingFactor;
+ 		int32_t diff = timestamp - audio->ch1.lastUpdate;
+ 		if (diff >= period) {
+-			diff /= period;
++			diff = diff < 2 * period ? 1 : diff / period;
+ 			audio->ch1.index = (audio->ch1.index + diff) & 7;
+ 			audio->ch1.lastUpdate += diff * period;
+ 			_updateSquareSample(&audio->ch1);
+@@ -504,7 +504,7 @@ void GBAudioRun(struct GBAudio* audio, int32_t timestamp, int channels) {
+ 		int period = 4 * (2048 - audio->ch2.control.frequency) * audio->timingFactor;
+ 		int32_t diff = timestamp - audio->ch2.lastUpdate;
+ 		if (diff >= period) {
+-			diff /= period;
++			diff = diff < 2 * period ? 1 : diff / period;
+ 			audio->ch2.index = (audio->ch2.index + diff) & 7;
+ 			audio->ch2.lastUpdate += diff * period;
+ 			_updateSquareSample(&audio->ch2);
+@@ -514,7 +514,7 @@ void GBAudioRun(struct GBAudio* audio, int32_t timestamp, int channels) {
+ 		int cycles = 2 * (2048 - audio->ch3.rate) * audio->timingFactor;
+ 		int32_t diff = timestamp - audio->ch3.nextUpdate;
+ 		if (diff >= 0) {
+-			diff = (diff / cycles) + 1;
++			diff = (diff < cycles ? 0 : diff / cycles) + 1;
+ 			int volume;
+ 			switch (audio->ch3.volume) {
+ 			case 0:
+@@ -583,7 +583,7 @@ void GBAudioRun(struct GBAudio* audio, int32_t timestamp, int channels) {
+ 		}
+ 	}
+ 	if (audio->playingCh4 && (channels & 0x8)) {
+-		const uint16_t noiseMaskTable[0x40] = {
++		static const uint16_t noiseMaskTable[0x40] = {
+ 			0x3f, 0x3e, 0x3c, 0x3d, 0x39, 0x38, 0x3a, 0x3b,
+ 			0x33, 0x32, 0x30, 0x31, 0x35, 0x34, 0x36, 0x37,
+ 			0x27, 0x26, 0x24, 0x25, 0x21, 0x20, 0x22, 0x23,
+@@ -593,7 +593,7 @@ void GBAudioRun(struct GBAudio* audio, int32_t timestamp, int channels) {
+ 			0x17, 0x16, 0x14, 0x15, 0x11, 0x10, 0x12, 0x13,
+ 			0x1b, 0x1a, 0x18, 0x19, 0x1d, 0x1c, 0x1e, 0x1f
+ 		};
+-		const uint16_t noisePopulationTable[0x40] = {
++		static const uint16_t noisePopulationTable[0x40] = {
+ 			6, 5, 4, 5, 4, 3, 4, 5, 4, 3, 2, 3, 4, 3, 4, 5,
+ 			4, 3, 2, 3, 2, 1, 2, 3, 4, 3, 2, 3, 4, 3, 4, 5,
+ 			4, 3, 2, 3, 2, 1, 2, 3, 2, 1, 0, 1, 2, 1, 2, 3,
+diff --git a/src/gba/audio.c b/src/gba/audio.c
+index 278e87832..c46ce1ac4 100644
+--- a/src/gba/audio.c
++++ b/src/gba/audio.c
+@@ -341,6 +341,7 @@ void GBAAudioSampleFIFO(struct GBAAudio* audio, int fifoId, int32_t cycles) {
+ 	int i;
+ 	for (i = bits - until; i < bits; ++i) {
+ 		channel->samples[i] = channel->internalSample;
++		__asm__ volatile("" ::: "memory"); /* keeps the loop from becoming a memset call, slower for a few bytes */
+ 	}
+ 	if (channel->internalRemaining) {
+ 		channel->internalSample >>= 8;
+@@ -406,13 +407,22 @@ void GBAAudioSample(struct GBAAudio* audio, int32_t timestamp) {
+ 	}
+ }
+ 
++/* memset(samples, value, GBA_MAX_SAMPLES) as four word stores: no library call per event. */
++static inline void _fillSamples(int8_t* samples, int8_t value) {
++	uint32_t word = (uint8_t) value * 0x01010101U;
++	memcpy(samples, &word, 4);
++	memcpy(samples + 4, &word, 4);
++	memcpy(samples + 8, &word, 4);
++	memcpy(samples + 12, &word, 4);
++}
++
+ static void _sample(struct mTiming* timing, void* user, uint32_t cyclesLate) {
+ 	struct GBAAudio* audio = user;
+ 	GBAAudioSample(audio, mTimingCurrentTime(&audio->p->timing) - cyclesLate);
+ 
+ 	int samples = 2 << GBARegisterSOUNDBIASGetResolution(audio->soundbias);
+-	memset(audio->chA.samples, audio->chA.samples[samples - 1], sizeof(audio->chA.samples));
+-	memset(audio->chB.samples, audio->chB.samples[samples - 1], sizeof(audio->chB.samples));
++	_fillSamples(audio->chA.samples, audio->chA.samples[samples - 1]);
++	_fillSamples(audio->chB.samples, audio->chB.samples[samples - 1]);
+ 
+ 	mCoreSyncLockAudio(audio->p->sync);
+ 	mAudioBufferWrite(&audio->psg.buffer, (int16_t*) audio->currentSamples, samples);
+diff --git a/src/util/audio-buffer.c b/src/util/audio-buffer.c
+index ec10a2e5d..9b4734393 100644
+--- a/src/util/audio-buffer.c
++++ b/src/util/audio-buffer.c
+@@ -16,8 +16,13 @@ void mAudioBufferDeinit(struct mAudioBuffer* buffer) {
+ 	mCircleBufferDeinit(&buffer->data);
+ }
+ 
++/* bytes / (channels * 2), without the library division for the usual two channels */
++static inline size_t _frames(size_t bytes, unsigned channels) {
++	return channels == 2 ? bytes >> 2 : bytes / (channels * sizeof(int16_t));
++}
++
+ size_t mAudioBufferAvailable(const struct mAudioBuffer* buffer) {
+-	return mCircleBufferSize(&buffer->data) / (buffer->channels * sizeof(int16_t));
++	return _frames(mCircleBufferSize(&buffer->data), buffer->channels);
+ }
+ 
+ size_t mAudioBufferCapacity(const struct mAudioBuffer* buffer) {
+@@ -59,8 +64,7 @@ size_t mAudioBufferWrite(struct mAudioBuffer* buffer, const int16_t* samples, si
+ 		if (!free) {
+ 			return 0;
+ 		}
+-		count = free / (buffer->channels * sizeof(int16_t));
++		count = _frames(free, buffer->channels);
+ 	}
+-	return mCircleBufferWrite(&buffer->data, samples, count * buffer->channels * sizeof(int16_t)) /
+-	       (buffer->channels * sizeof(int16_t));
++	return _frames(mCircleBufferWrite(&buffer->data, samples, count * buffer->channels * sizeof(int16_t)), buffer->channels);
+ }

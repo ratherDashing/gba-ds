@@ -1,0 +1,89 @@
+diff --git a/src/gba/memory.c b/src/gba/memory.c
+index 4d04979cf..cb5cfd2e4 100644
+--- a/src/gba/memory.c
++++ b/src/gba/memory.c
+@@ -1662,31 +1662,14 @@ void GBAPatch8(struct ARMCore* cpu, uint32_t address, int8_t value, int8_t* old)
+ 		wait += 16; \
+ 		address += 64; \
+ 	} \
+-	for (i = 0; i < 16; i += 4) { \
+-		if (UNLIKELY(mask & (1 << i))) { \
+-			LDM; \
+-			cpu->gprs[i] = value; \
+-			++wait; \
+-			address += 4; \
+-		} \
+-		if (UNLIKELY(mask & (2 << i))) { \
+-			LDM; \
+-			cpu->gprs[i + 1] = value; \
+-			++wait; \
+-			address += 4; \
+-		} \
+-		if (UNLIKELY(mask & (4 << i))) { \
+-			LDM; \
+-			cpu->gprs[i + 2] = value; \
+-			++wait; \
+-			address += 4; \
+-		} \
+-		if (UNLIKELY(mask & (8 << i))) { \
+-			LDM; \
+-			cpu->gprs[i + 3] = value; \
+-			++wait; \
+-			address += 4; \
+-		} \
++	mask &= 0xFFFF; \
++	while (mask) { \
++		i = __builtin_ctz(mask); \
++		mask &= mask - 1; \
++		LDM; \
++		cpu->gprs[i] = value; \
++		++wait; \
++		address += 4; \
+ 	}
+ 
+ uint32_t GBALoadMultiple(struct ARMCore* cpu, uint32_t address, int mask, enum LSMDirection direction, int* cycleCounter) {
+@@ -1780,34 +1763,17 @@ uint32_t GBALoadMultiple(struct ARMCore* cpu, uint32_t address, int mask, enum L
+ 		wait += 16; \
+ 		address += 64; \
+ 	} \
+-	for (i = 0; i < 16; i += 4) { \
+-		if (UNLIKELY(mask & (1 << i))) { \
+-			value = cpu->gprs[i]; \
+-			STM; \
+-			++wait; \
+-			address += 4; \
+-		} \
+-		if (UNLIKELY(mask & (2 << i))) { \
+-			value = cpu->gprs[i + 1]; \
+-			STM; \
+-			++wait; \
+-			address += 4; \
+-		} \
+-		if (UNLIKELY(mask & (4 << i))) { \
+-			value = cpu->gprs[i + 2]; \
+-			STM; \
+-			++wait; \
+-			address += 4; \
+-		} \
+-		if (UNLIKELY(mask & (8 << i))) { \
+-			value = cpu->gprs[i + 3]; \
+-			if (i + 3 == ARM_PC) { \
+-				value += WORD_SIZE_ARM; \
+-			} \
+-			STM; \
+-			++wait; \
+-			address += 4; \
++	mask &= 0xFFFF; \
++	while (mask) { \
++		i = __builtin_ctz(mask); \
++		mask &= mask - 1; \
++		value = cpu->gprs[i]; \
++		if (i == ARM_PC) { \
++			value += WORD_SIZE_ARM; \
+ 		} \
++		STM; \
++		++wait; \
++		address += 4; \
+ 	}
+ 
+ uint32_t GBAStoreMultiple(struct ARMCore* cpu, uint32_t address, int mask, enum LSMDirection direction, int* cycleCounter) {

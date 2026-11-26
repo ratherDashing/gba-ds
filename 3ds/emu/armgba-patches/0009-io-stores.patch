@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: armGBA speedups <none@example.invalid>
+Date: Wed, 18 Nov 2026 10:00:00 -0500
+Subject: armGBA: I/O stores from compiled code have their own slow path, with
+ IE, IF and IME written directly (armGBA 2.0, 78ff173 and 216aa64, already
+ applies IE writes that flip the H-blank bit at once)
+
+
+diff --git a/src/cpu/a32/backend.c b/src/cpu/a32/backend.c
+index d43b0c4..8eec179 100644
+--- a/src/cpu/a32/backend.c
++++ b/src/cpu/a32/backend.c
+@@ -467,7 +467,7 @@ static void emitMissSignal(struct Emitter* e, int kind, bool stopped) {
+ 
+ // Goes through bus.c, events and all; r1 = address, r2 = a value to store. For romCode, returns
+ // whether the buffer was stopped in N.
+-static void emitSlowPath(struct Emitter* e, int kind, bool romCode) {
++static void emitSlowPath(struct Emitter* e, int kind, bool romCode, const void* handler) {
+ 	// The return address identifies the guest instruction for open-bus reads.
+ 	strF(e, LR, OFF(siteReturn));
+ 	ldrF(e, R0, OFF(cpu.nextEvent));
+@@ -480,7 +480,7 @@ static void emitSlowPath(struct Emitter* e, int kind, bool romCode) {
+ 	aMov(e, R2, R1);
+ 	aMovI(e, R1, kind);
+ 	aMov(e, R0, R_GBA);
+-	callAbs(e, jitSlowAccess);
++	callAbs(e, handler);
+ 	if (kind == MEM_LOADS8) {
+ 		aExtend(e, X_SXTB, R0, R0);
+ 	} else if (kind == MEM_LOADS16) {
+@@ -772,6 +772,11 @@ static uint8_t* emitMemRoutine(struct Jit* jit, struct Emitter* e, int kind, boo
+ 		aCmpI(e, R0, REGION_OAM - base, R3);
+ 		toOam = aB(e, C_EQ, NULL);
+ 	}
++	uint8_t* toIoStore = NULL;
++	if (store) {
++		aCmpI(e, R0, REGION_IO, R3);
++		toIoStore = aB(e, C_EQ, NULL);
++	}
+ 	toSlow[slowCount++] = aB(e, C_AL, NULL);
+ 
+ 	for (int r = 0; r < 2; ++r) {
+@@ -966,10 +971,15 @@ static uint8_t* emitMemRoutine(struct Jit* jit, struct Emitter* e, int kind, boo
+ 		aBx(e, LR);
+ 	}
+ 
++	if (toIoStore) {
++		// Stores to I/O registers: interrupt handlers make hundreds of them a frame.
++		patchHere(e, toIoStore);
++		emitSlowPath(e, kind, romCode, jitIoStore);
++	}
+ 	for (int i = 0; i < slowCount; ++i) {
+ 		patchHere(e, toSlow[i]);
+ 	}
+-	emitSlowPath(e, kind, romCode);
++	emitSlowPath(e, kind, romCode, jitSlowAccess);
+ 	return start;
+ }
+ 
+diff --git a/src/cpu/jit-internal.h b/src/cpu/jit-internal.h
+index b47104f..10332c7 100644
+--- a/src/cpu/jit-internal.h
++++ b/src/cpu/jit-internal.h
+@@ -608,6 +608,7 @@ void jitRecordSite(struct Block*, uint32_t offset, uint32_t pc, uint32_t op0, ui
+ void jitNameCode(const void* start, const void* end, const char* name);
+ void jitNameBlock(const struct Block*, const void* bodyEnd, const void* cold, const void* end);
+ uint32_t jitSlowAccess(struct GBA*, int kind, uint32_t address, uint32_t value);
++uint32_t jitIoStore(struct GBA*, int kind, uint32_t address, uint32_t value);
+ // Whether a word load from the cartridge is PC-relative, so it compiles to a constant and a fixed
+ // wait.
+ bool jitRomLiteral(struct GBA*, const struct Inst*, uint32_t* value, int* wait);
+diff --git a/src/cpu/jit.c b/src/cpu/jit.c
+index 6acfe51..00e5448 100644
+--- a/src/cpu/jit.c
++++ b/src/cpu/jit.c
+@@ -550,6 +550,24 @@ static bool loadsPc(struct GBA* gba) {
+ 	return in.kind == I_MEM && in.load && in.rd == 15;
+ }
+ 
++// What follows a slow access: events it ran hand control back to the run loop.
++static uint32_t slowDone(struct GBA* gba, uint32_t runs, uint32_t result) {
++	if (runs != gba->eventRuns) {
++		yield(gba);
++		// Without the prefetch buffer, cartridge code adds the next fetch's nonsequential part once
++		// this returns, and then leaves. An interrupt the events raised is taken before that fetch,
++		// so the fetch is left for whatever runs next to count: the exact CPU, or compiled code
++		// entered again.
++		syncSite(gba);
++		if (inRom(gba->cpu.r[15]) && !gba->prefetchEnabled && !gba->prefetchDisabled && !loadsPc(gba)) {
++			gba->cpu.cycles -= fetchGap(gba);
++			gba->cpu.fetchSeq = false;
++		}
++	}
++	gba->siteValid = false;
++	return result;
++}
++
+ uint32_t jitSlowAccess(struct GBA* gba, int kind, uint32_t address, uint32_t value) {
+ 	// The PC is looked up only if something asks for it.
+ 	gba->siteValid = true;
+@@ -580,20 +598,46 @@ uint32_t jitSlowAccess(struct GBA* gba, int kind, uint32_t address, uint32_t val
+ 	if (kind < MEM_STORE32) {
+ 		busIdle(gba);
+ 	}
+-	if (runs != gba->eventRuns) {
+-		yield(gba);
+-		// Without the prefetch buffer, cartridge code adds the next fetch's nonsequential part once
+-		// this returns, and then leaves. An interrupt the events raised is taken before that fetch,
+-		// so the fetch is left for whatever runs next to count: the exact CPU, or compiled code
+-		// entered again.
+-		syncSite(gba);
+-		if (inRom(gba->cpu.r[15]) && !gba->prefetchEnabled && !gba->prefetchDisabled && !loadsPc(gba)) {
+-			gba->cpu.cycles -= fetchGap(gba);
+-			gba->cpu.fetchSeq = false;
++	return slowDone(gba, runs, result);
++}
++
++// A compiled store to an I/O register: when no event, DMA or idle-loop log comes before the write, the part of
++// jitSlowAccess that remains, with the registers interrupt handlers write the most (IE, IF, IME) called directly.
++uint32_t jitIoStore(struct GBA* gba, int kind, uint32_t address, uint32_t value) {
++	int32_t cycles = 1 + (kind == MEM_STORE32 ? gba->waitN32[REGION_IO] : gba->waitN16[REGION_IO]);
++	if (gba->idleProbing || gba->dmaRunnable || gba->cpu.cycles + cycles >= gba->cpu.nextEvent) {
++		return jitSlowAccess(gba, kind, address, value);
++	}
++	gba->siteValid = true;
++	uint32_t runs = gba->eventRuns;
++	gba->dmaIdleCredit = 0;
++	gba->cpu.cycles += cycles;
++	switch (kind) {
++	case MEM_STORE32:
++		ioWrite32(gba, address & 0xFFFFFC, value);
++		break;
++	case MEM_STORE16:
++		switch (address & 0xFFFFFE) {
++		case REG_IE:
++			gbaWriteIe(gba, (uint16_t) value);
++			break;
++		case REG_IF:
++			gbaWriteIf(gba, (uint16_t) value);
++			break;
++		case REG_IME:
++			gbaWriteIme(gba, (uint16_t) value);
++			break;
++		default:
++			ioWrite(gba, address & 0xFFFFFE, (uint16_t) value);
++			break;
+ 		}
++		break;
++	default:
++		ioWrite8(gba, address & 0xFFFFFF, (uint8_t) value);
++		break;
+ 	}
+-	gba->siteValid = false;
+-	return result;
++	gba->lastAccessDma = false;
++	return slowDone(gba, runs, 0);
+ }
+ 
+ // Throws all compiled code away and starts again from the bottom of the code memory.
+diff --git a/src/cpu/x64/backend.c b/src/cpu/x64/backend.c
+index df925fa..bf6bd6a 100644
+--- a/src/cpu/x64/backend.c
++++ b/src/cpu/x64/backend.c
+@@ -463,7 +463,7 @@ static void codeWriteArgs(struct Emitter* e) {
+ // instead.
+ 
+ // Goes through bus.c, events and all; ecx = address, edx = a value to store.
+-static void emitSlowPath(struct Emitter* e, int kind) {
++static void emitSlowPath(struct Emitter* e, int kind, const void* handler) {
+ 	// The return address identifies the guest instruction for open-bus reads.
+ 	xLoad(e, 8, RAX, M(RSP, 0));
+ 	xStore(e, 8, M(R15, OFF(siteReturn)), RAX);
+@@ -482,7 +482,7 @@ static void emitSlowPath(struct Emitter* e, int kind) {
+ 	xMovRR(e, 4, RAX, RDX);
+ 	xMovRR(e, 4, RDX, RCX);
+ 	xMovRR(e, 4, RCX, RAX);
+-	callAbs(e, jitSlowAccess);
++	callAbs(e, handler);
+ 	if (kind == MEM_LOADS8) {
+ 		xMovsx(e, RAX, 1, R(RAX));
+ 	} else if (kind == MEM_LOADS16) {
+@@ -684,6 +684,11 @@ static uint8_t* emitMemRoutine(struct Jit* jit, struct Emitter* e, int kind, boo
+ 		xAluI(e, X_CMP, 4, R(RAX), REGION_ROM2_EX - REGION_ROM0);
+ 		toRom = xJcc(e, CC_BE, NULL);
+ 	}
++	uint8_t* toIoStore = NULL;
++	if (store) {
++		xAluI(e, X_CMP, 4, R(RAX), REGION_IO);
++		toIoStore = xJcc(e, CC_E, NULL);
++	}
+ 	toSlow[slowCount++] = xJmp(e, NULL);
+ 
+ 	for (int r = 0; r < 2; ++r) {
+@@ -834,10 +839,14 @@ static uint8_t* emitMemRoutine(struct Jit* jit, struct Emitter* e, int kind, boo
+ 		xRet(e);
+ 	}
+ 
++	if (toIoStore) {
++		patchHere(e, toIoStore);
++		emitSlowPath(e, kind, jitIoStore);
++	}
+ 	for (int i = 0; i < slowCount; ++i) {
+ 		patchHere(e, toSlow[i]);
+ 	}
+-	emitSlowPath(e, kind);
++	emitSlowPath(e, kind, jitSlowAccess);
+ 	return start;
+ }
+ 
